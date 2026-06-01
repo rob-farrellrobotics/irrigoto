@@ -1,0 +1,23 @@
+# Pinned Python build deps for irrigoto firmware compiles.
+#
+# Why pinned: ESPHome's beta channel (e.g. 2026.5.0b1) sometimes ships
+# transitive-dep updates inside the same version label that introduce
+# LWIP regressions (verified 2026-05-26 — a routine FW_BUILD bump
+# started crashing in lwip_netconn_do_writemore until the host upgraded
+# to 2026.5.1 stable). A plain `pip install esphome` re-resolves
+# transitives at each install, which makes "works on Monday, broken on
+# Wednesday" a real failure mode.
+#
+# Install (fresh venv recommended so global pip can't drift these):
+#   python -m venv .venv
+#   .venv\Scripts\activate          (Windows)  /  source .venv/bin/activate (POSIX)
+#   pip install -r requirements.txt
+#
+# Bump intentionally: when you want to move to a newer ESPHome, edit
+# this file, re-pin all three lines, compile, OTA, watch for ~5 min,
+# then commit the bump as its own change.
+
+esphome==2026.4.5
+# Let pip resolve aioesphomeapi + zeroconf transitively to the versions
+# compatible with this esphome release. Re-pin here once the install is
+# verified working.

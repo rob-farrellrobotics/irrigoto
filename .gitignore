@@ -1,0 +1,54 @@
+# ESP-IDF build artifacts
+build/
+
+# Per-developer ESP-IDF config — DO NOT commit, contains WiFi creds.
+# Regenerate from sdkconfig.defaults via `idf.py menuconfig`.
+sdkconfig
+sdkconfig.old
+
+# ESP-IDF Component Manager — third-party deps are declared in
+# main/idf_component.yml and re-fetched into managed_components/ on
+# build. Don't vendor the downloaded sources.
+managed_components/
+
+# tools/ holds local scratch: analysis scripts, simulators, captured device
+# logs, live-device probes (some hardcode a LAN IP). Keep ALL of it local —
+# published tools: the HA config generator and the factory-cal extractor.
+tools/*
+!tools/ha-regen.py
+!tools/ha-regen.sh
+!tools/extract_factory_cal.py
+
+# ESPHome compile output
+.esphome/
+
+# Secrets — never commit
+esphome/secrets.yaml
+
+# Per-user personalized HA files — written by tools/ha-regen.py from the
+# committed homeassistant/ templates + your devices.yaml. Stays local so
+# the public repo doesn't carry any one user's device MAC / LAN IPs. The
+# files here are ready to copy 1:1 into your HA config (no rename).
+homeassistant/generated/
+# Legacy output name from the pre-generated-dir scheme; ignore any strays.
+homeassistant/**/*.local.yaml
+# Per-user device fleet manifest (slugs, friendly names, IPs). Drives
+# tools/ha-regen.py. Stays local so the public repo doesn't carry any
+# one user's device MACs / LAN addresses. Ship devices.example.yaml.
+homeassistant/devices.yaml
+# Default device slug remembered by tools/ha-regen.sh so subsequent
+# runs don't need the arg. Per-user.
+.ha-regen-default
+# Legacy state file from b302-era URL flag (no longer used; gitignored
+# so existing local copies stay invisible).
+.ha-regen-url-default
+
+# Python cache
+__pycache__/
+*.pyc
+
+Documents/
+
+# Editor / IDE state — per-developer, often contains user-folder paths.
+.vscode/
+.idea/

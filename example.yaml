@@ -1,0 +1,44 @@
+# Irrigoto — Home Assistant ESPHome Builder install
+#
+# To deploy this firmware to a device via the HA ESPHome Builder add-on:
+#
+#   1. Copy these two files from the repo into /config/esphome/ on
+#      your HA host:
+#        - example.yaml                         (this file)
+#        - esphome/irrigoto-partitions.csv      (8 MB OTA partition table)
+#
+#   2. Make sure /config/esphome/secrets.yaml contains:
+#
+#        api_key:        "<openssl rand -base64 32>"  # ESPHome API key
+#        ota_password:   "<any string>"               # OTA upload password
+#        wifi_ssid:      "<your WiFi SSID>"
+#        wifi_password:  "<your WiFi password>"
+#        ap_password:    "<8+ chars>"                  # Fallback hotspot pwd
+#
+#   3. In the ESPHome Builder UI, click "New Device" -> "Continue" ->
+#      "Skip" the wizard, then open this YAML and click "Install".
+#      First flash needs USB (Builder will prompt for a port); subsequent
+#      flashes go over WiFi automatically.
+#
+# To pin to a specific firmware release instead of tracking main, change
+# `ref: main` (in BOTH places below) to a release tag like `ref: v392`.
+# main can move at any time; tags are immutable. Each published release is
+# tagged `v<build>` (see the repo's tags for the available builds).
+#
+# Hardware: ESP32-WROOM with 8 MB flash, OtO sprinkler control board.
+# Source: https://github.com/rob-farrellrobotics/irrigoto
+
+packages:
+  irrigoto:
+    url: https://github.com/rob-farrellrobotics/irrigoto
+    ref: main
+    files:
+      - esphome/irrigoto-core.yaml
+    refresh: 1d
+
+external_components:
+  - source:
+      type: git
+      url: https://github.com/rob-farrellrobotics/irrigoto
+      ref: main
+    components: [irrigoto]
