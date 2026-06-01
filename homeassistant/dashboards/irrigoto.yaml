@@ -1,0 +1,998 @@
+# irrigoto — Lovelace dashboard (SINGLE-DEVICE TEMPLATE)
+#
+# This file describes ONE device's dashboard using <<DEV_*>> placeholders.
+# tools/ha-regen.py turns it into a multi-device dashboard: it adds a
+# device picker to the top of every tab and repeats each tab's cards once
+# per device, each copy wrapped in a `conditional` so only the selected
+# device's cards show. You author/maintain it as if there were a single
+# device; regen handles the multiplication.
+#
+# Install the GENERATED file (generated/dashboards/irrigoto.yaml):
+#   Settings → Dashboards → + Add Dashboard → Title "Irrigoto" →
+#   "New dashboard from scratch" → three-dot menu → "Edit dashboard" →
+#   three-dot menu → "Raw configuration editor" → paste its contents.
+#
+# Uses built-in card types (entities, tile, conditional, select,
+# statistics-graph, history-graph, logbook) PLUS the optional custom
+# irrigoto-heatmap-card on the Heatmaps tab (install per
+# homeassistant/lovelace/README.md).
+#
+# >>>STRIP-ON-REGEN-START<<<
+# Placeholder tokens (substituted per device by ha-regen):
+#   <<DEV_DASH>>  →  dashed device slug      (e.g. irrigoto-ab12cd)
+#   <<DEV_USC>>   →  underscored slug         (entity IDs)
+#   <<DEV_URL>>   →  device base URL
+#   <<DEV_NAME>>  →  friendly name            (picker / conditional match)
+# They are deliberately invalid YAML so HA errors loudly if you ever
+# paste this template instead of the generated file. The device
+# picker (input_select.irrigoto_active_device) and the per-tab
+# conditional wrappers are injected by regen, not written here.
+#
+# Heatmap cards resolve the live device URL from the device's wifi_info
+# ip_address entity (firmware b307+); no IP is hardcoded. The mirror_slug
+# config tells the card which per-device cache folder to fall back to
+# (/local/community/irrigoto/<slug>/csv/) when the device is asleep.
+# ─────────────────────────────────────────────────────────────────────
+# >>>STRIP-ON-REGEN-END<<<
+
+title: Irrigoto
+views:
+  - title: Overview
+    path: overview
+    icon: mdi:sprinkler-variant
+    panel: true
+    cards:
+      - type: horizontal-stack
+        cards:
+          - type: vertical-stack
+            cards:
+              - type: tile
+                entity: sensor.<<DEV_USC>>_irrigoto_status
+                name: Status
+                icon: mdi:state-machine
+                color: green
+                show_entity_picture: false
+                tap_action:
+                  action: more-info
+              - type: conditional
+                conditions:
+                  - entity: binary_sensor.<<DEV_USC>>_irrigoto_watering
+                    state: 'on'
+                card:
+                  type: tile
+                  entity: sensor.<<DEV_USC>>_irrigoto_water_minutes_remaining
+                  name: Time remaining
+                  icon: mdi:timer-sand
+                  color: blue
+                  show_entity_picture: false
+                  tap_action:
+                    action: more-info
+              - type: horizontal-stack
+                cards:
+                  - type: tile
+                    entity: binary_sensor.<<DEV_USC>>_irrigoto_online
+                    name: Online
+                    color: green
+                  - type: tile
+                    entity: binary_sensor.<<DEV_USC>>_irrigoto_watering
+                    name: Watering
+                    color: blue
+                  - type: tile
+                    entity: switch.<<DEV_USC>>_irrigoto_auto_sleep
+                    name: Auto-sleep
+                    color: orange
+                    tap_action:
+                      action: toggle
+              - type: tile
+                entity: switch.<<DEV_USC>>_valve
+                name: Valve
+                icon: mdi:valve
+                color: blue
+                tap_action:
+                  action: toggle
+              - type: entities
+                state_color: false
+                entities:
+                  - entity: automation.irrigoto_<<DEV_USC>>_disable_auto_sleep_when_device_comes_online
+                    name: Auto sleep disable on connect
+              - type: entities
+                title: Schedule
+                show_header_toggle: false
+                entities:
+                  - entity: sensor.<<DEV_USC>>_irrigoto_next_scheduled_run
+                    name: Next run
+                    icon: mdi:clock-outline
+                  - entity: sensor.<<DEV_USC>>_irrigoto_schedule_delay
+                    name: Rain delay
+                    icon: mdi:weather-pouring
+                  - entity: sensor.<<DEV_USC>>_irrigoto_last_schedule_update
+                    name: Last update
+                    icon: mdi:calendar-check-outline
+                  - entity: input_text.<<DEV_USC>>_schedule_mirror
+                    name: Live schedule
+                    icon: mdi:calendar-text
+              - type: logbook
+                title: Recent activity
+                hours_to_show: 168
+                entities:
+                  - sensor.<<DEV_USC>>_watering_completions
+                  - sensor.<<DEV_USC>>_watering_log
+                  - sensor.<<DEV_USC>>_calibration_log
+          - type: vertical-stack
+            cards:
+              - type: entities
+                title: Current zone / mode selection
+                show_header_toggle: false
+                entities:
+                  - entity: input_select.<<DEV_USC>>_water_zone
+                    name: Zone
+                  - entity: input_select.<<DEV_USC>>_water_mode
+                    name: Mode
+                  - entity: input_select.<<DEV_USC>>_water_depth
+                    name: Depth
+              - type: horizontal-stack
+                cards:
+                  - type: button
+                    name: Start watering
+                    icon: mdi:play-circle-outline
+                    icon_height: 36px
+                    tap_action:
+                      action: perform-action
+                      perform_action: script.<<DEV_USC>>_water_now
+                  - type: button
+                    name: Stop watering
+                    icon: mdi:stop-circle-outline
+                    icon_height: 36px
+                    tap_action:
+                      action: perform-action
+                      perform_action: esphome.<<DEV_USC>>_stop
+          - type: vertical-stack
+            cards:
+              - type: entities
+                title: Last watering
+                show_header_toggle: false
+                entities:
+                  - entity: sensor.<<DEV_USC>>_last_watering_zone
+                    name: Zone
+                  - entity: sensor.<<DEV_USC>>_last_watering_duration
+                    name: Duration
+                  - entity: sensor.<<DEV_USC>>_last_watering_volume
+                    name: Volume
+                  - entity: sensor.<<DEV_USC>>_last_watering_area
+                    name: Area covered
+                  - entity: sensor.<<DEV_USC>>_last_watering_score
+                    name: Coverage score
+                  - entity: sensor.<<DEV_USC>>_last_watering_status
+                    name: Status
+              - type: logbook
+                title: Watering history
+                hours_to_show: 336
+                target:
+                  entity_id:
+                    - sensor.<<DEV_USC>>_watering_completions
+              - type: entity
+                entity: sensor.<<DEV_USC>>_irrigoto_battery_voltage
+                name: Battery Voltage
+  - title: Trends
+    path: trends
+    icon: mdi:chart-line
+    cards:
+      - type: statistics-graph
+        title: Depth applied (daily, by zone) — last 7 days
+        chart_type: bar
+        period: day
+        days_to_show: 7
+        stat_types:
+          - change
+        entities:
+          - sensor.<<DEV_USC>>_zone_1_cumulative_depth
+          - sensor.<<DEV_USC>>_zone_2_cumulative_depth
+          - sensor.<<DEV_USC>>_zone_3_cumulative_depth
+          - sensor.<<DEV_USC>>_zone_4_cumulative_depth
+          - sensor.<<DEV_USC>>_zone_5_cumulative_depth
+          - sensor.<<DEV_USC>>_zone_6_cumulative_depth
+          - sensor.<<DEV_USC>>_zone_7_cumulative_depth
+          - sensor.<<DEV_USC>>_zone_8_cumulative_depth
+      - type: statistics-graph
+        title: Watering score by zone (daily mean) — last 30 days
+        chart_type: bar
+        period: day
+        days_to_show: 30
+        stat_types:
+          - mean
+        entities:
+          - sensor.<<DEV_USC>>_zone_1_last_score
+          - sensor.<<DEV_USC>>_zone_2_last_score
+          - sensor.<<DEV_USC>>_zone_3_last_score
+          - sensor.<<DEV_USC>>_zone_4_last_score
+          - sensor.<<DEV_USC>>_zone_5_last_score
+          - sensor.<<DEV_USC>>_zone_6_last_score
+          - sensor.<<DEV_USC>>_zone_7_last_score
+          - sensor.<<DEV_USC>>_zone_8_last_score
+      - type: grid
+        columns: 2
+        square: false
+        cards:
+          - type: conditional
+            conditions:
+              - condition: state
+                entity: binary_sensor.<<DEV_USC>>_zone_1_exists
+                state: 'on'
+            card:
+              type: entities
+              title: Zone 1 — last run
+              show_header_toggle: false
+              entities:
+                - entity: sensor.<<DEV_USC>>_zone_1_last_finished
+                  name: Finished
+                - entity: sensor.<<DEV_USC>>_zone_1_last_volume
+                  name: Volume
+                - entity: sensor.<<DEV_USC>>_zone_1_last_duration
+                  name: Duration
+                - entity: sensor.<<DEV_USC>>_zone_1_last_polygon_coverage
+                  name: Coverage
+                - entity: sensor.<<DEV_USC>>_zone_1_last_score
+                  name: Score
+                - entity: sensor.<<DEV_USC>>_zone_1_last_status
+                  name: Status
+          - type: conditional
+            conditions:
+              - condition: state
+                entity: binary_sensor.<<DEV_USC>>_zone_2_exists
+                state: 'on'
+            card:
+              type: entities
+              title: Zone 2 — last run
+              show_header_toggle: false
+              entities:
+                - entity: sensor.<<DEV_USC>>_zone_2_last_finished
+                  name: Finished
+                - entity: sensor.<<DEV_USC>>_zone_2_last_volume
+                  name: Volume
+                - entity: sensor.<<DEV_USC>>_zone_2_last_duration
+                  name: Duration
+                - entity: sensor.<<DEV_USC>>_zone_2_last_polygon_coverage
+                  name: Coverage
+                - entity: sensor.<<DEV_USC>>_zone_2_last_score
+                  name: Score
+                - entity: sensor.<<DEV_USC>>_zone_2_last_status
+                  name: Status
+          - type: conditional
+            conditions:
+              - condition: state
+                entity: binary_sensor.<<DEV_USC>>_zone_3_exists
+                state: 'on'
+            card:
+              type: entities
+              title: Zone 3 — last run
+              show_header_toggle: false
+              entities:
+                - entity: sensor.<<DEV_USC>>_zone_3_last_finished
+                  name: Finished
+                - entity: sensor.<<DEV_USC>>_zone_3_last_volume
+                  name: Volume
+                - entity: sensor.<<DEV_USC>>_zone_3_last_duration
+                  name: Duration
+                - entity: sensor.<<DEV_USC>>_zone_3_last_polygon_coverage
+                  name: Coverage
+                - entity: sensor.<<DEV_USC>>_zone_3_last_score
+                  name: Score
+                - entity: sensor.<<DEV_USC>>_zone_3_last_status
+                  name: Status
+          - type: conditional
+            conditions:
+              - condition: state
+                entity: binary_sensor.<<DEV_USC>>_zone_4_exists
+                state: 'on'
+            card:
+              type: entities
+              title: Zone 4 — last run
+              show_header_toggle: false
+              entities:
+                - entity: sensor.<<DEV_USC>>_zone_4_last_finished
+                  name: Finished
+                - entity: sensor.<<DEV_USC>>_zone_4_last_volume
+                  name: Volume
+                - entity: sensor.<<DEV_USC>>_zone_4_last_duration
+                  name: Duration
+                - entity: sensor.<<DEV_USC>>_zone_4_last_polygon_coverage
+                  name: Coverage
+                - entity: sensor.<<DEV_USC>>_zone_4_last_score
+                  name: Score
+                - entity: sensor.<<DEV_USC>>_zone_4_last_status
+                  name: Status
+          - type: conditional
+            conditions:
+              - condition: state
+                entity: binary_sensor.<<DEV_USC>>_zone_5_exists
+                state: 'on'
+            card:
+              type: entities
+              title: Zone 5 — last run
+              show_header_toggle: false
+              entities:
+                - entity: sensor.<<DEV_USC>>_zone_5_last_finished
+                  name: Finished
+                - entity: sensor.<<DEV_USC>>_zone_5_last_volume
+                  name: Volume
+                - entity: sensor.<<DEV_USC>>_zone_5_last_duration
+                  name: Duration
+                - entity: sensor.<<DEV_USC>>_zone_5_last_polygon_coverage
+                  name: Coverage
+                - entity: sensor.<<DEV_USC>>_zone_5_last_score
+                  name: Score
+                - entity: sensor.<<DEV_USC>>_zone_5_last_status
+                  name: Status
+          - type: conditional
+            conditions:
+              - condition: state
+                entity: binary_sensor.<<DEV_USC>>_zone_6_exists
+                state: 'on'
+            card:
+              type: entities
+              title: Zone 6 — last run
+              show_header_toggle: false
+              entities:
+                - entity: sensor.<<DEV_USC>>_zone_6_last_finished
+                  name: Finished
+                - entity: sensor.<<DEV_USC>>_zone_6_last_volume
+                  name: Volume
+                - entity: sensor.<<DEV_USC>>_zone_6_last_duration
+                  name: Duration
+                - entity: sensor.<<DEV_USC>>_zone_6_last_polygon_coverage
+                  name: Coverage
+                - entity: sensor.<<DEV_USC>>_zone_6_last_score
+                  name: Score
+                - entity: sensor.<<DEV_USC>>_zone_6_last_status
+                  name: Status
+          - type: conditional
+            conditions:
+              - condition: state
+                entity: binary_sensor.<<DEV_USC>>_zone_7_exists
+                state: 'on'
+            card:
+              type: entities
+              title: Zone 7 — last run
+              show_header_toggle: false
+              entities:
+                - entity: sensor.<<DEV_USC>>_zone_7_last_finished
+                  name: Finished
+                - entity: sensor.<<DEV_USC>>_zone_7_last_volume
+                  name: Volume
+                - entity: sensor.<<DEV_USC>>_zone_7_last_duration
+                  name: Duration
+                - entity: sensor.<<DEV_USC>>_zone_7_last_polygon_coverage
+                  name: Coverage
+                - entity: sensor.<<DEV_USC>>_zone_7_last_score
+                  name: Score
+                - entity: sensor.<<DEV_USC>>_zone_7_last_status
+                  name: Status
+          - type: conditional
+            conditions:
+              - condition: state
+                entity: binary_sensor.<<DEV_USC>>_zone_8_exists
+                state: 'on'
+            card:
+              type: entities
+              title: Zone 8 — last run
+              show_header_toggle: false
+              entities:
+                - entity: sensor.<<DEV_USC>>_zone_8_last_finished
+                  name: Finished
+                - entity: sensor.<<DEV_USC>>_zone_8_last_volume
+                  name: Volume
+                - entity: sensor.<<DEV_USC>>_zone_8_last_duration
+                  name: Duration
+                - entity: sensor.<<DEV_USC>>_zone_8_last_polygon_coverage
+                  name: Coverage
+                - entity: sensor.<<DEV_USC>>_zone_8_last_score
+                  name: Score
+                - entity: sensor.<<DEV_USC>>_zone_8_last_status
+                  name: Status
+      - type: logbook
+        title: Watering history (completed cycles)
+        hours_to_show: 336
+        entities:
+          - sensor.<<DEV_USC>>_watering_completions
+      - chart_type: bar
+        period: hour
+        type: statistics-graph
+        title: Battery V (hourly mean) — last 7 days
+        days_to_show: 7
+        stat_types:
+          - mean
+        entities:
+          - sensor.<<DEV_USC>>_irrigoto_battery_voltage
+        min_y_axis: 3.6
+        max_y_axis: 4.3
+  - title: Heatmaps
+    path: heatmaps
+    icon: mdi:thermometer-water
+    type: sections
+    max_columns: 2
+    sections:
+      - type: grid
+        column_span: 2
+        cards:
+          - type: markdown
+            content: >
+              ### Watering depth heatmaps
+
+              One card per zone that has been watered at least once. Each shows
+              the same heatmap as the device's own zone page (🌡 → Actual),
+              themed to match HA. Click ↻ in a card header to refresh. Color
+              ramp: **blue** = under, **green** = on target (1/8" per pass),
+              **amber/red** = over.
+      - type: grid
+        cards:
+          - type: conditional
+            conditions:
+              - condition: state
+                entity: binary_sensor.<<DEV_USC>>_zone_1_exists
+                state: 'on'
+            card:
+              type: custom:irrigoto-heatmap-card
+              device: <<DEV_DASH>>
+              mirror_slug: <<DEV_DASH>>
+              zone_id: 0
+              title: Zone 1 heatmap
+      - type: grid
+        cards:
+          - type: conditional
+            conditions:
+              - condition: state
+                entity: binary_sensor.<<DEV_USC>>_zone_2_exists
+                state: 'on'
+            card:
+              type: custom:irrigoto-heatmap-card
+              device: <<DEV_DASH>>
+              mirror_slug: <<DEV_DASH>>
+              zone_id: 1
+              title: Zone 2 heatmap
+      - type: grid
+        cards:
+          - type: conditional
+            conditions:
+              - condition: state
+                entity: binary_sensor.<<DEV_USC>>_zone_3_exists
+                state: 'on'
+            card:
+              type: custom:irrigoto-heatmap-card
+              device: <<DEV_DASH>>
+              mirror_slug: <<DEV_DASH>>
+              zone_id: 2
+              title: Zone 3 heatmap
+      - type: grid
+        cards:
+          - type: conditional
+            conditions:
+              - condition: state
+                entity: binary_sensor.<<DEV_USC>>_zone_4_exists
+                state: 'on'
+            card:
+              type: custom:irrigoto-heatmap-card
+              device: <<DEV_DASH>>
+              mirror_slug: <<DEV_DASH>>
+              zone_id: 3
+              title: Zone 4 heatmap
+      - type: grid
+        cards:
+          - type: conditional
+            conditions:
+              - condition: state
+                entity: binary_sensor.<<DEV_USC>>_zone_5_exists
+                state: 'on'
+            card:
+              type: custom:irrigoto-heatmap-card
+              device: <<DEV_DASH>>
+              mirror_slug: <<DEV_DASH>>
+              zone_id: 4
+              title: Zone 5 heatmap
+      - type: grid
+        cards:
+          - type: conditional
+            conditions:
+              - condition: state
+                entity: binary_sensor.<<DEV_USC>>_zone_6_exists
+                state: 'on'
+            card:
+              type: custom:irrigoto-heatmap-card
+              device: <<DEV_DASH>>
+              mirror_slug: <<DEV_DASH>>
+              zone_id: 5
+              title: Zone 6 heatmap
+      - type: grid
+        cards:
+          - type: conditional
+            conditions:
+              - condition: state
+                entity: binary_sensor.<<DEV_USC>>_zone_7_exists
+                state: 'on'
+            card:
+              type: custom:irrigoto-heatmap-card
+              device: <<DEV_DASH>>
+              mirror_slug: <<DEV_DASH>>
+              zone_id: 6
+              title: Zone 7 heatmap
+      - type: grid
+        cards:
+          - type: conditional
+            conditions:
+              - condition: state
+                entity: binary_sensor.<<DEV_USC>>_zone_8_exists
+                state: 'on'
+            card:
+              type: custom:irrigoto-heatmap-card
+              device: <<DEV_DASH>>
+              mirror_slug: <<DEV_DASH>>
+              zone_id: 7
+              title: Zone 8 heatmap
+  - title: Chase
+    path: chase
+    icon: mdi:dog-side
+    cards:
+      - type: markdown
+        content: >
+          ### 🐶 Chase mode
+
+          Slow-wandering water stream that stays inside the zone polygon —
+          designed so a dog or kid can chase the spray without it ever escaping
+          the boundary. Pick a duration, tap a zone. Press Stop (or the device's
+          web Stop button) to end early.
+      - type: entities
+        title: Duration
+        show_header_toggle: false
+        entities:
+          - entity: input_number.<<DEV_USC>>_chase_duration
+            name: Chase duration
+      - type: grid
+        columns: 2
+        square: false
+        cards:
+          - type: conditional
+            conditions:
+              - condition: state
+                entity: binary_sensor.<<DEV_USC>>_zone_1_exists
+                state: 'on'
+            card:
+              type: button
+              name: Chase Zone 1
+              icon: mdi:dog
+              tap_action:
+                action: call-service
+                service: script.<<DEV_USC>>_chase_zone_0
+          - type: conditional
+            conditions:
+              - condition: state
+                entity: binary_sensor.<<DEV_USC>>_zone_2_exists
+                state: 'on'
+            card:
+              type: button
+              name: Chase Zone 2
+              icon: mdi:dog
+              tap_action:
+                action: call-service
+                service: script.<<DEV_USC>>_chase_zone_1
+          - type: conditional
+            conditions:
+              - condition: state
+                entity: binary_sensor.<<DEV_USC>>_zone_3_exists
+                state: 'on'
+            card:
+              type: button
+              name: Chase Zone 3
+              icon: mdi:dog
+              tap_action:
+                action: call-service
+                service: script.<<DEV_USC>>_chase_zone_2
+          - type: conditional
+            conditions:
+              - condition: state
+                entity: binary_sensor.<<DEV_USC>>_zone_4_exists
+                state: 'on'
+            card:
+              type: button
+              name: Chase Zone 4
+              icon: mdi:dog
+              tap_action:
+                action: call-service
+                service: script.<<DEV_USC>>_chase_zone_3
+          - type: conditional
+            conditions:
+              - condition: state
+                entity: binary_sensor.<<DEV_USC>>_zone_5_exists
+                state: 'on'
+            card:
+              type: button
+              name: Chase Zone 5
+              icon: mdi:dog
+              tap_action:
+                action: call-service
+                service: script.<<DEV_USC>>_chase_zone_4
+          - type: conditional
+            conditions:
+              - condition: state
+                entity: binary_sensor.<<DEV_USC>>_zone_6_exists
+                state: 'on'
+            card:
+              type: button
+              name: Chase Zone 6
+              icon: mdi:dog
+              tap_action:
+                action: call-service
+                service: script.<<DEV_USC>>_chase_zone_5
+          - type: conditional
+            conditions:
+              - condition: state
+                entity: binary_sensor.<<DEV_USC>>_zone_7_exists
+                state: 'on'
+            card:
+              type: button
+              name: Chase Zone 7
+              icon: mdi:dog
+              tap_action:
+                action: call-service
+                service: script.<<DEV_USC>>_chase_zone_6
+          - type: conditional
+            conditions:
+              - condition: state
+                entity: binary_sensor.<<DEV_USC>>_zone_8_exists
+                state: 'on'
+            card:
+              type: button
+              name: Chase Zone 8
+              icon: mdi:dog
+              tap_action:
+                action: call-service
+                service: script.<<DEV_USC>>_chase_zone_7
+      - type: button
+        name: Stop watering
+        icon: mdi:stop-circle
+        tap_action:
+          action: call-service
+          service: script.<<DEV_USC>>_water_cancel
+  - title: Schedule
+    path: schedule
+    icon: mdi:calendar-clock
+    panel: true
+    cards:
+      - type: horizontal-stack
+        cards:
+          - type: vertical-stack
+            cards:
+              - type: markdown
+                title: Schedule
+                content: >
+                  {% set ha_entries =
+                  state_attr('sensor.irrigoto_desired_schedule', 'entries') |
+                  default([], true) %}
+
+                  {% set dev_entries =
+                  state_attr('sensor.<<DEV_USC>>_schedule_rest', 'entries')
+                  | default([], true) %}
+
+                  {% set MODES = ['Pulse','Gentle','Smooth'] %}
+
+                  {% set DEPTHS = ['1/8"','1/4"'] %}
+
+                  {% set DLET = ['S','M','T','W','T','F','S'] %}
+
+                  {% set rows = namespace(items=[]) %}
+
+                  {%- for e in ha_entries if (e.id | int(0)) > 0 -%}
+                    {%- set ns = namespace(dev_e=none) -%}
+                    {%- for d in dev_entries -%}
+                      {%- if (d.id | int(0)) == (e.id | int(0)) -%}
+                        {%- set ns.dev_e = d -%}
+                      {%- endif -%}
+                    {%- endfor -%}
+                    {%- set dev_e = ns.dev_e -%}
+                    {%- set ha_lm = e.last_modified | int(0) -%}
+                    {%- set dev_lm = (dev_e.last_modified if dev_e else 0) | int(0) -%}
+                    {%- if dev_e is none -%}{%- set status = 'pending push' -%}
+                    {%- elif ha_lm > dev_lm -%}{%- set status = 'pending push' -%}
+                    {%- elif dev_lm > ha_lm -%}{%- set status = 'pending pull' -%}
+                    {%- else -%}{%- set status = 'synced' -%}{%- endif -%}
+                    {%- set rows.items = rows.items + [{'slot': e.slot | int(0), 'zone': e.zone, 'mode': e.mode, 'depth': e.depth, 'time': e.time, 'days': e.days, 'enabled': e.enabled, 'lm': ha_lm, 'status': status}] -%}
+                  {%- endfor -%}
+
+                  {%- for e in ha_entries if (e.id | int(0)) == 0 -%}
+                    {%- set rows.items = rows.items + [{'slot': e.slot | int(0), 'zone': e.zone, 'mode': e.mode, 'depth': e.depth, 'time': e.time, 'days': e.days, 'enabled': e.enabled, 'lm': e.last_modified | int(0), 'status': 'new'}] -%}
+                  {%- endfor -%}
+
+                  {%- set ha_ids = ha_entries | rejectattr('id','equalto',0) |
+                  map(attribute='id') | map('int') | list -%}
+
+                  {%- for dev_e in dev_entries -%}
+                    {%- if (dev_e.id | int(0)) not in ha_ids -%}
+                      {%- set mask = dev_e.days_mask | int(0) -%}
+                      {%- set ds = namespace(s='') -%}
+                      {%- if mask == 127 -%}{%- set ds.s = 'Daily' -%}
+                      {%- elif mask == 62 -%}{%- set ds.s = 'Weekdays' -%}
+                      {%- elif mask == 65 -%}{%- set ds.s = 'Weekends' -%}
+                      {%- elif mask == 42 -%}{%- set ds.s = 'MWF' -%}
+                      {%- elif mask == 20 -%}{%- set ds.s = 'TTh' -%}
+                      {%- else -%}
+                        {%- for i in range(7) -%}{%- if mask | bitwise_and(2**i) > 0 -%}{%- set ds.s = ds.s ~ DLET[i] -%}{%- endif -%}{%- endfor -%}
+                      {%- endif -%}
+                      {%- set rows.items = rows.items + [{'slot': 0, 'zone': dev_e.zone, 'mode': MODES[dev_e.mode | int(0)], 'depth': DEPTHS[dev_e.depth | int(0)], 'time': '%02d:%02d' | format(dev_e.hour | int(0), dev_e.minute | int(0)), 'days': ds.s, 'enabled': (dev_e.enabled | int(0)) == 1, 'lm': dev_e.last_modified | int(0), 'status': 'pending pull'}] -%}
+                    {%- endif -%}
+                  {%- endfor -%}
+
+                  {% if rows.items | count == 0 -%}
+
+                  _No schedule on HA or device. Use the **Compose entry** form
+                  below to add one._
+
+                  {%- else -%}
+
+                  <table style="font-size: 0.78em; border-collapse: collapse;">
+
+                  <thead><tr>
+
+                  <th style="text-align:right; padding: 2px 6px;">Slot</th>
+
+                  <th style="text-align:left; padding: 2px 6px;">Status</th>
+
+                  <th style="text-align:right; padding: 2px 6px;">Zone</th>
+
+                  <th style="text-align:left; padding: 2px 6px;">Mode</th>
+
+                  <th style="text-align:left; padding: 2px 6px;">Depth</th>
+
+                  <th style="text-align:left; padding: 2px 6px;">Time</th>
+
+                  <th style="text-align:left; padding: 2px 6px;">Days</th>
+
+                  <th style="text-align:center; padding: 2px 6px;">On</th>
+
+                  <th style="text-align:left; padding: 2px 6px;">Modified</th>
+
+                  </tr></thead>
+
+                  <tbody>
+
+                  {% for r in rows.items | sort(attribute='slot') -%}
+
+                  {% set icon = '✓' if r.status == 'synced' else ('⬆' if
+                  r.status == 'pending push' else ('⬇' if r.status == 'pending
+                  pull' else '★')) -%}
+
+                  {% set days_str = r.days if r.days is string else (r.days |
+                  join(',')) -%}
+
+                  {% set lm_s = r.lm | timestamp_custom('%Y-%m-%d %H:%M', true)
+                  if r.lm > 1700000000 else '—' -%}
+
+                  <tr>
+
+                  <td style="text-align:right; padding: 1px 6px;">{{ r.slot if
+                  r.slot else '—' }}</td>
+
+                  <td style="padding: 1px 6px;">{{ icon }} {{ r.status }}</td>
+
+                  <td style="text-align:right; padding: 1px 6px;">{{ r.zone
+                  }}</td>
+
+                  <td style="padding: 1px 6px;">{{ r.mode }}</td>
+
+                  <td style="padding: 1px 6px;">{{ r.depth }}</td>
+
+                  <td style="padding: 1px 6px;">{{ r.time }}</td>
+
+                  <td style="padding: 1px 6px;">{{ days_str }}</td>
+
+                  <td style="text-align:center; padding: 1px 6px;">{{ '✓' if
+                  r.enabled else '✗' }}</td>
+
+                  <td style="padding: 1px 6px;">{{ lm_s }}</td>
+
+                  </tr>
+
+                  {% endfor -%}
+
+                  </tbody>
+
+                  </table>
+
+                  {%- endif %}
+              - type: entities
+                title: Schedule status
+                show_header_toggle: false
+                entities:
+                  - entity: sensor.irrigoto_desired_schedule
+                    name: Desired (count)
+                    secondary_info: last-updated
+                  - entity: sensor.<<DEV_USC>>_schedule_pending_outbound
+                    name: Push to device (HA → device)
+                    secondary_info: last-updated
+                  - entity: sensor.<<DEV_USC>>_schedule_pending_inbound
+                    name: Pull from device (device → HA)
+                    secondary_info: last-updated
+                  - entity: sensor.<<DEV_USC>>_desired_rendered
+                    name: This device's slice
+                    icon: mdi:calendar-arrow-right
+                  - entity: sensor.<<DEV_USC>>_schedule_full
+                    name: This device reports
+                    icon: mdi:calendar-text
+                  - type: attribute
+                    entity: sensor.<<DEV_USC>>_schedule_full
+                    attribute: schedule_version
+                    name: Device schedule_version
+                    icon: mdi:counter
+                  - entity: input_text.<<DEV_USC>>_last_seen_schedule_version
+                    name: HA last-seen version
+                    icon: mdi:counter
+          - type: vertical-stack
+            cards:
+              - type: entities
+                title: Compose entry
+                show_header_toggle: false
+                entities:
+                  - entity: input_number.irrigoto_compose_slot
+                    name: Slot (1-10)
+                  - entity: input_select.irrigoto_compose_device
+                    name: Device
+                  - entity: input_select.irrigoto_compose_zone
+                    name: Zone
+                  - entity: input_select.irrigoto_compose_mode
+                    name: Mode
+                  - entity: input_select.irrigoto_compose_depth
+                    name: Depth
+                  - entity: input_datetime.irrigoto_compose_time
+                    name: Time
+                  - entity: input_select.irrigoto_compose_days
+                    name: Days
+                  - entity: input_text.irrigoto_compose_days_custom
+                    name: Custom days mask (0-127, used when Days = Custom)
+                  - entity: input_boolean.irrigoto_compose_enabled
+                    name: Enabled
+              - type: horizontal-stack
+                cards:
+                  - type: button
+                    name: Save
+                    icon: mdi:content-save-outline
+                    tap_action:
+                      action: perform-action
+                      perform_action: script.irrigoto_compose_save_to_slot
+                  - type: button
+                    name: Clear slot
+                    icon: mdi:close-circle-outline
+                    tap_action:
+                      action: perform-action
+                      perform_action: script.irrigoto_compose_clear_slot
+                  - type: button
+                    name: Clear ALL
+                    icon: mdi:delete-sweep-outline
+                    tap_action:
+                      action: perform-action
+                      perform_action: script.irrigoto_compose_clear_all
+                  - type: button
+                    name: Open device editor
+                    icon: mdi:open-in-new
+                    tap_action:
+                      action: url
+                      url_path: <<DEV_URL>>/schedule
+              - type: conditional
+                conditions:
+                  - entity: sensor.<<DEV_USC>>_irrigoto_schedule_delay
+                    state: 'off'
+                card:
+                  type: horizontal-stack
+                  cards:
+                    - type: button
+                      name: Delay 6h
+                      icon: mdi:timer-sand
+                      tap_action:
+                        action: perform-action
+                        perform_action: esphome.<<DEV_USC>>_delay_schedule_hours
+                        data:
+                          hours: 6
+                    - type: button
+                      name: Delay 12h
+                      icon: mdi:timer-sand
+                      tap_action:
+                        action: perform-action
+                        perform_action: esphome.<<DEV_USC>>_delay_schedule_hours
+                        data:
+                          hours: 12
+                    - type: button
+                      name: Delay 24h
+                      icon: mdi:timer-sand
+                      tap_action:
+                        action: perform-action
+                        perform_action: esphome.<<DEV_USC>>_delay_schedule_hours
+                        data:
+                          hours: 24
+                    - type: button
+                      name: Delay 48h
+                      icon: mdi:timer-sand
+                      tap_action:
+                        action: perform-action
+                        perform_action: esphome.<<DEV_USC>>_delay_schedule_hours
+                        data:
+                          hours: 48
+              - type: conditional
+                conditions:
+                  - entity: sensor.<<DEV_USC>>_irrigoto_schedule_delay
+                    state_not: 'off'
+                card:
+                  type: button
+                  name: Cancel rain delay
+                  icon: mdi:close-circle-outline
+                  tap_action:
+                    action: perform-action
+                    perform_action: esphome.<<DEV_USC>>_delay_schedule_hours
+                    data:
+                      hours: 0
+  - title: Device
+    path: device
+    icon: mdi:chip
+    cards:
+      - type: entities
+        title: Status
+        show_header_toggle: false
+        entities:
+          - entity: binary_sensor.<<DEV_USC>>_irrigoto_online
+            name: Online
+          - entity: sensor.<<DEV_USC>>_irrigoto_status
+            name: Activity
+          - entity: sensor.<<DEV_USC>>_irrigoto_last_sleep_reason
+            name: Last sleep reason
+          - entity: sensor.<<DEV_USC>>_irrigoto_reset_reason
+            name: Reset reason
+          - entity: sensor.<<DEV_USC>>_irrigoto_boot_diag
+            name: Boot diagnostics
+          - entity: sensor.<<DEV_USC>>_irrigoto_battery_voltage
+            name: Battery
+          - entity: sensor.<<DEV_USC>>_irrigoto_pressure
+            name: Supply pressure
+          - entity: sensor.<<DEV_USC>>_irrigoto_throw_distance
+            name: Current throw distance
+      - type: vertical-stack
+        cards:
+          - type: entities
+            title: Power management
+            show_header_toggle: false
+            entities:
+              - entity: switch.<<DEV_USC>>_irrigoto_auto_sleep
+                name: Auto-sleep enabled
+              - entity: number.<<DEV_USC>>_irrigoto_inactivity_timeout
+                name: Inactivity timeout (min)
+              - entity: number.<<DEV_USC>>_irrigoto_sleep_duration
+                name: Sleep duration (s)
+              - entity: number.<<DEV_USC>>_irrigoto_nozzle_dwell_timeout
+                name: Nozzle dwell watchdog (s)
+          - type: button
+            name: Sleep 10 min
+            icon: mdi:sleep
+            icon_height: 36px
+            tap_action:
+              action: perform-action
+              perform_action: esphome.<<DEV_USC>>_sleep_now
+              data:
+                duration_s: 600
+          - type: button
+            name: Open device web UI
+            icon: mdi:open-in-new
+            icon_height: 36px
+            tap_action:
+              action: url
+              url_path: http://<<DEV_DASH>>.local
+  - title: Calibration
+    path: calibration
+    icon: mdi:tune
+    cards:
+      - type: entities
+        title: State
+        show_header_toggle: false
+        entities:
+          - entity: sensor.<<DEV_USC>>_irrigoto_calibration_state
+            name: Current state
+      - type: button
+        name: Open cal page on device
+        icon: mdi:open-in-new
+        icon_height: 36px
+        tap_action:
+          action: url
+          url_path: http://<<DEV_DASH>>.local/cal

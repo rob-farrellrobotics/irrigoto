@@ -1,0 +1,108 @@
+# irrigoto — shared Home Assistant package (TEMPLATE)
+#
+# This is the DEVICE-AGNOSTIC half of the irrigoto HA config. Exactly one
+# copy is installed regardless of how many devices you run. It holds:
+#
+#   • input_select.irrigoto_active_device — the dashboard's device picker.
+#     Its options are the friendly names from homeassistant/devices.yaml.
+#   • shell_command.* — the HTTP helpers every device shares. They are
+#     parameterized (ip / zone_id / slug / duration), so one definition
+#     serves the whole fleet; per-device automations pass their own values.
+#   • sensor.irrigoto_activity_log — a fleet-wide logbook sink for HA-side
+#     actions that aren't tied to one device (schedule compose edits, etc).
+#
+# Everything here is SHARED, so its entities use the bare `irrigoto_`
+# prefix — never a device slug. Per-device entities live in
+# irrigoto_device.yaml and are prefixed with the device's slug instead.
+#
+# tools/ha-regen.py fills the device list below from devices.yaml and
+# writes generated/packages/irrigoto_common.yaml. Drop that one file (plus
+# the generated per-device files and irrigoto_schedule.yaml) into your HA
+# config/packages/ directory.
+
+# ── Device picker ────────────────────────────────────────────────────
+# Display-only: selecting a device here changes which cards the Irrigoto
+# dashboard shows. It does NOT gate automations — every device's
+# automations and sensors always run, for all devices, regardless of
+# what's selected here.
+input_select:
+  irrigoto_active_device:
+    name: Irrigoto device
+    icon: mdi:devices
+    options:
+      <<DEVICE_NAME_OPTIONS>>
+
+# ── Shared HTTP helpers ──────────────────────────────────────────────
+# All device-agnostic: the caller passes the target device's ip (and a
+# slug, for the mirror's per-device cache folder). curl -m caps each
+# request so a slow/asleep device can't hang HA; trailing `|| true` keeps
+# the call green in HA's UI so the card's fallback chain can take over.
+shell_command:
+  # Mirror per-zone heatmap data from one device into HA's static-file
+  # root so the irrigoto-heatmap-card can render even while the device
+  # sleeps. Files are namespaced by device slug so multiple devices never
+  # clobber each other's cache:
+  #   /config/www/community/irrigoto/<slug>/csv/   (served at
+  #   /local/community/irrigoto/<slug>/csv/)
+  #
+  # Three files per run: zone_<id>.csv (heat data), zone_<id>_lastwater
+  # .json (per-ring summary), api_all.json (zone polygons). Caller passes
+  # ip, zone_id (0-based) and slug (the device's dash-form slug).
+  irrigoto_mirror_zone: >-
+    /bin/sh -c "
+    mkdir -p /config/www/community/irrigoto/{{ slug }}/csv;
+    curl -fsS -m 10 -o /config/www/community/irrigoto/{{ slug }}/csv/api_all.json
+    'http://{{ ip }}/api/all' || true;
+    curl -fsS -m 10 -o /config/www/community/irrigoto/{{ slug }}/csv/zone_{{ zone_id }}_lastwater.json
+    'http://{{ ip }}/zone/last_water?id={{ zone_id }}' || true;
+    curl -fsS -m 10 -o /config/www/community/irrigoto/{{ slug }}/csv/zone_{{ zone_id }}.csv
+    'http://{{ ip }}/zone/water_csv?id={{ zone_id }}' || true
+    "
+
+  # Chase mode — entertainment watering. POST /zone/water with mode=c and
+  # a 1..10 minute duration. Returns immediately; cancel via
+  # irrigoto_water_cancel or the device web UI Stop button.
+  irrigoto_chase_zone: >-
+    curl -fsS -m 5 -X POST
+    -d 'id={{ zone_id }}&mode=c&duration={{ duration }}'
+    'http://{{ ip }}/zone/water'
+
+  # Start a normal watering run on one zone. mode is the style digit
+  # (1=Pulse, 5=Gentle, 7=Smooth); depth is the target in eighths of an inch
+  # (1..8 = 1/8".. 1"). (Chase uses irrigoto_chase_zone with mode=c.) The
+  # per-device water_now script fills these from the zone/mode/depth selectors.
+  irrigoto_water_zone: >-
+    curl -fsS -m 5 -X POST
+    -d 'id={{ zone_id }}&mode={{ mode }}&depth={{ depth }}'
+    'http://{{ ip }}/zone/water'
+
+  # Cancel any active watering (chase or otherwise). Idempotent.
+  irrigoto_water_cancel: >-
+    curl -fsS -m 5 -X POST 'http://{{ ip }}/zone/water/cancel' || true
+
+  # Valve open/close (kept off the HA service bus to stay under the
+  # ESPHome ListEntitiesServices send-buffer ceiling). Backs each
+  # device's "Irrigoto Valve" template switch.
+  irrigoto_valve_open: >-
+    curl -fsS -m 15 -X POST 'http://{{ ip }}/valve/open' || true
+  irrigoto_valve_close: >-
+    curl -fsS -m 15 -X POST 'http://{{ ip }}/valve/close' || true
+
+# ── Fleet-wide activity log sink ─────────────────────────────────────
+# A constant-state placeholder sensor used purely as a target for
+# logbook.log entries from HA-side, non-device-specific actions (schedule
+# compose saves/clears, overlap notices). Excluded from the logbook so its
+# own (meaningless) state changes don't show; the messages tagged against
+# it do. Per-device activity uses each device's own
+# sensor.<slug>_watering_log instead.
+logbook:
+  exclude:
+    entities:
+      - sensor.irrigoto_activity_log
+
+template:
+  - sensor:
+      - name: irrigoto activity log
+        unique_id: irrigoto_activity_log
+        icon: mdi:clipboard-text-clock
+        state: "ok"

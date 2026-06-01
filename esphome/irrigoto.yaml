@@ -1,0 +1,26 @@
+# Irrigoto — local dev wrapper.
+#
+# This file is what you compile against when working on the firmware
+# from a clone of the repo:
+#
+#   python -m esphome compile esphome/irrigoto.yaml
+#   python -m esphome run     esphome/irrigoto.yaml --device irrigoto-xxxxxx
+#
+# All of the device configuration lives in irrigoto-core.yaml so the
+# same body can also be served to ESPHome Builder users via the
+# repo-root example.yaml (which pulls irrigoto-core.yaml from git
+# and adds a `type: git` external_components source).
+#
+# The only thing this wrapper adds on top of the canonical config is
+# the local-checkout source for the irrigoto external component, so
+# edits to components/irrigoto/*.c|.py are picked up on the next
+# compile without a git push.
+
+packages:
+  irrigoto: !include irrigoto-core.yaml
+
+external_components:
+  - source:
+      type: local
+      path: ../components
+    components: [irrigoto]

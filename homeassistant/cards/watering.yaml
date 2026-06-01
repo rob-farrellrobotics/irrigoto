@@ -1,0 +1,72 @@
+# irrigoto — Watering history card snippets
+#
+# These cards depend on the per-device template sensors defined in
+# homeassistant/packages/irrigoto_device.yaml. Install that package first.
+#
+# Replace <<DEV_USC>> with your device's underscored slug (e.g.
+# irrigoto_ab12cd) throughout — these are per-device entities:
+#   sensor.<<DEV_USC>>_last_watering_zone
+#   sensor.<<DEV_USC>>_last_watering_duration
+#   sensor.<<DEV_USC>>_last_watering_volume
+#   sensor.<<DEV_USC>>_last_watering_area
+#   sensor.<<DEV_USC>>_last_watering_score
+#   sensor.<<DEV_USC>>_last_watering_status
+#   sensor.<<DEV_USC>>_cumulative_volume
+#   binary_sensor.<<DEV_USC>>_irrigoto_watering   (device-provided)
+#
+# Tip: instead of editing by hand, copy the equivalent card out of a
+# generated/dashboards/irrigoto.yaml where the slug is already filled.
+
+# ── Card A: Last watering details ────────────────────────────────────
+type: entities
+title: Last watering
+show_header_toggle: false
+entities:
+  - entity: sensor.<<DEV_USC>>_last_watering_zone
+    name: Zone
+  - entity: sensor.<<DEV_USC>>_last_watering_duration
+    name: Duration
+  - entity: sensor.<<DEV_USC>>_last_watering_volume
+    name: Volume
+  - entity: sensor.<<DEV_USC>>_last_watering_area
+    name: Area covered
+  - entity: sensor.<<DEV_USC>>_last_watering_score
+    name: Coverage score
+  - entity: sensor.<<DEV_USC>>_last_watering_status
+    name: Status
+
+# ── Card B: Cumulative water (long-term stats) ───────────────────────
+# Paste separately. Uses HA statistics so the graph survives past the
+# 10-day recorder window — months of data show up correctly.
+#
+# type: statistics-graph
+# title: Cumulative water (long term)
+# entities:
+#   - sensor.<<DEV_USC>>_cumulative_volume
+# chart_type: line
+# period: hour
+# days_to_show: 30
+# stat_types:
+#   - max
+
+# ── Card C: Watering activity history (last week) ────────────────────
+# Recorder-driven, last 7 days. Shows watering on/off bands per day.
+#
+# type: history-graph
+# title: Watering activity
+# hours_to_show: 168
+# entities:
+#   - binary_sensor.<<DEV_USC>>_irrigoto_watering
+#   - sensor.<<DEV_USC>>_irrigoto_active_zone
+
+# ── Card D: Recent waterings + cal in Logbook ────────────────────────
+# The package's automations append a Logbook line per watering and
+# per calibration; this card surfaces them in a dashboard panel.
+#
+# type: logbook
+# title: Recent activity
+# hours_to_show: 168
+# entities:
+#   - sensor.<<DEV_USC>>_irrigoto_status
+#   - binary_sensor.<<DEV_USC>>_irrigoto_watering
+#   - sensor.<<DEV_USC>>_irrigoto_calibration_state

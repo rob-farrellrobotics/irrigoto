@@ -1,0 +1,612 @@
+# Irrigoto — canonical device configuration
+#
+# This file is the source of truth for the device's ESPHome config.
+# It is NOT meant to be compiled directly — it omits the
+# `external_components:` block on purpose so the same file can be
+# included from two wrappers:
+#
+#   * esphome/irrigoto.yaml  – local dev wrapper (type: local)
+#   * example.yaml           – end-user wrapper for ESPHome Builder
+#                              (type: git, pulled from GitHub)
+#
+# Both wrappers `packages:`-include this file and add the appropriate
+# external_components source. Anything you change here flows to both.
+#
+# Partition path is a sibling-relative reference, so end users must
+# drop irrigoto-partitions.csv next to their wrapper yaml in
+# /config/esphome/. The dev wrapper sits next to its own copy in
+# esphome/irrigoto-partitions.csv.
+
+substitutions:
+  device_name: irrigoto
+  friendly_name: Irrigoto
+  # IANA timezone — used by ESPHome's own time formatting (display,
+  # automation triggers). Pre-parsed to a POSIX struct at codegen.
+  device_timezone: "America/New_York"
+  # POSIX TZ string — used to set libc's TZ env var so standard
+  # localtime_r() / mktime() work. ESPHome's set_global_tz on
+  # embedded targets doesn't touch libc TZ (only the host build
+  # variant does); without this, our schedule executor would
+  # interpret hour:minute fields in UTC instead of local time.
+  # Common values:
+  #   America/New_York : "EST5EDT,M3.2.0/2,M11.1.0/2"
+  #   America/Chicago  : "CST6CDT,M3.2.0/2,M11.1.0/2"
+  #   America/Denver   : "MST7MDT,M3.2.0/2,M11.1.0/2"
+  #   America/Los_Ang. : "PST8PDT,M3.2.0/2,M11.1.0/2"
+  #   Europe/London    : "GMT0BST,M3.5.0/1,M10.5.0/2"
+  #   Europe/Berlin    : "CET-1CEST,M3.5.0,M10.5.0/3"
+  #   Australia/Sydney : "AEST-10AEDT,M10.1.0,M4.1.0/3"
+  #   UTC              : "UTC0"
+  device_posix_tz: "EST5EDT,M3.2.0/2,M11.1.0/2"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  # Append last 6 hex chars of the MAC to the device name and mDNS
+  # hostname, so multiple irrigoto units on the same LAN are
+  # distinguishable. e.g. "irrigoto" -> "irrigoto-a3f201".
+  # The fallback AP SSID picks up the same suffix automatically.
+  name_add_mac_suffix: true
+  on_boot:
+    # Set libc's TZ env var so standard localtime_r() / mktime() in
+    # the C schedule executor honor the user's timezone. ESPHome's
+    # set_global_tz on embedded targets only updates ESPHome's own
+    # internal time wrapper, not libc — so without this hook our
+    # schedule entries would be interpreted in UTC.
+    # Priority 800 = AFTER_WIFI but before component setup, so it's
+    # in effect before our schedule_task spins up.
+    priority: 800
+    then:
+      - lambda: |-
+          setenv("TZ", "${device_posix_tz}", 1);
+          tzset();
+          ESP_LOGI("irrigoto.tz", "Set libc TZ to ${device_posix_tz}");
+      # b290: tried "component.update: reset_reason" here in b287 but
+      # at priority 800 the template text_sensor isn't fully
+      # initialized yet, so the update call was silently dropped.
+      # The real fix is on the sensor itself -- removed
+      # "update_interval: never" so the auto-tick (default 60s)
+      # publishes the value. esp_reset_reason() returns a cached
+      # static after boot so republishing it costs nothing.
+
+esp32:
+  board: esp32dev
+  # 8 MB matches the physical chip and the partition layout in
+  # irrigoto-partitions.csv (littlefs partition lives at
+  # 0x3E0000-0x460000). ESPHome sets both the platformio
+  # board_upload.flash_size and the IDF CONFIG_ESPTOOLPY_FLASHSIZE_*
+  # sdkconfig option from this.
+  flash_size: 8MB
+  # Custom partition layout (nvs / otadata / ota_0 / ota_1 / littlefs).
+  # ESPHome's `partitions:` key copies the file into the build dir and
+  # sets the IDF sdkconfig options. Sibling-relative path — resolves
+  # to the directory of the wrapper yaml that packages:-includes this
+  # file, so the partition CSV must sit next to the wrapper.
+  partitions: irrigoto-partitions.csv
+  framework:
+    type: esp-idf
+    # Omit version → ESPHome uses its recommended IDF (5.5.4 as of 2026.4.5).
+    # Standalone builds run IDF 5.5.2, same minor — toolchain is compatible.
+    # log_level controls the IDF compile-time log level (CONFIG_LOG_DEFAULT_LEVEL).
+    # Default is ERROR, which strips out every ESP_LOGI from the binary —
+    # including our component's "Zone X saved", "LittleFS mounted", etc.
+    # Bumping to INFO restores those over `esphome logs` / HA log viewer.
+    log_level: INFO
+    advanced:
+      # ESPHome strips VFS directory support by default (saves ~3 KB) but
+      # this also disables mkdir/opendir/readdir/rmdir from joltwallet/littlefs
+      # — every storage_zone_save / cal_save / FS-browser readdir then fails.
+      # Re-enable so our component's storage layer works.
+      disable_vfs_support_dir: false
+    sdkconfig_options:
+      # ESPHome auto-computes LWIP_MAX_SOCKETS=12 from its known
+      # components, which doesn't account for the irrigoto web server.
+      # 16 matches the standalone config and gives our httpd room
+      # (allowed max_open = LWIP_MAX_SOCKETS - 3 internal).
+      CONFIG_LWIP_MAX_SOCKETS: "16"
+      # b291: experiment with sdkconfig knobs that should reduce or eliminate
+      # the WiFi-PHY <-> SPI-flash-cache race we've been chasing since b285.
+      # The race fires when one core's SPI-flash op disables cache while
+      # another core is mid-execution from flash. These options move more
+      # WiFi & flash-driver code into IRAM (always-accessible RAM, not
+      # cached flash), so even during a cache-disable window the code can
+      # still run. Flash size grows by tens of KB but we have plenty of
+      # headroom. None of these options change behavior if they're not
+      # supported by the IDF version or chip variant -- IDF silently
+      # ignores unknown / unsupported config keys.
+      CONFIG_WIFI_IRAM_OPT: y         # WiFi driver code in IRAM
+      CONFIG_WIFI_RX_IRAM_OPT: y      # WiFi RX path in IRAM (key for the
+                                      #   ppDirectRecycleAmpdu crash we saw)
+      CONFIG_SPI_FLASH_AUTO_SUSPEND: y # if flash chip supports it, allow
+                                      #   cache to stay enabled during writes
+                                      #   (only works on XMC and a few others;
+                                      #   ignored otherwise, no harm to try)
+
+# Enable logging (comment out in production to save RAM)
+logger:
+  level: INFO
+
+# b295: mDNS re-enabled. b290 disabled it as a flash-race workaround, but
+# the actual fix turned out to be b294 (pin water_task to PRO_CPU so all
+# flash users share a single core, eliminating the cross-core cache-disable
+# race). With that fix in place, mDNS reading flash for browse responses
+# no longer races with our watering's flash writes -- both run on the same
+# core, serialized by FreeRTOS scheduling.
+#
+# b350: mDNS DISABLED AGAIN as a hypothesis for the 2026.5.x OTA-crash
+# saga. b354: RE-ENABLED. Turned out mDNS wasn't the root cause -- the
+# real fix was pinning ESPHome to 2026.4.5 (see b353 commit message
+# and esphome_2026_5_0b1_lwip_crash memory). Leaving mDNS off was just
+# blocking .local hostname resolution + HA's auto-rediscovery after
+# the device reconnects post-network blip, with no upside on 2026.4.5.
+# So we let mDNS run as the ESPHome default again.
+
+# ESPHome API for Home Assistant
+api:
+  encryption:
+    key: !secret api_key
+  # Required for the C++ component to call fire_homeassistant_event() —
+  # how we surface "watering complete" and "cal complete" notifications
+  # to HA so automations can react with structured event.data fields.
+  homeassistant_services: true
+  # Services exposed to HA.
+  #
+  # b357: aggressively trimmed from 20 services to 8. The original ESPHome
+  # 2026.4.5 API send-buffer overflows on a 20-service ListEntitiesServices
+  # response, same code path as the b256 incident (5532ff0) — every crash
+  # backtrace was send_message<ListEntitiesServicesResponse> → send_buffer →
+  # try_to_clear_buffer → CRASH.
+  #
+  # b369: restored the manual valve/nozzle/arc control group (7 services)
+  # to TEST whether the b356/b357 crash was driven by service COUNT or by
+  # reconnect PERIODICITY. b356 kept 20 services (with slimmed sensors) and
+  # still crashed in 12s, pointing at count. b369 (14 services) booted and
+  # ran, but b370 — which added the Valve Open binary_sensor — reboot-looped
+  # past the safe_mode window. That one extra ListEntities row tipped the
+  # send-buffer: COUNT theory confirmed, 14 services was right at the cliff.
+  #
+  # b370 resolution: open_valve + close_valve moved to HTTP endpoints
+  # (/valve/open, /valve/close), dropping the service block to 12 while
+  # keeping the binary_sensor — a net -1 ListEntities row vs the booting
+  # b369 baseline. The remaining 5 manual services (valve_goto, nozzle_goto,
+  # aim_valve, aim_throw, water_arc) stay as HA actions.
+  #
+  # Still HTTP-only (intentionally NOT restored as HA services):
+  #   start_watering (/zone/water), read_pressure (/api/all),
+  #   open_valve + close_valve (/valve/open, /valve/close — b370),
+  #   cal_pressure_throw (/cal/pressure/throw), set_schedule + clear_schedule
+  #   (superseded by sync_schedule + /api/schedule[/clear]), set_led (no need).
+  services:
+    # Power: force deep sleep with timer wake. duration_s = 0 -> 300 s default.
+    - service: sleep_now
+      variables:
+        duration_s: int
+      then:
+        - lambda: |-
+            id(irrigoto_hw).sleep_now(duration_s);
+    # Emergency stop: abort active watering and drive valve closed.
+    - service: stop
+      then:
+        - lambda: |-
+            id(irrigoto_hw).stop_and_close();
+    # ── Manual valve / nozzle / arc control (b369 restore) ────────────────────
+    # Diagnostic: drive valve to a target angle (231-308 deg).
+    - service: valve_goto
+      variables:
+        target_deg: float
+      then:
+        - lambda: |-
+            id(irrigoto_hw).valve_goto(target_deg);
+    # Diagnostic: drive nozzle to a target bearing (0-360 deg).
+    - service: nozzle_goto
+      variables:
+        target_deg: float
+      then:
+        - lambda: |-
+            id(irrigoto_hw).nozzle_goto(target_deg);
+    # NOTE: open_valve / close_valve were HA services in b369 but moved to
+    # HTTP endpoints (/valve/open, /valve/close) in b370 — adding the
+    # Valve Open binary_sensor pushed the 14-service ListEntitiesServices
+    # response over the 2026.4.5 send-buffer ceiling (b370 reboot-looped
+    # past the safe_mode window). The dashboard "Irrigoto Valve" toggle now
+    # drives those HTTP endpoints via rest_command; net ListEntities rows
+    # are below the booting b369 baseline.
+    # Aim the stream by moving nozzle bearing AND valve in parallel.
+    # aim_valve takes the raw valve angle (231-308 deg). Refused while watering.
+    - service: aim_valve
+      variables:
+        bearing_deg: float
+        valve_deg: float
+      then:
+        - lambda: |-
+            id(irrigoto_hw).aim_valve(bearing_deg, valve_deg);
+    # aim_throw takes the throw distance in mm; firmware converts to a valve
+    # angle via the pressure calibration table. Refused while watering.
+    - service: aim_throw
+      variables:
+        bearing_deg: float
+        throw_mm: float
+      then:
+        - lambda: |-
+            id(irrigoto_hw).aim_throw(bearing_deg, throw_mm);
+    # Water a single arc: parallel-position to (arc_start_deg, throw), then
+    # sweep nozzle to arc_end_deg at constant speed_dps (1-25 dps).
+    # direction: "cw" / "ccw" / "shortest". Valve LEFT OPEN at end; chain
+    # another arc or call close_valve / stop to stop flow. Refused while watering.
+    - service: water_arc
+      variables:
+        throw_mm: float
+        arc_start_deg: float
+        arc_end_deg: float
+        speed_dps: float
+        direction: string
+      then:
+        - lambda: |-
+            id(irrigoto_hw).water_arc(throw_mm, arc_start_deg, arc_end_deg,
+                                      speed_dps, direction);
+    # ── Calibration ──────────────────────────────────────────────────────────
+    # Pressure + nozzle calibration are interactive, measure-as-you-go flows
+    # run entirely from the device web UI cal page (/cal). The HA-callable
+    # cal_pressure_start / cal_pressure_cancel / cal_nozzle_start services
+    # were removed so cal is driven only from the device, where the throw
+    # measurements are entered.
+    # ── Schedule ────────────────────────────────────────────────────────────
+    # b355: bidirectional sync. Each entry's fields:
+    #   id,last_modified,zone,mode,depth,hour,minute,days_mask,enabled,source,tombstone
+    # id=0          -> device allocates next sequential ID
+    # tombstone=1   -> delete matching id (if present)
+    # otherwise     -> upsert with last-writer-wins (device wins on tie).
+    # Entries the device has but HA didn't mention are preserved —
+    # device-only entries (added via the web UI before HA learned of
+    # them) survive the push.
+    - service: sync_schedule
+      variables:
+        entries: string
+      then:
+        - lambda: |-
+            id(irrigoto_hw).sync_schedule(entries);
+    # Rain / wind delay — suspend all scheduled firing for `hours` hours
+    # from now. Pass 0 to cancel any active delay and resume the
+    # schedule immediately. NVS-persisted so it survives reboot / wake.
+    # Clamped to 14 days (336 h) on the device side; anything larger is
+    # probably a unit mistake and the next_run walker only looks 14 d
+    # forward.
+    - service: delay_schedule_hours
+      variables:
+        hours: int
+      then:
+        - lambda: |-
+            id(irrigoto_hw).delay_schedule_hours(hours);
+
+# Time source — HA syncs the device's system clock via the API. Cloud-free:
+# no NTP, no internet. Survives WiFi/HA outages on the ESP32 RTC until the
+# next reconnect; the schedule executor checks time(NULL) > 1.7e9 before
+# firing so it won't trigger off a never-set clock.
+time:
+  - platform: homeassistant
+    id: ha_time
+    timezone: "${device_timezone}"
+
+# OTA updates via ESPHome (replaces the custom curl-push OTA)
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+# b342: explicit safe_mode config so the boot is marked good after a
+# fixed window of stable runtime instead of waiting for the HA API to
+# negotiate. Earlier OTAs of builds with new services (b325 specifically)
+# were being rolled back because HA's re-discovery + auth handshake
+# didn't complete within the default safe_mode window, so ESPHome never
+# marked the new image valid.
+#
+# b349: bumped 10s → 30s. The 2026-05-26 OTA cycle revealed that even
+# 2026.5.1's LWIP stack still throws an intermittent TaskWDT during
+# HA's first reconnect storm post-boot (proven by boot_diag boot_seq=11
+# capturing the crash). A 10s window was tight enough that the crash
+# sometimes preceded "good" → rollback to the prior firmware. 30s gives
+# the reconnect storm time to settle before we mark the image valid,
+# so a single LWIP hiccup just reboots into the same firmware instead
+# of unwinding the deploy.
+safe_mode:
+  boot_is_good_after: 30s
+
+# WiFi — ESPHome manages connection and reconnect.
+# The irrigoto component skips its own wifi_init() when built as a component.
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Static IP optional — comment out for DHCP
+  # manual_ip:
+  #   static_ip: 192.168.1.150
+  #   gateway: 192.168.1.1
+  #   subnet: 255.255.255.0
+  ap:
+    # Fallback hotspot if WiFi is unavailable
+    ssid: "${device_name} Fallback"
+    password: !secret ap_password
+
+captive_portal:
+
+# ─── Deep sleep ──────────────────────────────────────────────────────────────
+# No run_duration / sleep_duration — irrigoto.c decides when to sleep
+# (inactivity watchdog, low-battery, scheduled). The C++ wrapper hands
+# off to this component via begin_sleep() so HA gets a clean disconnect
+# notification (entities keep last-known state instead of going unavailable).
+# HA can hold the device awake via deep_sleep.prevent automation action.
+deep_sleep:
+  id: irr_sleep
+
+# ─── Irrigoto hardware component ─────────────────────────────────────────────
+irrigoto:
+  id: irrigoto_hw
+  deep_sleep_id: irr_sleep
+
+# ─── Home Assistant entities ──────────────────────────────────────────────────
+
+sensor:
+  - platform: irrigoto
+    # b358: deadband filters on the noisy analog sensors. ADC sampling
+    # noise was producing ~30 publishes/minute per sensor of basically-
+    # identical values; deadband drops that to a handful per minute
+    # without losing meaningful changes. The `or: [delta, throttle]`
+    # pairing means a publish fires when EITHER the value moves by the
+    # delta amount OR the throttle period has elapsed since the last
+    # publish — so HA's recorder always sees fresh state at least once
+    # a minute even when the value is rock-steady.
+    pressure_psi:
+      name: "${friendly_name} Pressure"
+      unit_of_measurement: psi
+      accuracy_decimals: 1
+      device_class: pressure
+      state_class: measurement
+      filters:
+        - or:
+            - delta: 0.5
+            - throttle: 60s
+    battery_mv:
+      name: "${friendly_name} Battery Voltage"
+      unit_of_measurement: V
+      accuracy_decimals: 3
+      device_class: voltage
+      state_class: measurement
+      filters:
+        - or:
+            - delta: 0.05      # 50 mV
+            - throttle: 60s
+    throw_mm:
+      name: "${friendly_name} Throw Distance"
+      unit_of_measurement: mm
+      accuracy_decimals: 0
+      state_class: measurement
+      filters:
+        - or:
+            - delta: 5         # 5 mm
+            - throttle: 60s
+    # Estimated minutes remaining for the active watering run.
+    # Updated continuously from the water task as it works through
+    # rings; 0 between runs. Used by the HA dashboard's Status panel
+    # to show a "time remaining" line during watering.
+    water_minutes_remaining:
+      name: "${friendly_name} Water Minutes Remaining"
+      unit_of_measurement: min
+      icon: mdi:timer-sand
+      accuracy_decimals: 0
+      state_class: measurement
+  # Uptime in seconds since last boot. Resets to 0 on every boot, so any
+  # unexplained step-down in the graph = device rebooted. Useful for
+  # spotting stability issues (watchdogs, brownouts, crashes) that would
+  # otherwise hide behind WiFi reconnects.
+  - platform: uptime
+    name: "${friendly_name} Uptime"
+    id: device_uptime
+    update_interval: 60s
+
+binary_sensor:
+  - platform: irrigoto
+    watering:
+      name: "${friendly_name} Watering"
+      device_class: running
+    # b370: confirmed valve state from the cached encoder angle (no I2C poll
+    # — reading the live encoder powers the sensor rail and blocks deep-sleep).
+    # ON = any non-closed position (>8 deg off the 231 deg seat). Backs the
+    # single open/close valve toggle on the HA dashboard.
+    valve_open:
+      name: "${friendly_name} Valve Open"
+      device_class: opening
+  # Connectivity indicator — ON while the API is connected to HA, OFF when
+  # the device disconnects (deep sleep, power loss, WiFi drop). Since the
+  # device only normally disconnects via sleep, OFF effectively means
+  # "asleep" for dashboard purposes.
+  - platform: status
+    name: "${friendly_name} Online"
+
+text_sensor:
+  - platform: irrigoto
+    status:
+      name: "${friendly_name} Status"
+    zone_name:
+      name: "${friendly_name} Active Zone"
+    cal_state:
+      name: "${friendly_name} Calibration State"
+    last_sleep_reason:
+      name: "${friendly_name} Last Sleep Reason"
+      icon: "mdi:sleep"
+    next_run:
+      name: "${friendly_name} Next Scheduled Run"
+      icon: "mdi:clock-outline"
+    schedule_status:
+      name: "${friendly_name} Last Schedule Update"
+      icon: "mdi:calendar-check-outline"
+    # Full schedule contents in the same ';'-separated text format as the
+    # set_schedule service. Long schedules truncate at the 240-char mark
+    # with "...(+N more)" so HA's 255-char state limit is respected.
+    # The companion esphome.<name>_schedule_changed event always carries
+    # the complete untrimmed text — listen for that if you need to mirror
+    # everything.
+    schedule_text:
+      name: "${friendly_name} Schedule Text"
+      icon: "mdi:calendar-text-outline"
+    # Rain/wind delay status. "off" when no delay is active, otherwise
+    # "until YYYY-MM-DD HH:MM" using device-local time. Drives the same
+    # suppression the schedule executor uses, so this sensor is the
+    # source of truth for "is the schedule paused right now."
+    schedule_delay:
+      name: "${friendly_name} Schedule Delay"
+      icon: "mdi:weather-pouring"
+    # b355: schedule_version text_sensor was here. Removed in b356 — it
+    # was an extra ListEntities row contributing to the b256-class API
+    # send-buffer overflow crash that took out the API connection during
+    # entity enumeration. Version is still in the schedule_changed event
+    # and reachable via GET /api/schedule.
+  # b307: expose the device's current IP address as an HA text_sensor.
+  # The irrigoto-heatmap-card uses this to discover the device URL at
+  # render time -- HA's frontend API redacts config_entry.data (where
+  # the IP is normally stored), so a sensor that re-publishes the IP
+  # as an entity state is the cleanest deployable way to expose it to
+  # custom cards. Value follows DHCP renewals automatically.
+  - platform: wifi_info
+    ip_address:
+      name: "${friendly_name} IP Address"
+      icon: "mdi:ip-network-outline"
+  # Why the device last booted. Captured once at boot via esp_reset_reason().
+  # Common values:
+  #   PowerOn       -- cold boot (power cycle, first boot after assembly)
+  #   ExternalPin   -- reset pin asserted (hardware reset button)
+  #   Software      -- esp_restart() called from firmware (e.g. post-OTA)
+  #   DeepSleepWake -- normal wake from a scheduled deep sleep
+  #   Brownout      -- voltage dipped below brownout threshold (suspicious!)
+  #   TaskWDT       -- a FreeRTOS task hung past the watchdog timeout (bug)
+  #   InterruptWDT  -- interrupt handler ran too long (bug)
+  #   Panic/Crash   -- exception / abort() / hard fault (bug)
+  # Anything other than PowerOn / DeepSleepWake / Software during normal
+  # operation deserves investigation.
+  - platform: template
+    name: "${friendly_name} Reset Reason"
+    id: reset_reason
+    icon: "mdi:restart-alert"
+    # b290: NO update_interval (defaults to 60s). The earlier
+    # "update_interval: never" was elegant in theory (value
+    # doesn't change after boot) but ALSO meant the sensor never
+    # published at all -- HA showed "Unknown" forever. Letting
+    # the auto-tick run is harmless (lambda returns a cached
+    # static).
+    lambda: |-
+      switch (esp_reset_reason()) {
+        case ESP_RST_POWERON:   return {"PowerOn"};
+        case ESP_RST_EXT:       return {"ExternalPin"};
+        case ESP_RST_SW:        return {"Software"};
+        case ESP_RST_PANIC:     return {"Panic/Crash"};
+        case ESP_RST_INT_WDT:   return {"InterruptWDT"};
+        case ESP_RST_TASK_WDT:  return {"TaskWDT"};
+        case ESP_RST_WDT:       return {"OtherWDT"};
+        case ESP_RST_DEEPSLEEP: return {"DeepSleepWake"};
+        case ESP_RST_BROWNOUT:  return {"Brownout"};
+        case ESP_RST_SDIO:      return {"SDIO"};
+        default:                return {"Unknown"};
+      }
+  # b347: post-mortem of the boot-time battery + valve check. NVS-persisted
+  # by check_battery_on_boot() / check_valve_closed_on_boot(), so dashboards
+  # can see what those guards observed even when the prior boot ended in
+  # a TaskWDT / panic / brownout. Format example (clean wake):
+  #   "b346 #4 DeepSleepWake batt=4.10V valve=231.2° (closed, err=+0.2°)"
+  # And after a fault that left the valve open:
+  #   "b346 #5 TaskWDT batt=4.01V valve=287.3° err=+56.3° -> drove ok post=232.1° sag=3.78V"
+  # Full ring-buffer of last 5 boots is available at GET /api/boot_diag
+  # on the device's HTTP server.
+  - platform: template
+    name: "${friendly_name} Boot Diag"
+    id: boot_diag
+    icon: "mdi:clipboard-pulse-outline"
+    # Default 60s update tick — value only changes once per boot but
+    # republishing the same string is a no-op via ESPHome's dedup, and the
+    # initial publish is needed so HA doesn't show "Unknown" forever (same
+    # bug as the reset_reason sensor in b290).
+    lambda: |-
+      return {id(irrigoto_hw).get_boot_diag_summary()};
+
+select:
+  - platform: irrigoto
+    zone:
+      name: "${friendly_name} Zone"
+      # Options listed here are placeholders. The firmware replaces them
+      # at runtime with the actual configured zones' names (e.g. "Front
+      # Lawn", "Garden", ...) on each loop tick, so HA picks up renames
+      # and added/deleted zones automatically.
+      options:
+        - "(loading)"
+    mode:
+      name: "${friendly_name} Water Mode"
+      options:
+        - "Pulse"
+        - "Gentle"
+        - "Smooth"
+
+switch:
+  # Auto-sleep enable. Toggling this calls irrigoto_set_auto_sleep_enabled(),
+  # which persists the state to NVS so it survives reboots / OTA / wake.
+  - platform: template
+    name: "${friendly_name} Auto-sleep"
+    id: irr_auto_sleep_sw
+    icon: "mdi:sleep"
+    # DISABLED: don't let ESPHome restore from its own preferences on boot.
+    # The state lambda + NVS-backed pm_nvs_load() are the source of truth;
+    # without this, ESPHome's RESTORE_DEFAULT_OFF would call turn_off_action
+    # on every wake and clobber the NVS-restored value.
+    restore_mode: DISABLED
+    lambda: |-
+      return id(irrigoto_hw).get_auto_sleep();
+    turn_on_action:
+      - lambda: id(irrigoto_hw).set_auto_sleep(true);
+    turn_off_action:
+      - lambda: id(irrigoto_hw).set_auto_sleep(false);
+
+number:
+  # Inactivity threshold (minutes) before auto-sleep fires.
+  # Setter persists to NVS so the value survives reboots.
+  - platform: template
+    name: "${friendly_name} Inactivity Timeout"
+    id: irr_inactivity_min
+    icon: "mdi:timer-sand"
+    min_value: 1
+    max_value: 60
+    step: 1
+    unit_of_measurement: min
+    optimistic: false
+    update_interval: 30s
+    lambda: |-
+      return (float)id(irrigoto_hw).get_inactivity_minutes();
+    set_action:
+      - lambda: id(irrigoto_hw).set_inactivity_minutes((uint32_t)x);
+  # Sleep duration (seconds) — how long the device sleeps before
+  # waking to reconnect to HA.
+  - platform: template
+    name: "${friendly_name} Sleep Duration"
+    id: irr_sleep_dur_s
+    icon: "mdi:timer-outline"
+    min_value: 30
+    max_value: 3600
+    step: 30
+    unit_of_measurement: s
+    optimistic: false
+    update_interval: 30s
+    lambda: |-
+      return (float)id(irrigoto_hw).get_sleep_duration_s();
+    set_action:
+      - lambda: id(irrigoto_hw).set_sleep_duration_s((uint32_t)x);
+  # Nozzle dwell-watchdog timeout (seconds). Backstop for nozzle fault
+  # detection — caps how long the nozzle can sit at one bearing with
+  # the valve open before the run is aborted as nozzle_fault.
+  - platform: template
+    name: "${friendly_name} Nozzle Dwell Timeout"
+    id: irr_dwell_timeout_s
+    icon: "mdi:timer-alert-outline"
+    min_value: 10
+    max_value: 300
+    step: 5
+    unit_of_measurement: s
+    optimistic: false
+    update_interval: 30s
+    lambda: |-
+      return (float)id(irrigoto_hw).get_dwell_timeout_s();
+    set_action:
+      - lambda: id(irrigoto_hw).set_dwell_timeout_s((uint32_t)x);

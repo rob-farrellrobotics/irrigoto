@@ -1,0 +1,731 @@
+/* landing_html.h -- OtO landing page */
+R"LANDHTML(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>irrigoto</title>
+<script>
+// Apply theme before body renders to avoid flash. localStorage = instant
+// cache; /api/theme = source of truth (NVS-backed).
+(function(){
+  try{var t=localStorage.getItem('irrigoto_theme');
+    if(t==='light'||t==='dark')document.documentElement.dataset.theme=t;}catch(e){}
+  fetch('/api/theme').then(function(r){return r.json();}).then(function(d){
+    var t2=d.dark?'dark':'light';
+    if(document.documentElement.dataset.theme!==t2){
+      document.documentElement.dataset.theme=t2;
+      try{localStorage.setItem('irrigoto_theme',t2);}catch(e){}}
+    var cb=document.getElementById('theme-cb');
+    if(cb)cb.checked=(t2==='light');
+  }).catch(function(){});
+})();
+</script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}
+:root,:root[data-theme="dark"]{
+  --bg:#060c10;--bg2:#0b1820;--bg3:#0f2030;
+  --green:#00e87a;--green-dim:#0a3020;--green-glow:rgba(0,232,122,.22);
+  --orange:#ff8c00;--text:#c8e0d4;--text-dim:#1e3828;--text-mid:#608070;
+  --border:#0c2a1e;--btn:#0b1c28;--radius:12px;--radius-sm:8px;
+  /* --radar-bg drives both the .zone-radar thumbnails here and the
+     full canvas on the zone-setup page (which reads it via
+     getComputedStyle). Keep these in sync with zone_setup_html.h. */
+  --radar-bg:#0a1a12;
+}
+:root[data-theme="light"]{
+  --bg:#f7f9f8;--bg2:#ffffff;--bg3:#eef3f0;
+  --green:#00913f;--green-dim:#cfeede;--green-glow:rgba(0,145,63,.18);
+  --orange:#c95400;--text:#0e1a14;--text-dim:#cfdcd5;--text-mid:#5a7468;
+  --border:#cee0d7;--btn:#f0f5f2;
+  --radar-bg:#E8F4FE;  /* light blue; also used by zone-setup canvas */
+}
+.theme-switch{position:relative;display:inline-block;width:44px;height:22px;vertical-align:middle;}
+.theme-switch input{opacity:0;width:0;height:0;}
+.theme-slider{position:absolute;cursor:pointer;inset:0;background:var(--bg3);
+  transition:.3s;border-radius:22px;border:1px solid var(--border);}
+.theme-slider:before{position:absolute;content:"";height:14px;width:14px;
+  left:3px;top:3px;background:var(--text-mid);transition:.3s;border-radius:50%;}
+.theme-switch input:checked + .theme-slider{background:var(--green-dim);border-color:var(--green);}
+.theme-switch input:checked + .theme-slider:before{transform:translateX(22px);background:var(--green);}
+html,body{height:100%;background:var(--bg);color:var(--text);
+  font-family:-apple-system,BlinkMacSystemFont,'Helvetica Neue',sans-serif;}
+body{display:flex;flex-direction:column;max-width:480px;margin:0 auto;height:100dvh;}
+header{display:flex;align-items:center;justify-content:space-between;
+  padding:14px 20px 10px;flex-shrink:0;border-bottom:1px solid var(--border);}
+.logo{font-family:'Courier New',monospace;font-size:20px;font-weight:700;
+  letter-spacing:.15em;color:var(--green);text-shadow:0 0 12px var(--green-glow);}
+.dev-name-inp{background:none;border:none;color:var(--text);font-size:13px;
+  font-family:inherit;padding:0;width:160px;margin-top:1px;cursor:text;}
+.dev-name-inp:focus{outline:1px solid var(--green);border-radius:3px;padding:0 3px;}
+#conn{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text-mid);}
+#conn-dot{width:7px;height:7px;border-radius:50%;background:var(--text-dim);transition:all .4s;}
+#conn-dot.ok{background:var(--green);box-shadow:0 0 8px var(--green);}
+main{flex:1;overflow-y:auto;padding:16px;}
+section{margin-bottom:18px;}
+.sec-hdr{display:flex;align-items:center;justify-content:space-between;
+  margin-bottom:10px;padding:0 2px;}
+.sec-title{font-size:11px;letter-spacing:.18em;text-transform:uppercase;
+  color:var(--text-mid);font-weight:500;}
+.sec-btn{font-size:12px;color:var(--green);background:none;
+  padding:4px 10px;border-radius:var(--radius-sm);cursor:pointer;
+  border:1px solid var(--border);}
+.sec-btn:active{background:var(--green-dim);}
+.card{background:var(--bg2);border:1px solid var(--border);
+  border-radius:var(--radius);padding:14px 16px;margin-bottom:10px;}
+.zone-card{display:flex;gap:12px;align-items:flex-start;}
+/* No CSS background: the JS fills only inside the outermost-radar
+   circle so the corners show the card behind the canvas — matches
+   the zone-setup radar's "circle on page bg" look. */
+.zone-radar{flex-shrink:0;}
+.zone-body{flex:1;min-width:0;}
+.zone-name-wrap{display:flex;align-items:center;gap:6px;margin-bottom:3px;}
+.zone-name{font-size:16px;font-weight:600;color:var(--text);letter-spacing:.02em;
+  background:none;border:none;color:var(--text);font-size:16px;font-weight:600;
+  padding:0;width:100%;font-family:inherit;}
+.zone-name:focus{outline:1px solid var(--green);border-radius:4px;padding:0 4px;}
+.edit-icon{font-size:11px;color:var(--text-mid);cursor:pointer;flex-shrink:0;}
+.zone-meta{font-size:12px;color:var(--text-mid);margin-bottom:10px;}
+.zone-actions{display:flex;gap:8px;flex-wrap:wrap;}
+.btn{padding:8px 14px;border-radius:var(--radius-sm);border:1px solid var(--border);
+  background:var(--btn);color:var(--text);font-size:13px;cursor:pointer;
+  text-decoration:none;display:inline-flex;align-items:center;gap:5px;
+  transition:background .15s;white-space:nowrap;}
+.btn:active{background:var(--green-dim);border-color:#1a5035;}
+.btn-primary{background:var(--green-dim);border-color:#1a5035;color:var(--green);}
+.btn-primary:active{background:#0d3824;}
+.empty{color:var(--text-mid);font-size:13px;padding:4px 0;}
+.dev-row{display:flex;justify-content:space-between;align-items:center;
+  padding:6px 0;border-bottom:1px solid var(--border);font-size:13px;}
+.dev-row:last-child{border-bottom:none;}
+.dev-label{color:var(--text-mid);}
+.dev-val{color:var(--text);font-family:'Courier New',monospace;font-size:12px;}
+.cal-desc{font-size:12px;color:var(--text-mid);margin-bottom:10px;line-height:1.5;}
+/* Water modal */
+#modal-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);
+  z-index:100;align-items:flex-end;justify-content:center;}
+#modal-bg.open{display:flex;}
+#modal{background:var(--bg2);border:1px solid var(--border);
+  border-radius:var(--radius) var(--radius) 0 0;padding:20px;width:100%;
+  max-width:480px;}
+.modal-title{font-size:16px;font-weight:600;margin-bottom:4px;}
+.modal-sub{font-size:12px;color:var(--text-mid);margin-bottom:18px;}
+.mode-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:18px;}
+.mode-btn{padding:14px 10px;border-radius:var(--radius-sm);border:1px solid var(--border);
+  background:var(--btn);color:var(--text);font-size:13px;cursor:pointer;
+  text-align:center;line-height:1.4;}
+.mode-btn.sel{border-color:var(--green);background:var(--green-dim);color:var(--green);}
+.mode-btn span{display:block;font-size:11px;color:var(--text-mid);margin-top:3px;}
+.mode-btn.sel span{color:rgba(0,232,122,.6);}
+.modal-actions{display:flex;gap:10px;}
+.modal-actions .btn{flex:1;justify-content:center;}
+#modal-status{font-size:12px;color:var(--text-mid);text-align:center;
+  margin-top:10px;min-height:18px;}
+/* Schedule-row status dot pulses while that zone is actively watering. */
+.sched-dot{display:inline-block;font-size:10px;margin-right:2px;line-height:1;
+  transition:color .2s, text-shadow .2s;}
+@keyframes sched-pulse-anim{
+  0%,100%{opacity:1;}
+  50%{opacity:.35;}
+}
+.sched-pulse{animation:sched-pulse-anim 1.2s ease-in-out infinite;}
+</style>
+</head>
+<body>
+<header style="justify-content:center;flex-direction:column;align-items:center;gap:2px;position:relative;">
+  <span class="logo">Irrigoto</span>
+  <div style="display:flex;align-items:center;gap:4px;">
+    <input class="dev-name-inp" id="dev-name-inp" type="text" value="irrigoto"
+      title="Tap to rename"
+      onblur="saveDeviceName(this.value)"
+      onkeydown="if(event.key==='Enter')this.blur()">
+    <span style="font-size:11px;color:var(--text-mid);cursor:pointer" title="Tap name to edit">&#9998;</span>
+  </div>
+  <div id="conn" style="position:absolute;right:20px;top:50%;transform:translateY(-50%);">
+    <div id="conn-dot"></div><span id="conn-txt">connecting</span>
+  </div>
+</header>
+<main>
+  <section>
+    <div class="sec-hdr">
+      <span class="sec-title">Zones</span>
+      <button class="sec-btn" onclick="location='/zone?id=new'">+ Add Zone</button>
+    </div>
+    <div id="zone-list"><div class="empty">Loading&hellip;</div></div>
+  </section>
+  <section>
+    <div class="sec-hdr">
+      <span class="sec-title">Schedule</span>
+      <a class="sec-btn" href="/schedule">Edit</a>
+    </div>
+    <div id="sched-summary" class="card"><div class="empty">No schedules configured.</div></div>
+  </section>
+  <section>
+    <div class="sec-hdr"><span class="sec-title">Calibration</span></div>
+    <div class="card">
+      <div class="cal-desc">Device-level: pressure &rarr; throw mapping and nozzle speed. Run after hardware changes or if watering accuracy degrades.</div>
+      <div class="zone-actions">
+        <a class="btn" href="/cal">&#128200; Pressure cal</a>
+        <a class="btn" href="/cal#speed">&#9992; Speed cal</a>
+      </div>
+    </div>
+  </section>
+  <section>
+    <div class="sec-hdr"><span class="sec-title">Device</span>
+      <a class="sec-btn" href="/fs">&#128193; Filesystem</a>
+    </div>
+    <div class="card">
+      <div class="dev-row"><span class="dev-label">Firmware</span><span class="dev-val" id="d-fw">&mdash;</span></div>
+      <div class="dev-row"><span class="dev-label">WiFi</span><span class="dev-val" id="d-wifi">&mdash;</span></div>
+      <div class="dev-row"><span class="dev-label">Battery</span><span class="dev-val" id="d-bat">&mdash;</span></div>
+      <div class="dev-row"><span class="dev-label">Storage</span><span class="dev-val" id="d-storage">&mdash;</span></div>
+      <div class="dev-row" onclick="toggleDetailLog()" style="cursor:pointer" title="Toggle per-pass detail log for smooth mode watering">
+        <span class="dev-label">Detail log</span><span class="dev-val" id="d-detail">Off</span>
+      </div>
+      <div class="dev-row" title="Toggle light / dark theme">
+        <span class="dev-label">Theme (light)</span>
+        <label class="theme-switch">
+          <input type="checkbox" id="theme-cb" onchange="setTheme(this.checked?'light':'dark')">
+          <span class="theme-slider"></span>
+        </label>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- Water modal -->
+<div id="modal-bg" onclick="if(event.target===this)closeModal()">
+  <div id="modal">
+    <div class="modal-title" id="modal-zone-name">Water Zone</div>
+    <div class="modal-sub">Select depth and start watering</div>
+    <div class="mode-grid">
+      <button class="mode-btn sel" data-mode="1" onclick="selMode(this)">
+        1/8&Prime; <span>1 pass &middot; ~13 min</span>
+      </button>
+      <button class="mode-btn" data-mode="2" onclick="selMode(this)">
+        1/4&Prime; <span>1 pass &middot; ~26 min</span>
+      </button>
+      <button class="mode-btn" data-mode="3" onclick="selMode(this)">
+        1/8&Prime; &times;2 <span>2 passes &middot; ~26 min</span>
+      </button>
+      <button class="mode-btn" data-mode="5" onclick="selMode(this)">
+        Gentle 1/8&Prime; <span>seed-safe &middot; 5 passes</span>
+      </button>
+      <button class="mode-btn" data-mode="6" onclick="selMode(this)">
+        Gentle 1/4&Prime; <span>seed-safe &middot; 10 passes</span>
+      </button>
+      <button class="mode-btn" data-mode="7" onclick="selMode(this)">
+        Smooth 1/8&Prime; <span>open-loop &middot; multipass</span>
+      </button>
+      <button class="mode-btn" data-mode="d" onclick="selMode(this)">
+        Demo <span>max speed</span>
+      </button>
+      <button class="mode-btn" data-mode="c" onclick="selMode(this)">
+        &#128054; Chase <span>play mode &middot; 1-10 min</span>
+      </button>
+    </div>
+    <div id="chase-row" style="display:none;margin:-6px 0 18px;padding:10px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--btn);font-size:12px;">
+      <label for="chase-dur" style="display:block;color:var(--text-mid);margin-bottom:6px;">
+        Chase duration
+      </label>
+      <div style="display:flex;align-items:center;gap:10px;">
+        <input type="range" id="chase-dur" min="1" max="10" step="1" value="3"
+               oninput="document.getElementById('chase-dur-val').textContent=this.value+' min'"
+               style="flex:1;">
+        <span id="chase-dur-val" style="min-width:48px;text-align:right;color:var(--text);font-weight:600;">3 min</span>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" id="start-btn" onclick="startWater()">&#9654; Start</button>
+    </div>
+    <div id="modal-status"></div>
+  </div>
+</div>
+
+<script>
+let selZoneId=0, selModeDat='1';
+let waterStartTime=0, waterEstMs=0, countdownTimer=null, lastWateringState=false, lastCleanupPass=0, lastEstMin=0;
+
+function handleZoneBtn(id){
+  if(lastWateringState && id === activeWaterZoneId){ cancelWater(); return; }
+  if(lastWateringState) return;  // another zone watering, button should be disabled
+  const card=document.getElementById('zcard-'+id);
+  const name=card?.querySelector('.zone-name')?.value||'Zone';
+  openModal(id, name);
+}
+
+function dot(ok){
+  document.getElementById('conn-dot').className=ok?'ok':'';
+  document.getElementById('conn-txt').textContent=ok?'live':'offline';
+}
+
+// ── Mini radar canvas ─────────────────────────────────────────────────────────
+function drawRadar(canvas, pts) {
+  // Cache the points on the canvas so a theme change can redraw with
+  // the new --radar-bg without needing a fresh /api/all fetch.
+  canvas._pts = pts;
+  const S=canvas.width, cx=S/2, cy=S/2, maxR=cx-4;
+  const ctx=canvas.getContext('2d');
+  ctx.clearRect(0,0,S,S);
+  // Filled radar background — only inside the outermost circle. The
+  // canvas corners stay transparent so the card bg shows through.
+  const radarBg = getComputedStyle(document.documentElement)
+                  .getPropertyValue('--radar-bg').trim() || '#0a1a12';
+  ctx.beginPath(); ctx.arc(cx,cy,maxR,0,Math.PI*2);
+  ctx.fillStyle = radarBg; ctx.fill();
+  // Grid rings
+  [5,10,15,20].forEach(ft=>{
+    const r=ft*304.8/8534*maxR;
+    ctx.beginPath();ctx.arc(cx,cy,r,0,Math.PI*2);
+    ctx.strokeStyle='rgba(0,80,40,.35)';ctx.lineWidth=.5;ctx.stroke();
+  });
+  if(!pts||pts.length<2){
+    ctx.fillStyle='rgba(96,128,112,.4)';ctx.font='9px sans-serif';
+    ctx.textAlign='center';ctx.textBaseline='middle';
+    ctx.fillText('no data',cx,cy);return;
+  }
+  // Walk-order sort
+  const wp=[...pts].sort((a,b)=>((a.widx??99)-(b.widx??99)));
+  function pol(deg,mm){
+    const r=(deg-90)*Math.PI/180;
+    return[cx+Math.cos(r)*(mm/8534*maxR), cy+Math.sin(r)*(mm/8534*maxR)];
+  }
+  // Zone fill
+  ctx.beginPath();
+  wp.forEach(({deg,mm},i)=>{const[x,y]=pol(deg,mm);i?ctx.lineTo(x,y):ctx.moveTo(x,y);});
+  ctx.closePath();
+  ctx.fillStyle='rgba(0,232,122,.08)';ctx.fill();
+  ctx.strokeStyle='rgba(255,140,0,.7)';ctx.lineWidth=1;ctx.stroke();
+  // Points
+  wp.forEach(({deg,mm})=>{
+    const[x,y]=pol(deg,mm);
+    ctx.beginPath();ctx.arc(x,y,2.5,0,Math.PI*2);
+    ctx.fillStyle='rgba(255,140,0,.9)';ctx.fill();
+  });
+  // Origin dot
+  ctx.beginPath();ctx.arc(cx,cy,3,0,Math.PI*2);
+  ctx.fillStyle='#ffd700';ctx.fill();
+}
+
+// ── Zone cards ────────────────────────────────────────────────────────────────
+async function loadZoneCard(card, id) {
+  // Thumbnail drawn inline from /api/all data; this fetch is no longer needed.
+}
+
+function saveName(id, val) {
+  const body='id='+id+'&name='+encodeURIComponent(val);
+  fetch('/api/zone/name',{method:'POST',body,headers:{'Content-Type':'application/x-www-form-urlencoded'}});
+}
+
+function saveDeviceName(val) {
+  if(!val||!val.trim()) return;
+  const body='name='+encodeURIComponent(val.trim());
+  fetch('/api/device/name',{method:'POST',body,headers:{'Content-Type':'application/x-www-form-urlencoded'}})
+    .then(r=>r.json()).then(d=>{
+      if(d.ok) document.title=val.trim();
+    });
+}
+
+function renderZones(zones){
+  const el=document.getElementById('zone-list');
+  if(!zones||!zones.length){
+    el.innerHTML='<div class="empty">No zones saved yet. Use zone setup to walk a zone.</div>';return;
+  }
+  // Clear placeholder text once real data arrives
+  if(!document.getElementById('zcard-'+zones[0].id)){
+    el.innerHTML='';
+  }
+  zones.forEach(z=>{
+    if(!document.getElementById('zcard-'+z.id)){
+      const div=document.createElement('div');
+      div.className='card';div.id='zcard-'+z.id;
+      div.innerHTML=`
+        <div class="zone-card">
+          <canvas class="zone-radar" width="90" height="90"></canvas>
+          <div class="zone-body">
+            <div class="watering-bar" id="wbar-${z.id}" style="display:none">
+              <div class="pulse-dot"></div>
+              <span class="watering-label" id="wlabel-${z.id}">Watering&hellip;</span>
+            </div>
+            <div class="zone-name-wrap">
+              <input class="zone-name" type="text" value="${z.name||'Zone '+(z.id+1)}"
+                onblur="saveName(${z.id},this.value)"
+                onkeydown="if(event.key==='Enter')this.blur()">
+              <span class="edit-icon" title="Tap name to edit">&#9998;</span>
+            </div>
+            <div class="zone-meta" id="zmeta-${z.id}"></div>
+            <div class="zone-actions">
+              <button class="btn btn-primary" id="wbtn-${z.id}" onclick="handleZoneBtn(${z.id})">&#127783; Water Zone</button>
+              <a class="btn" href="/zone?id=${z.id}">&#9881; Setup</a>
+              <button class="btn" style="border-color:rgba(248,113,113,.3);color:#f87171;padding:8px 10px" onclick="deleteZone(${z.id},'${z.name||'Zone '+(z.id+1)}')">&#128465;</button>
+            </div>
+          </div>
+        </div>`;
+      el.appendChild(div);
+      const cv=div.querySelector('canvas');
+      if(cv) drawRadar(cv, z.points||[]);
+    }
+    const meta=document.getElementById('zmeta-'+z.id);
+    if(meta) meta.textContent=z.num_points+' pts \u00b7 '+z.min_ft.toFixed(0)+'\u2013'+z.max_ft.toFixed(0)+'ft \u00b7 '+z.arc_deg.toFixed(0)+'\u00b0';
+    // Update name input from server data (skip if user is currently editing)
+    const inp=document.getElementById('zcard-'+z.id)?.querySelector('.zone-name');
+    if(inp&&!inp.matches(':focus')&&z.name&&inp.value!==z.name) inp.value=z.name;
+  });
+}
+
+// ── Water modal ───────────────────────────────────────────────────────────────
+function openModal(id, name){
+  selZoneId=id; selModeDat='1';
+  document.getElementById('modal-zone-name').textContent='Water: '+name;
+  document.getElementById('modal-status').textContent='';
+  document.getElementById('start-btn').disabled=false;
+  document.getElementById('start-btn').textContent='\u25B6 Start';
+  document.querySelectorAll('.mode-btn').forEach(b=>b.classList.remove('sel'));
+  document.querySelector('.mode-btn[data-mode="1"]').classList.add('sel');
+  document.getElementById('chase-row').style.display='none';
+  document.getElementById('modal-bg').classList.add('open');
+}
+function closeModal(){ document.getElementById('modal-bg').classList.remove('open'); }
+function selMode(btn){
+  document.querySelectorAll('.mode-btn').forEach(b=>b.classList.remove('sel'));
+  btn.classList.add('sel'); selModeDat=btn.dataset.mode;
+  // Chase mode shows a duration slider; other modes hide it.
+  document.getElementById('chase-row').style.display =
+    (selModeDat === 'c') ? 'block' : 'none';
+}
+async function startWater(){
+  const btn=document.getElementById('start-btn');
+  const st=document.getElementById('modal-status');
+  btn.disabled=true; btn.textContent='Starting\u2026';
+  let body='id='+selZoneId+'&mode='+selModeDat;
+  if (selModeDat === 'c') {
+    const d=parseInt(document.getElementById('chase-dur').value, 10) || 3;
+    body += '&duration=' + d;
+  }
+  try{
+    const r=await fetch('/zone/water',{method:'POST',
+      body:body,
+      headers:{'Content-Type':'application/x-www-form-urlencoded'}});
+    const d=await r.json();
+    if(d.ok){ st.style.color='var(--green)'; st.textContent='Watering started.';
+      setTimeout(closeModal,1500); }
+    else { st.style.color='#f87171'; st.textContent=d.error||'Failed to start.'; btn.disabled=false; btn.textContent='\u25B6 Start'; }
+  }catch(e){ st.style.color='#f87171'; st.textContent='Error: '+e.message;
+    btn.disabled=false; btn.textContent='\u25B6 Start'; }
+}
+
+// ── Status polling ────────────────────────────────────────────────────────────
+function rssiLabel(rssi){
+  if(!rssi||rssi>0) return '<span style="color:var(--text-mid)">disconnected</span>';
+  const bars = rssi>=-60?4:rssi>=-70?3:rssi>=-80?2:1;
+  const col = bars>=3?'var(--green)':bars===2?'var(--orange)':'#f87171';
+  const label = rssi>=-60?'Excellent':rssi>=-70?'Good':rssi>=-80?'Fair':'Weak';
+  const barHtml=Array.from({length:4},(_,i)=>
+    `<span style="display:inline-block;width:4px;height:${6+i*3}px;margin-right:2px;border-radius:1px;`+
+    `background:${i<bars?col:'var(--text-dim)'};vertical-align:bottom"></span>`
+  ).join('');
+  return `<span style="color:${col};font-size:11px">${label} (${rssi}dBm)</span> `+barHtml;
+}
+
+async function toggleDetailLog(){
+  try{
+    const d=await fetch('/api/detail_log').then(r=>r.json());
+    const dlEl=document.getElementById('d-detail');
+    dlEl.textContent=d.detail_log?'On':'Off';
+    dlEl.style.color=d.detail_log?'var(--green)':'var(--text-mid)';
+  }catch(e){}
+}
+
+async function refresh(){
+  try{
+    const d=await fetch('/api/all').then(r=>r.json());
+    dot(true);
+    document.getElementById('d-fw').textContent='build '+d.fw_build;
+    document.getElementById('d-wifi').innerHTML=
+      (d.wifi_ip?'<span style="color:var(--text-mid);font-size:11px">'+d.wifi_ip+'</span> ':'')+rssiLabel(d.wifi_rssi);
+    if(d.bat_mv){
+      const v=(d.bat_mv/1000).toFixed(3);
+      const col=d.bat_mv>=3700?'var(--green)':d.bat_mv>=3400?'var(--orange)':'#f87171';
+      document.getElementById('d-bat').innerHTML='<span style="color:'+col+'">'+v+'V</span>';
+    }
+    document.getElementById('d-storage').textContent=
+      (d.storage_used_kb||0)+'KB / '+(d.storage_total_kb||0)+'KB';
+    const dlEl=document.getElementById('d-detail');
+    dlEl.textContent=d.detail_log?'On':'Off';
+    dlEl.style.color=d.detail_log?'var(--green)':'var(--text-mid)';
+    // Update device name (skip if user is editing)
+    const dni=document.getElementById('dev-name-inp');
+    if(d.device_name&&dni&&!dni.matches(':focus')&&dni.value!==d.device_name){
+      dni.value=d.device_name;
+      document.title=d.device_name;
+    }
+    renderZones(d.zones);
+    updateWateringState(d.watering, d.water_mode, d.water_est_min, d.water_zone_id, d.cleanup_pass||0);
+  }catch(e){ dot(false); }
+}
+
+let activeWaterZoneId = -1;
+let lastWaterMode = 0;
+
+function updateWateringState(watering, mode, estMin, waterZoneId, cleanupPass) {
+  lastWateringState = !!watering;
+  lastCleanupPass   = cleanupPass || 0;
+  lastWaterMode     = watering ? (mode || 0) : 0;
+  activeWaterZoneId = watering ? (waterZoneId ?? -1) : -1;
+  // Schedule dots reflect watering state — repaint on every /api/all
+  // update so they react within the 8 s poll without waiting for the
+  // 30 s schedule refresh.
+  if (typeof paintSchedDots === 'function') paintSchedDots();
+
+  document.querySelectorAll('[id^="wbar-"]').forEach(el=>{
+    const zid = parseInt(el.id.split('-')[1]);
+    el.style.display = (watering && zid === activeWaterZoneId) ? 'flex' : 'none';
+  });
+
+  document.querySelectorAll('[id^="wbtn-"]').forEach(btn=>{
+    const zid = parseInt(btn.id.split('-')[1]);
+    const isWateringZone = watering && zid === activeWaterZoneId;
+    if(isWateringZone){
+      btn.innerHTML='&#9632; Stop';
+      btn.classList.remove('btn-primary');
+      btn.style.borderColor='#7f2020'; btn.style.color='#f87171';
+      btn.disabled = false;
+    } else if(watering){
+      // Another zone is watering -- disable this button
+      btn.innerHTML='&#127783; Water Zone';
+      btn.classList.add('btn-primary');
+      btn.style.borderColor=''; btn.style.color='';
+      btn.disabled = true; btn.style.opacity='0.4';
+    } else {
+      btn.innerHTML='&#127783; Water Zone';
+      btn.classList.add('btn-primary');
+      btn.style.borderColor=''; btn.style.color='';
+      btn.disabled = false; btn.style.opacity='';
+    }
+  });
+
+  // Disable setup/delete buttons on non-watering zones too
+  document.querySelectorAll('[id^="zcard-"]').forEach(card=>{
+    const zid = parseInt(card.id.split('-')[1]);
+    const isWateringZone = watering && zid === activeWaterZoneId;
+    card.querySelectorAll('a.btn, button.btn:not([id^="wbtn-"])').forEach(b=>{
+      b.style.opacity = (watering && !isWateringZone) ? '0.4' : '';
+      b.style.pointerEvents = (watering && !isWateringZone) ? 'none' : '';
+    });
+  });
+
+  // Countdown timer
+  if(watering && !countdownTimer){
+    if(!waterStartTime) waterStartTime=Date.now();
+    if(!waterEstMs && estMin){ waterEstMs=estMin*60000; lastEstMin=estMin; }
+    countdownTimer=setInterval(tickCountdown,1000);
+    tickCountdown();
+  } else if(!watering && countdownTimer){
+    clearInterval(countdownTimer); countdownTimer=null;
+    waterStartTime=0; waterEstMs=0; lastEstMin=0;
+  } else if(watering && countdownTimer && estMin && estMin!==lastEstMin){
+    // Smooth multipass: firmware updates estimate after pass 0 once it knows
+    // how many passes are needed. Only reset the countdown when estMin actually
+    // changes -- not every poll -- to avoid the display jumping repeatedly.
+    waterStartTime=Date.now();
+    waterEstMs=estMin*60000;
+    lastEstMin=estMin;
+    tickCountdown();
+  }
+  if(watering) document.getElementById('modal-bg').classList.remove('open');
+}
+
+function tickCountdown(){
+  const lbl=document.getElementById('wlabel-'+activeWaterZoneId);
+  if(!lbl) return;
+  if(lastCleanupPass>0){
+    lbl.textContent='Cleanup pass '+lastCleanupPass+'…';
+    return;
+  }
+  if(!waterStartTime||!waterEstMs) return;
+  const elapsed=Date.now()-waterStartTime;
+  const rem=Math.max(0,waterEstMs-elapsed);
+  const remMin=Math.floor(rem/60000);
+  const remSec=Math.floor((rem%60000)/1000);
+  const prefix = (lastWaterMode === 50) ? '🐶 Chase · ' : '';
+  lbl.textContent=rem>0
+    ? prefix + remMin+':'+String(remSec).padStart(2,'0')+' remaining'
+    : 'finishing…';
+}
+
+async function deleteZone(id, name){
+  if(!confirm('Delete zone "'+name+'"?\nThis cannot be undone.')) return;
+  try{
+    const r=await fetch('/api/zone/delete',{method:'POST',
+      body:'id='+id,
+      headers:{'Content-Type':'application/x-www-form-urlencoded'}});
+    const d=await r.json();
+    if(d.ok){
+      const card=document.getElementById('zcard-'+id);
+      if(card) card.remove();
+      if(!document.querySelector('[id^="zcard-"]'))
+        document.getElementById('zone-list').innerHTML='<div class="empty">No zones saved yet.</div>';
+    } else alert(d.error||'Delete failed.');
+  }catch(e){ alert('Error: '+e.message); }
+}
+
+async function cancelWater() {
+  try {
+    await fetch('/zone/water/cancel', {method:'POST'});
+  } catch(e) {}
+}
+
+function setTheme(t){
+  document.documentElement.dataset.theme=t;
+  try{ localStorage.setItem('irrigoto_theme',t); }catch(e){}
+  // Re-paint every zone-thumbnail canvas so its filled bg picks up the
+  // new --radar-bg. CSS handles everything else automatically.
+  document.querySelectorAll('.zone-radar').forEach(function(cv){
+    if(cv._pts) drawRadar(cv, cv._pts);
+  });
+  fetch('/api/theme',{method:'POST',
+    headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:'dark='+(t==='dark'?'1':'0')}).catch(function(){});
+}
+// Sync the checkbox to whatever the head script applied (in case the
+// page rendered before /api/theme returned).
+(function(){
+  var cb=document.getElementById('theme-cb');
+  if(cb)cb.checked=(document.documentElement.dataset.theme==='light');
+})();
+
+refresh(); setInterval(refresh, 8000);
+
+// ── Schedule summary ──────────────────────────────────────────────────────────
+// Independent of /api/all so a slow/failing schedule fetch never affects
+// zone rendering. Polled less often (30 s) since it changes rarely.
+const DAY_LBL = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+function fmtLocalEpoch(epoch, tzOffMin){
+  const u = new Date((epoch + tzOffMin*60) * 1000);
+  const Y = u.getUTCFullYear(), M = String(u.getUTCMonth()+1).padStart(2,'0'),
+        D = String(u.getUTCDate()).padStart(2,'0'),
+        h = String(u.getUTCHours()).padStart(2,'0'),
+        m = String(u.getUTCMinutes()).padStart(2,'0');
+  return Y+'-'+M+'-'+D+' '+h+':'+m;
+}
+function daysShort(mask){
+  if (mask === 127) return 'Every day';
+  if (mask === 62)  return 'Weekdays';        // Mon-Fri
+  if (mask === 65)  return 'Weekends';        // Sun, Sat
+  let s = [];
+  for (let i = 0; i < 7; i++) if (mask & (1<<i)) s.push(DAY_LBL[i].slice(0,3));
+  return s.join(' ') || '(no days)';
+}
+// Paint the status dot on every schedule row based on enable flag and
+// whether that zone is currently watering. Called both right after the
+// schedule fetch and again whenever /api/all reports a watering-state
+// change, so the dot reacts within the faster (8 s) polling cadence
+// without having to re-fetch the schedule.
+//   enabled + watering this zone -> orange (var(--orange)), pulsing
+//   enabled, idle                -> green  (var(--green))
+//   disabled                     -> dim    (var(--text-dim)), hollow
+function paintSchedDots(){
+  document.querySelectorAll('.sched-row').forEach(row => {
+    const zoneOne = +row.dataset.zone || 0;
+    const enabled = row.dataset.enabled === '1';
+    const dot = row.querySelector('.sched-dot');
+    if (!dot) return;
+    const wateringThis = lastWateringState && (activeWaterZoneId === zoneOne - 1);
+    row.style.opacity = enabled ? '1' : '.45';
+    if (wateringThis) {
+      // Water blue — same hue on both themes since neither --green nor
+      // --orange evokes "water"; small enough that contrast isn't an issue.
+      dot.textContent = '●';                 // ●
+      dot.style.color = '#4ab8ff';
+      dot.style.textShadow = '0 0 8px rgba(74,184,255,.85)';
+      dot.classList.add('sched-pulse');
+    } else if (enabled) {
+      dot.textContent = '●';                 // ●
+      dot.style.color = 'var(--green)';
+      dot.style.textShadow = '0 0 4px var(--green-glow)';
+      dot.classList.remove('sched-pulse');
+    } else {
+      dot.textContent = '○';                 // ○ hollow
+      dot.style.color = 'var(--text-dim)';
+      dot.style.textShadow = 'none';
+      dot.classList.remove('sched-pulse');
+    }
+  });
+}
+
+// Format a duration in seconds into a compact "ago" / "in" string.
+// e.g. "just now", "5 min ago", "2 h ago", "yesterday", "3 d ago".
+function relTimeFromSec(deltaSec, future){
+  const abs = Math.abs(deltaSec);
+  const suffix = future ? ' away' : ' ago';
+  if (abs < 60)        return future ? 'soon' : 'just now';
+  if (abs < 3600)      return Math.round(abs/60)   + ' min' + suffix;
+  if (abs < 86400)     return Math.round(abs/3600) + ' h'   + suffix;
+  if (abs < 86400*2)   return future ? 'tomorrow' : 'yesterday';
+  return Math.round(abs/86400) + ' d' + suffix;
+}
+
+async function refreshSchedule(){
+  try{
+    const d = await fetch('/api/schedule',{cache:'no-store'}).then(r=>r.json());
+    const el = document.getElementById('sched-summary');
+    const entries = d.entries || [];
+    const tz = d.tz_offset_min || 0;
+    const now = d.now || 0;
+    // Render the "last completed" line whether or not there are
+    // entries — it's history, not schedule state.
+    let lastHtml = '';
+    if (d.last_run && d.last_run.epoch > 1700000000){
+      const zn = d.last_run.name || ('Zone '+d.last_run.zone);
+      const ago = now ? relTimeFromSec(now - d.last_run.epoch, false) : '';
+      const stat = d.last_run.status || '';
+      const statCol = stat === 'completed' ? 'var(--green)'
+                    : stat === 'cancelled' ? 'var(--text-mid)'
+                    : 'var(--orange)';
+      lastHtml = '<div style="font-size:12px;color:var(--text-mid);margin-bottom:4px;">'+
+                 'Last: <span style="color:var(--text)">'+zn+'</span> '+
+                 '<span style="color:'+statCol+'">('+stat+')</span> '+
+                 (ago ? '&middot; '+ago : '')+
+                 '</div>';
+    }
+    if (!entries.length){
+      el.innerHTML = lastHtml +
+        '<div class="empty">No schedules configured. <a href="/schedule" style="color:var(--green)">Add one &rarr;</a></div>';
+      return;
+    }
+    // Build a zone-id -> name map for nicer labels.
+    const zoneMap = {};
+    (d.zones||[]).forEach(z => { zoneMap[z.id+1] = z.name; });
+    let html = lastHtml;
+    if (d.next_run && d.next_run.epoch > 1700000000){
+      const zn = zoneMap[d.next_run.zone] || ('Zone '+d.next_run.zone);
+      html += '<div style="font-size:12px;color:var(--text-mid);margin-bottom:6px;">'+
+              'Next: <span style="color:var(--green)">'+zn+'</span> at '+
+              fmtLocalEpoch(d.next_run.epoch, tz)+'</div>';
+    }
+    html += '<div style="display:flex;flex-direction:column;gap:4px;">';
+    entries.forEach(e => {
+      const zn = zoneMap[e.zone] || ('Zone '+e.zone);
+      const t  = String(e.hour).padStart(2,'0')+':'+String(e.minute).padStart(2,'0');
+      html += '<div class="sched-row" data-zone="'+e.zone+'" data-enabled="'+(e.enabled?1:0)+'" '+
+              'style="display:flex;justify-content:space-between;align-items:center;'+
+              'font-size:12px;">'+
+              '<span style="color:var(--text)"><span class="sched-dot">&#9679;</span> '+
+              t+' &middot; '+zn+'</span>'+
+              '<span style="color:var(--text-mid);font-size:11px;">'+daysShort(e.days_mask)+'</span>'+
+              '</div>';
+    });
+    html += '</div>';
+    el.innerHTML = html;
+    paintSchedDots();
+  }catch(e){
+    // Silent — leave whatever was there. The /schedule page surfaces the real error.
+  }
+}
+refreshSchedule(); setInterval(refreshSchedule, 30000);
+</script>
+</body>
+</html>
+)LANDHTML"

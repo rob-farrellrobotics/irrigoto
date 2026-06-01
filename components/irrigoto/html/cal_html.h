@@ -1,0 +1,556 @@
+/* cal_html.h -- OtO calibration page */
+R"CALHTML(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Calibration</title>
+<script>
+(function(){
+  try{var t=localStorage.getItem('irrigoto_theme');
+    if(t==='light'||t==='dark')document.documentElement.dataset.theme=t;}catch(e){}
+  fetch('/api/theme').then(function(r){return r.json();}).then(function(d){
+    var t2=d.dark?'dark':'light';
+    if(document.documentElement.dataset.theme!==t2){
+      document.documentElement.dataset.theme=t2;
+      try{localStorage.setItem('irrigoto_theme',t2);}catch(e){}}
+  }).catch(function(){});
+})();
+</script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}
+:root,:root[data-theme="dark"]{
+  --bg:#060c10;--bg2:#0b1820;--bg3:#0f2030;
+  --green:#00e87a;--green-dim:#0a3020;--green-glow:rgba(0,232,122,.22);
+  --orange:#ff8c00;--red:#f87171;
+  --text:#c8e0d4;--text-mid:#608070;--border:#0c2a1e;--btn:#0b1c28;
+  --radius:12px;--radius-sm:8px;
+}
+:root[data-theme="light"]{
+  --bg:#f7f9f8;--bg2:#ffffff;--bg3:#eef3f0;
+  --green:#00913f;--green-dim:#cfeede;--green-glow:rgba(0,145,63,.18);
+  --orange:#c95400;--red:#c43030;
+  --text:#0e1a14;--text-mid:#5a7468;--border:#cee0d7;--btn:#f0f5f2;
+}
+html,body{min-height:100%;background:var(--bg);color:var(--text);
+  font-family:-apple-system,BlinkMacSystemFont,'Helvetica Neue',sans-serif;}
+body{display:flex;flex-direction:column;max-width:480px;margin:0 auto;padding-bottom:24px;}
+header{display:flex;align-items:center;gap:12px;padding:14px 20px 10px;border-bottom:1px solid var(--border);}
+.back{color:var(--green);text-decoration:none;font-size:20px;}
+.hdr-title{font-family:'Courier New',monospace;font-size:16px;font-weight:700;letter-spacing:.1em;color:var(--green);}
+.page-logo{display:flex;justify-content:center;padding:12px 0 2px;}
+.logo{font-family:'Courier New',monospace;font-size:20px;font-weight:700;
+  letter-spacing:.15em;color:var(--green);text-shadow:0 0 12px var(--green-glow);}
+main{padding:16px;}
+section{margin-bottom:18px;}
+.sec-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;}
+.sec-title{font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:var(--text-mid);font-weight:500;}
+.card{background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px;margin-bottom:10px;}
+.note{font-size:12px;color:var(--text-mid);line-height:1.5;margin-bottom:12px;}
+/* Progress bar */
+.prog-wrap{background:var(--bg3);border-radius:4px;height:6px;margin:10px 0;}
+.prog-fill{height:100%;border-radius:4px;background:var(--green);transition:width .4s;}
+.status-msg{font-size:12px;color:var(--text-mid);min-height:18px;margin:6px 0;}
+/* Buttons */
+.btn{padding:9px 16px;border-radius:var(--radius-sm);border:1px solid var(--border);
+  background:var(--btn);color:var(--text);font-size:13px;cursor:pointer;
+  display:inline-flex;align-items:center;gap:6px;text-decoration:none;white-space:nowrap;}
+.btn:active,.btn:disabled{opacity:.5;}
+.btn-green{background:var(--green-dim);border-color:#1a5035;color:var(--green);}
+.btn-red{border-color:#7f2020;color:var(--red);}
+.btn-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;}
+/* Table */
+table{width:100%;border-collapse:collapse;font-size:12px;margin-top:10px;}
+th{color:var(--text-mid);font-weight:500;text-align:left;padding:4px 8px 6px;
+  border-bottom:1px solid var(--border);font-size:11px;letter-spacing:.08em;}
+td{padding:5px 8px;border-bottom:1px solid rgba(12,42,30,.5);
+  font-family:'Courier New',monospace;color:var(--text);}
+tr:last-child td{border-bottom:none;}
+.bar-wrap{background:var(--bg3);border-radius:3px;height:5px;width:80px;}
+.bar-fill{height:100%;border-radius:3px;background:var(--green);}
+/* Throw input */
+.throw-input-block{display:none;margin-top:12px;padding:14px;background:var(--bg3);
+  border-radius:var(--radius-sm);border:1px solid rgba(255,140,0,.3);}
+.throw-input-block.show{display:block;}
+.throw-label{font-size:13px;color:var(--orange);margin-bottom:8px;line-height:1.5;}
+.throw-row{display:flex;gap:8px;align-items:center;}
+.throw-inp{flex:1;background:var(--bg2);border:1px solid var(--border);
+  border-radius:var(--radius-sm);color:var(--text);font-size:15px;padding:9px 12px;
+  font-family:'Courier New',monospace;}
+.throw-inp:focus{outline:1px solid var(--green);}
+/* Encoder */
+.enc-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px;}
+.enc-box{background:var(--bg3);border-radius:var(--radius-sm);padding:10px 12px;border:1px solid var(--border);}
+.enc-name{font-size:11px;color:var(--text-mid);letter-spacing:.1em;margin-bottom:6px;}
+.enc-val{font-size:20px;font-family:'Courier New',monospace;color:var(--text);}
+.enc-sub{font-size:11px;color:var(--text-mid);margin-top:3px;}
+.enc-ok{color:var(--green);} .enc-warn{color:var(--orange);}
+/* Speed table compact */
+.spd-row{display:flex;justify-content:space-between;padding:4px 0;
+  border-bottom:1px solid rgba(12,42,30,.5);font-size:12px;}
+.spd-row:last-child{border-bottom:none;}
+.spd-label{color:var(--text-mid);}
+.spd-val{font-family:'Courier New',monospace;}
+</style>
+</head>
+<body>
+<div class="page-logo"><span class="logo">Irrigoto</span></div>
+<header>
+  <a class="back" href="/">&#8592;</a>
+  <span class="hdr-title">Calibration</span>
+</header>
+<main>
+
+<!-- Pressure calibration -->
+<section id="pressure">
+  <div class="sec-hdr"><span class="sec-title">Pressure &rarr; Throw</span></div>
+  <div class="card">
+    <div class="note">Sweeps the valve open&rarr;closed, reads pressure at each step, then averages opening and closing readings to remove hysteresis. Water supply must be connected and pressurised. Allow several minutes for the sweep, plus the throw-distance measurement steps.</div>
+    <div class="btn-row">
+      <button class="btn btn-green" id="pres-start-btn" onclick="presStart()">&#9654; Run scan</button>
+      <button class="btn btn-red" id="pres-cancel-btn" style="display:none" onclick="presCancel()">&#9632; Cancel</button>
+      <button class="btn" id="pres-clear-btn" onclick="presClear()" style="color:#f87171;border-color:#7f2020">&#10005; Clear cal</button>
+    </div>
+    <div class="prog-wrap" id="pres-prog-wrap" style="display:none">
+      <div class="prog-fill" id="pres-prog" style="width:0%"></div>
+    </div>
+    <div class="status-msg" id="pres-msg"></div>
+    <!-- Low throw entry (shown after scan, step 1 of 2) -->
+    <div class="throw-input-block" id="throw-low-block">
+      <div class="throw-label">&#128167; Step 1 of 2: Valve is open a little (short throw). Go measure the distance to the outer edge of this short spray ellipse, then enter it below.</div>
+      <div class="throw-row">
+        <input class="throw-inp" id="throw-low-inp" type="text" placeholder="e.g. 1200 or 4.0f" inputmode="decimal">
+        <button class="btn btn-green" id="throw-low-save-btn" onclick="submitThrowLow()">Save short throw</button>
+      </div>
+      <div class="status-msg" id="throw-low-msg" style="margin-top:6px"></div>
+    </div>
+    <!-- Max throw entry (shown after low throw, step 2 of 2) -->
+    <div class="throw-input-block" id="throw-block">
+      <div class="throw-label">&#127775; Step 2 of 2: Valve is now open at full pressure. Go measure the distance to the outer edge of the spray ellipse, then enter it below.</div>
+      <div class="throw-row">
+        <input class="throw-inp" id="throw-inp" type="text" placeholder="e.g. 6200 or 20.3f" inputmode="decimal">
+        <button class="btn btn-green" id="throw-save-btn" onclick="submitThrow()">Save max throw</button>
+      </div>
+      <div class="status-msg" id="throw-msg" style="margin-top:6px"></div>
+    </div>
+    <!-- Results table -->
+    <div id="pres-table-wrap" style="display:none">
+      <table>
+        <thead><tr><th>#</th><th>Valve (deg)</th><th>PSI</th><th>Throw</th><th></th></tr></thead>
+        <tbody id="pres-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- Nozzle speed calibration -->
+<section id="speed">
+  <div class="sec-hdr"><span class="sec-title">Nozzle Speed</span></div>
+  <div class="card">
+    <div class="note">Runs the nozzle at each PWM duty level and measures deg/sec from the encoder. CW then CCW. Takes ~4 minutes. Connect water supply first &mdash; valve opens to ~30% pressure.</div>
+    <div class="btn-row">
+      <button class="btn btn-green" id="noz-start-btn" onclick="nozStart()">&#9654; Run speed cal</button>
+    </div>
+    <div class="prog-wrap" id="noz-prog-wrap" style="display:none">
+      <div class="prog-fill" id="noz-prog" style="width:0%"></div>
+    </div>
+    <div class="status-msg" id="noz-msg"></div>
+    <div id="noz-table-wrap" style="display:none"></div>
+  </div>
+</section>
+
+<!-- Jog pulse calibration -->
+<section id="jog">
+  <div class="sec-hdr"><span class="sec-title">Jog Pulse Calibration</span></div>
+  <div class="card">
+    <div class="note">Measures how far the nozzle moves per PWM pulse under water load. Run AFTER nozzle speed cal. Valve opens to ~30% pressure &mdash; connect water supply first.</div>
+    <div class="btn-row">
+      <button class="btn btn-green" id="jog-start-btn" onclick="jogStart()">&#9654; Run jog cal</button>
+      <button class="btn btn-red" id="jog-cancel-btn" style="display:none" onclick="jogCancel()">&#9632; Cancel</button>
+    </div>
+    <div class="prog-wrap" id="jog-prog-wrap" style="display:none">
+      <div class="prog-fill" id="jog-prog" style="width:0%"></div>
+    </div>
+    <div class="status-msg" id="jog-msg"></div>
+  </div>
+</section>
+
+<!-- Encoder health -->
+<section>
+  <div class="sec-hdr">
+    <span class="sec-title">Encoder Health</span>
+    <button class="btn" style="font-size:12px;padding:4px 10px" onclick="loadEncoder()">&#8635; Refresh</button>
+  </div>
+  <div class="enc-grid">
+    <div class="enc-box">
+      <div class="enc-name">VALVE (AS5600L)</div>
+      <div class="enc-val" id="enc-v-deg">&mdash;</div>
+      <div class="enc-sub">AGC: <span id="enc-v-agc">&mdash;</span> &nbsp; <span id="enc-v-st"></span></div>
+    </div>
+    <div class="enc-box">
+      <div class="enc-name">NOZZLE (AS5600)</div>
+      <div class="enc-val" id="enc-n-deg">&mdash;</div>
+      <div class="enc-sub">AGC: <span id="enc-n-agc">&mdash;</span> &nbsp; <span id="enc-n-st"></span></div>
+    </div>
+  </div>
+</section>
+
+</main>
+<script>
+const WCAL_IDLE=0,WCAL_PRES_SCAN=1,WCAL_AWAIT_THROW=2,WCAL_NOZ=3,WCAL_JOG=4,WCAL_DONE=5,WCAL_ERR=6,WCAL_AWAIT_THROW_LOW=7;
+let pollTimer=null, lastCalSection='', calActive=false;
+
+// ── Pressure cal ─────────────────────────────────────────────────────────────
+async function presClear(){
+  if(!confirm('Clear pressure calibration (LittleFS + NVS backup)?')) return;
+  const r=await fetch('/api/cal/clear',{method:'POST'});
+  const d=await r.json();
+  if(d.ok){
+    document.getElementById('pres-table-wrap').innerHTML='';
+    document.getElementById('pres-msg').textContent='Calibration cleared.';
+  }
+}
+async function presStart(){
+  const r=await fetch('/cal/pressure/start',{method:'POST'});
+  const d=await r.json();
+  if(!d.ok){alert(d.error||'Failed');return;}
+  calActive=true;
+  document.getElementById('pres-start-btn').disabled=true;
+  document.getElementById('pres-clear-btn').disabled=true;
+  document.getElementById('pres-cancel-btn').style.display='';
+  document.getElementById('pres-prog-wrap').style.display='';
+  document.getElementById('pres-table-wrap').style.display='none';
+  document.getElementById('throw-block').classList.remove('show');
+  document.getElementById('throw-low-block').classList.remove('show');
+  document.getElementById('throw-low-save-btn').disabled=false;
+  document.getElementById('throw-save-btn').disabled=false;
+  startPoll();
+}
+async function presCancel(){
+  await fetch('/cal/pressure/cancel',{method:'POST'});
+  stopPoll(); resetPresUI();
+}
+// The throw handlers block ~10s while the valve drives (open for the max step,
+// closed at the end), so disable the button during the request and give
+// feedback -- otherwise an impatient second click lands after the device has
+// advanced and returns "not awaiting throw". On error we restart the poll so
+// the UI reconciles to the device's real state instead of stranding the block.
+async function submitThrowLow(){
+  const val=document.getElementById('throw-low-inp').value.trim();
+  if(!val){return;}
+  const btn=document.getElementById('throw-low-save-btn');
+  if(btn.disabled) return;
+  btn.disabled=true;
+  const msg=document.getElementById('throw-low-msg');
+  msg.textContent='Saving short throw... opening valve fully (~10s)';
+  msg.style.color='var(--text-mid)';
+  try{
+    const body='throw_mm='+encodeURIComponent(val);
+    const r=await fetch('/cal/pressure/throw_low',{method:'POST',body,
+      headers:{'Content-Type':'application/x-www-form-urlencoded'}});
+    const d=await r.json();
+    if(d.ok){
+      msg.textContent='Short throw saved. Opening fully...';
+      msg.style.color='var(--green)';
+      document.getElementById('throw-low-block').classList.remove('show');
+      startPoll();   // poll picks up AWAIT_THROW and shows the max-throw block
+    } else {
+      msg.textContent=d.error||'Error';
+      msg.style.color='var(--red)';
+      btn.disabled=false;
+      startPoll();
+    }
+  }catch(e){
+    msg.textContent='Connection error: '+e.message;
+    msg.style.color='var(--red)';
+    btn.disabled=false;
+  }
+}
+async function submitThrow(){
+  const val=document.getElementById('throw-inp').value.trim();
+  if(!val){return;}
+  const btn=document.getElementById('throw-save-btn');
+  if(btn.disabled) return;
+  btn.disabled=true;
+  const msg=document.getElementById('throw-msg');
+  msg.textContent='Saving max throw... closing valve (~10s)';
+  msg.style.color='var(--text-mid)';
+  try{
+    const body='throw_mm='+encodeURIComponent(val);
+    const r=await fetch('/cal/pressure/throw',{method:'POST',body,
+      headers:{'Content-Type':'application/x-www-form-urlencoded'}});
+    const d=await r.json();
+    if(d.ok){
+      msg.textContent='Saved.';
+      msg.style.color='var(--green)';
+      document.getElementById('throw-block').classList.remove('show');
+      setTimeout(loadCal, 300); // cal written to flash before POST returned
+      startPoll();              // continue polling so done-state UI cleanup fires
+    } else {
+      msg.textContent=d.error||'Error';
+      msg.style.color='var(--red)';
+      btn.disabled=false;
+      startPoll();              // reconcile: device may already be DONE
+    }
+  }catch(e){
+    msg.textContent='Connection error: '+e.message;
+    msg.style.color='var(--red)';
+    btn.disabled=false;
+  }
+}
+function resetPresUI(){
+  document.getElementById('pres-start-btn').disabled=false;
+  document.getElementById('pres-clear-btn').disabled=false;
+  document.getElementById('pres-cancel-btn').style.display='none';
+  document.getElementById('pres-prog-wrap').style.display='none';
+}
+
+// ── Nozzle cal ───────────────────────────────────────────────────────────────
+async function jogStart(){
+  const btn=document.getElementById('jog-start-btn');
+  const msg=document.getElementById('jog-msg');
+  btn.disabled=true;
+  document.getElementById('jog-prog-wrap').style.display='';
+  msg.textContent='Connecting...';
+  msg.style.color='var(--text-mid)';
+  try{
+    const r=await fetch('/cal/jog/start',{method:'POST'});
+    const d=await r.json();
+    if(!d.ok){
+      msg.textContent='Error: '+(d.error||'start failed');
+      msg.style.color='var(--red)';
+      btn.disabled=false;
+      document.getElementById('jog-prog-wrap').style.display='none';
+      return;
+    }
+    msg.textContent='Running...';
+    document.getElementById('jog-cancel-btn').style.display='';
+  calActive=true;
+  }catch(e){
+    msg.textContent='Connection error: '+e.message;
+    msg.style.color='var(--red)';
+    btn.disabled=false;
+    document.getElementById('jog-prog-wrap').style.display='none';
+    document.getElementById('jog-cancel-btn').style.display='none';
+    return;
+  }
+  startPoll();
+}
+
+async function jogCancel(){
+  await fetch('/cal/jog/cancel',{method:'POST'});
+  stopPoll();
+  document.getElementById('jog-start-btn').disabled=false;
+  document.getElementById('jog-cancel-btn').style.display='none';
+  document.getElementById('jog-prog-wrap').style.display='none';
+  document.getElementById('jog-msg').textContent='Cancelled.';
+  calActive=false;
+}
+
+async function nozStart(){
+  document.getElementById('noz-start-btn').disabled=true;
+  document.getElementById('noz-prog-wrap').style.display='';
+  document.getElementById('noz-msg').textContent='Starting...';
+  try{
+    const r=await fetch('/cal/nozzle/start',{method:'POST'});
+    const d=await r.json();
+    if(!d.ok){
+      alert(d.error||'Start failed');
+      document.getElementById('noz-start-btn').disabled=false;
+      document.getElementById('noz-prog-wrap').style.display='none';
+      return;
+    }
+  calActive=true;
+  }catch(e){
+    alert('Connection error: '+e.message);
+    document.getElementById('noz-start-btn').disabled=false;
+    document.getElementById('noz-prog-wrap').style.display='none';
+    return;
+  }
+  startPoll();
+}
+
+// ── Polling ──────────────────────────────────────────────────────────────────
+// Sequential: next poll is scheduled only after current fetch completes,
+// preventing request pile-up when the ESP32 is slow to respond.
+var _pollRunning=false;
+function startPoll(){ stopPoll(); _pollRunning=true; poll(); }
+function stopPoll(){ _pollRunning=false; clearTimeout(pollTimer); pollTimer=null; }
+
+async function poll(){
+  try{
+    const r=await fetch('/cal/status');
+    const txt=await r.text();
+    const d=JSON.parse(txt);
+    updatePresUI(d);
+    if(d.state===WCAL_DONE||d.state===WCAL_ERR){
+      stopPoll(); return;
+    }
+  }catch(e){
+    if(calActive) document.getElementById('pres-msg').textContent='poll err:'+e.message;
+  }
+  if(_pollRunning) pollTimer=setTimeout(poll,800);
+}
+
+function updatePresUI(d){
+  // Only update section that owns the current state
+  const presActive = d.state===WCAL_PRES_SCAN||d.state===WCAL_AWAIT_THROW||d.state===WCAL_AWAIT_THROW_LOW;
+  const nozActive  = d.state===WCAL_NOZ;
+  const jogActive  = d.state===WCAL_JOG;
+  const done       = d.state===WCAL_DONE||d.state===WCAL_ERR;
+  const msg=document.getElementById('pres-msg');
+  if(presActive||done) {
+    msg.textContent=presActive?d.msg||'':'';
+    msg.style.color=d.state===WCAL_ERR?'var(--red)':d.state===WCAL_DONE?'var(--green)':'var(--text-mid)';
+  }
+  const nozMsg=document.getElementById('noz-msg');
+  if(nozActive){lastCalSection='noz';
+    nozMsg.textContent=d.msg||'';
+    document.getElementById('noz-prog').style.width=d.progress+'%';
+    document.getElementById('noz-prog-wrap').style.display='';
+  } else if(jogActive){lastCalSection='jog';
+    document.getElementById('jog-cancel-btn').style.display='';
+    document.getElementById('jog-msg').textContent=d.msg||'';;
+    document.getElementById('jog-prog').style.width=d.progress+'%';
+    document.getElementById('jog-prog-wrap').style.display='';
+  }
+  if(done){
+    const col=d.state===WCAL_ERR?'var(--red)':'var(--green)';
+    ['noz-prog-wrap','jog-prog-wrap','pres-prog-wrap'].forEach(id=>{
+      const el=document.getElementById(id); if(el) el.style.display='none';
+    });
+    ['jog-cancel-btn','pres-cancel-btn'].forEach(id=>{
+      const el=document.getElementById(id); if(el) el.style.display='none';
+    });
+    // Cal finished (DONE/ERR): tear down the throw-input steps and reset their
+    // buttons, otherwise the last step's block stays on screen and a re-click
+    // hits "not awaiting throw".
+    ['throw-low-block','throw-block'].forEach(id=>{
+      const el=document.getElementById(id); if(el) el.classList.remove('show');
+    });
+    ['throw-low-save-btn','throw-save-btn'].forEach(id=>{
+      const el=document.getElementById(id); if(el) el.disabled=false;
+    });
+    // Re-enable after short delay so result message is readable
+    calActive=false;
+    setTimeout(()=>{
+      if(!calActive) {  // only re-enable if no new cal started
+        ['noz-start-btn','jog-start-btn','pres-start-btn'].forEach(id=>{
+          const el=document.getElementById(id); if(el) el.disabled=false;
+        });
+      }
+    }, 2000);
+    document.getElementById('pres-cancel-btn').style.display='none';
+    // Show final message in whichever section was running
+    if(lastCalSection==='jog'){
+      document.getElementById('jog-msg').textContent=d.msg||''; 
+      document.getElementById('jog-msg').style.color=col;
+    } else if(lastCalSection==='noz'){
+      nozMsg.textContent=d.msg||''; nozMsg.style.color=col;
+    }
+    lastCalSection='';
+    setTimeout(loadCal, 800);  // refresh cal table after scan completes
+  }
+
+  if(d.state===WCAL_PRES_SCAN){
+    document.getElementById('pres-prog').style.width=d.progress+'%';
+    document.getElementById('pres-cancel-btn').style.display='';
+  }
+
+  if(d.state===WCAL_AWAIT_THROW_LOW){
+    document.getElementById('pres-prog').style.width='100%';
+    document.getElementById('pres-cancel-btn').style.display='none';
+    document.getElementById('throw-low-block').classList.add('show');
+    document.getElementById('throw-block').classList.remove('show');
+    renderPresTable(d);
+  }
+
+  if(d.state===WCAL_AWAIT_THROW){
+    document.getElementById('pres-prog').style.width='100%';
+    document.getElementById('pres-cancel-btn').style.display='none';
+    document.getElementById('throw-low-block').classList.remove('show');
+    document.getElementById('throw-block').classList.add('show');
+    renderPresTable(d);
+  }
+
+  if((d.state===WCAL_DONE||d.state===WCAL_IDLE)&&d.num_points>0){
+    renderPresTable(d);
+  }
+}
+
+function renderPresTable(d){
+  if(!d.points||!d.points.length) return;
+  const wrap=document.getElementById('pres-table-wrap');
+  const tbody=document.getElementById('pres-tbody');
+  const maxT=Math.max(...d.points.map(p=>p.t));
+  tbody.innerHTML=d.points.map((p,i)=>{
+    const pct=maxT>0?Math.round(p.t/maxT*100):0;
+    const tStr=p.t>0?(p.t/304.8).toFixed(1)+'ft':'&mdash;';
+    return `<tr>
+      <td>${i+1}</td>
+      <td>${p.v.toFixed(1)}</td>
+      <td>${p.p.toFixed(3)}</td>
+      <td>${tStr}</td>
+      <td><div class="bar-wrap"><div class="bar-fill" style="width:${pct}%"></div></div></td>
+    </tr>`;
+  }).join('');
+  wrap.style.display='';
+}
+
+// ── Encoder ──────────────────────────────────────────────────────────────────
+async function loadEncoder(){
+  try{
+    const d=await fetch('/cal/encoder').then(r=>r.json());
+    function agcStatus(agc){
+      if(agc===undefined||agc===null) return {cls:'',txt:'no data'};
+      const ok=agc>50&&agc<200;
+      return {cls:ok?'enc-ok':'enc-warn', txt:ok?'OK':'check magnet'};
+    }
+    document.getElementById('enc-v-deg').textContent=d.valve.deg.toFixed(1)+'\u00b0';
+    document.getElementById('enc-n-deg').textContent=d.nozzle.deg.toFixed(1)+'\u00b0';
+    const vs=agcStatus(d.valve.agc), ns=agcStatus(d.nozzle.agc);
+    document.getElementById('enc-v-agc').textContent=d.valve.agc;
+    document.getElementById('enc-n-agc').textContent=d.nozzle.agc;
+    document.getElementById('enc-v-st').className=vs.cls;
+    document.getElementById('enc-v-st').textContent=vs.txt;
+    document.getElementById('enc-n-st').className=ns.cls;
+    document.getElementById('enc-n-st').textContent=ns.txt;
+  }catch(e){}
+}
+
+// Scroll to speed section if #speed hash
+if(location.hash==='#speed') setTimeout(()=>document.getElementById('speed').scrollIntoView({behavior:'smooth'}),200);
+
+// Initial load
+
+async function loadCal(){
+  try{
+    const d=await fetch('/api/cal').then(r=>r.json());
+    if(!d.num_points) return;
+    const tbody=document.getElementById('pres-tbody');
+    const wrap=document.getElementById('pres-table-wrap');
+    const maxT=Math.max(...d.throw_mm.filter(t=>t>0))||1;
+    tbody.innerHTML=d.valve_deg.map((v,i)=>{
+      const t=d.throw_mm[i];
+      const pct=Math.round(t/maxT*100);
+      const tStr=t>0?(t/304.8).toFixed(1)+'ft':'&mdash;';
+      return `<tr>
+        <td>${i+1}</td>
+        <td>${v.toFixed(1)}</td>
+        <td>${d.pressure_psi[i].toFixed(3)}</td>
+        <td>${tStr}</td>
+        <td><div class="bar-wrap"><div class="bar-fill" style="width:${pct}%"></div></div></td>
+      </tr>`;
+    }).join('');
+    wrap.style.display='';
+  }catch(e){}
+}
+
+loadCal();
+poll();
+loadEncoder();
+</script>
+</body>
+</html>
+)CALHTML"

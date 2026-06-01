@@ -1,0 +1,2450 @@
+# irrigoto — per-device Home Assistant package (TEMPLATE)
+#
+# This is the PER-DEVICE half of the irrigoto HA config. It is templated:
+# tools/ha-regen.py reads homeassistant/devices.yaml and emits one
+# personalized copy per device (generated/packages/irrigoto_device_<slug_usc>.yaml),
+# with the placeholders below substituted. Drop every generated copy plus
+# the shared files (irrigoto_common.yaml, irrigoto_schedule.yaml) into your
+# HA config/packages/ directory.
+#
+#   homeassistant:
+#     packages: !include_dir_named packages
+#
+# >>>STRIP-ON-REGEN-START<<<
+# ─── NAMING CONVENTION (read once, then forget) ──────────────────────
+#
+# Every entity, automation, script, and helper this template DEFINES is
+# prefixed with the device's underscore-slug (<<DEV_USC>>) so that N
+# copies — one per device — coexist in one HA without colliding. The
+# rule is deliberately simple:
+#
+#   <<DEV_USC>>_<name>   →  defined HERE, belongs to ONE device
+#                           (e.g. sensor.irrigoto_xxxxxx_cumulative_volume)
+#   irrigoto_<name>      →  SHARED across the fleet, defined in
+#                           irrigoto_common.yaml / irrigoto_schedule.yaml
+#                           (e.g. sensor.irrigoto_desired_schedule)
+#
+# Three placeholders are substituted per device by ha-regen:
+#
+#   <<DEV_DASH>>  →  irrigoto-xxxxxx   dash form; ESPHome events
+#                                      (esphome.<<DEV_DASH>>_watering_complete)
+#   <<DEV_USC>>   →  irrigoto_xxxxxx   underscore form; device entity IDs
+#                                      (sensor.<<DEV_USC>>_irrigoto_pressure)
+#                                      and every entity defined here
+#   <<DEV_URL>>   →  http://<ip>       base URL for HTTP-poll sensors
+#
+# Device-PROVIDED entities (published by the ESPHome integration) read
+# as <domain>.<<DEV_USC>>_irrigoto_<entity> — the trailing "irrigoto_"
+# is the friendly_name slug and is NOT one of our prefixes; leave it.
+# ─────────────────────────────────────────────────────────────────────
+# >>>STRIP-ON-REGEN-END<<<
+
+# ── Input helpers ────────────────────────────────────────────────────
+# Mirror of the device's live schedule text — updated from the
+# schedule_changed event below so HA dashboards can display it without
+# polling the device. Read-only from the UI's perspective; treat as a
+# status snapshot.
+input_text:
+  <<DEV_USC>>_schedule_mirror:
+    name: <<DEV_DASH>> schedule (live)
+    icon: mdi:calendar-text
+    max: 255
+  # b355: per-device "last schedule_version HA observed from this device."
+  # Updated whenever the schedule_version text_sensor publishes or the
+  # schedule_changed event fires; the reconciler compares HA's last_seen
+  # against the device's current value to decide whether to pull in
+  # device-side edits. Stored as a string so we can use input_text
+  # (input_number has step / precision quirks for a monotonic counter).
+  <<DEV_USC>>_last_seen_schedule_version:
+    name: "irrigoto <<DEV_DASH>> last seen schedule_version"
+    icon: mdi:counter
+    max: 16
+    initial: "0"
+
+# b311: chase-mode duration shared across all zones. 1..10 minutes,
+# 1-minute steps. The chase scripts read this and pass it to the
+# firmware via shell_command.irrigoto_chase_zone.
+input_number:
+  <<DEV_USC>>_chase_duration:
+    name: <<DEV_DASH>> chase duration
+    icon: mdi:timer-outline
+    min: 1
+    max: 10
+    step: 1
+    unit_of_measurement: min
+    mode: slider
+
+# Depth selector for the Device tab's "Start watering" button. Pairs with
+# the device's Zone + Water Mode selects; the water_now script maps the
+# (mode, depth) pair to the firmware's mode digit. Smooth mode ignores depth
+# (device only supports Smooth 1/8").
+input_select:
+  # Zone picker for the "Start watering" button. Options are populated from
+  # the device's live zone list as "Name (#id)" by the
+  # <<DEV_USC>>_update_water_zone_options automation (includes zone id 0).
+  # HA-side so the selection holds (the device's own Zone/Mode selects
+  # republish their state each loop tick and snap back).
+  <<DEV_USC>>_water_zone:
+    name: <<DEV_DASH>> water zone
+    icon: mdi:sprinkler-variant
+    options:
+      - "(loading)"
+  <<DEV_USC>>_water_mode:
+    name: <<DEV_DASH>> water mode
+    icon: mdi:water-pump
+    options:
+      - Pulse
+      - Gentle
+      - Smooth
+    initial: Pulse
+  <<DEV_USC>>_water_depth:
+    name: <<DEV_DASH>> water depth
+    icon: mdi:arrow-expand-down
+    options:
+      - 1/8 in
+      - 1/4 in
+      - 3/8 in
+      - 1/2 in
+      - 5/8 in
+      - 3/4 in
+      - 7/8 in
+      - 1 in
+    initial: 1/8 in
+
+# b311: per-zone chase scripts. Each calls the chase shell_command with
+# its zone id and the current input_number value. Card buttons fire
+# script.<<DEV_USC>>_chase_zone_N -- no need for the card to know about ip
+# resolution or duration plumbing.
+script:
+  <<DEV_USC>>_chase_zone_0:
+    alias: "irrigoto <<DEV_DASH>>: chase Zone (id 0)"
+    icon: mdi:dog
+    mode: single
+    sequence:
+      - action: shell_command.irrigoto_chase_zone
+        data:
+          ip: "{{ states('sensor.<<DEV_USC>>_irrigoto_ip_address') }}"
+          zone_id: 0
+          duration: "{{ states('input_number.<<DEV_USC>>_chase_duration') | int(3) }}"
+  <<DEV_USC>>_chase_zone_1:
+    alias: "irrigoto <<DEV_DASH>>: chase Zone (id 1)"
+    icon: mdi:dog
+    mode: single
+    sequence:
+      - action: shell_command.irrigoto_chase_zone
+        data:
+          ip: "{{ states('sensor.<<DEV_USC>>_irrigoto_ip_address') }}"
+          zone_id: 1
+          duration: "{{ states('input_number.<<DEV_USC>>_chase_duration') | int(3) }}"
+  <<DEV_USC>>_chase_zone_2:
+    alias: "irrigoto <<DEV_DASH>>: chase Zone (id 2)"
+    icon: mdi:dog
+    mode: single
+    sequence:
+      - action: shell_command.irrigoto_chase_zone
+        data:
+          ip: "{{ states('sensor.<<DEV_USC>>_irrigoto_ip_address') }}"
+          zone_id: 2
+          duration: "{{ states('input_number.<<DEV_USC>>_chase_duration') | int(3) }}"
+  <<DEV_USC>>_chase_zone_3:
+    alias: "irrigoto <<DEV_DASH>>: chase Zone (id 3)"
+    icon: mdi:dog
+    mode: single
+    sequence:
+      - action: shell_command.irrigoto_chase_zone
+        data:
+          ip: "{{ states('sensor.<<DEV_USC>>_irrigoto_ip_address') }}"
+          zone_id: 3
+          duration: "{{ states('input_number.<<DEV_USC>>_chase_duration') | int(3) }}"
+  <<DEV_USC>>_chase_zone_4:
+    alias: "irrigoto <<DEV_DASH>>: chase Zone (id 4)"
+    icon: mdi:dog
+    mode: single
+    sequence:
+      - action: shell_command.irrigoto_chase_zone
+        data:
+          ip: "{{ states('sensor.<<DEV_USC>>_irrigoto_ip_address') }}"
+          zone_id: 4
+          duration: "{{ states('input_number.<<DEV_USC>>_chase_duration') | int(3) }}"
+  <<DEV_USC>>_chase_zone_5:
+    alias: "irrigoto <<DEV_DASH>>: chase Zone (id 5)"
+    icon: mdi:dog
+    mode: single
+    sequence:
+      - action: shell_command.irrigoto_chase_zone
+        data:
+          ip: "{{ states('sensor.<<DEV_USC>>_irrigoto_ip_address') }}"
+          zone_id: 5
+          duration: "{{ states('input_number.<<DEV_USC>>_chase_duration') | int(3) }}"
+  <<DEV_USC>>_chase_zone_6:
+    alias: "irrigoto <<DEV_DASH>>: chase Zone (id 6)"
+    icon: mdi:dog
+    mode: single
+    sequence:
+      - action: shell_command.irrigoto_chase_zone
+        data:
+          ip: "{{ states('sensor.<<DEV_USC>>_irrigoto_ip_address') }}"
+          zone_id: 6
+          duration: "{{ states('input_number.<<DEV_USC>>_chase_duration') | int(3) }}"
+  <<DEV_USC>>_chase_zone_7:
+    alias: "irrigoto <<DEV_DASH>>: chase Zone (id 7)"
+    icon: mdi:dog
+    mode: single
+    sequence:
+      - action: shell_command.irrigoto_chase_zone
+        data:
+          ip: "{{ states('sensor.<<DEV_USC>>_irrigoto_ip_address') }}"
+          zone_id: 7
+          duration: "{{ states('input_number.<<DEV_USC>>_chase_duration') | int(3) }}"
+  <<DEV_USC>>_water_cancel:
+    alias: "irrigoto <<DEV_DASH>>: cancel watering"
+    icon: mdi:stop-circle
+    mode: single
+    sequence:
+      - action: shell_command.irrigoto_water_cancel
+        data:
+          ip: "{{ states('sensor.<<DEV_USC>>_irrigoto_ip_address') }}"
+
+  # Start watering the zone/mode/depth chosen in the HA selectors ("Start
+  # watering" button). The zone selector carries the id as "Name (#id)", so
+  # the id (including 0) resolves unambiguously; mode maps to the firmware
+  # style digit, depth to eighths of an inch:
+  #   Pulse=1  Gentle=5  Smooth=7      depth 1..8 = 1/8".. 1"
+  <<DEV_USC>>_water_now:
+    alias: "irrigoto <<DEV_DASH>>: start watering selected zone/mode/depth"
+    icon: mdi:play-circle
+    mode: single
+    sequence:
+      - variables:
+          zone_sel: "{{ states('input_select.<<DEV_USC>>_water_zone') }}"
+          mode_sel: "{{ states('input_select.<<DEV_USC>>_water_mode') }}"
+          depth_sel: "{{ states('input_select.<<DEV_USC>>_water_depth') }}"
+          zone_id: >-
+            {%- if '(#' in zone_sel and ')' in zone_sel -%}
+              {{ zone_sel.split('(#')[1].split(')')[0] | int(-1) }}
+            {%- else -%}-1{%- endif -%}
+          depth8: >-
+            {{ {'1/8 in':1,'1/4 in':2,'3/8 in':3,'1/2 in':4,
+                '5/8 in':5,'3/4 in':6,'7/8 in':7,'1 in':8}.get(depth_sel, 1) }}
+          mode_digit: >-
+            {%- if mode_sel == 'Pulse' -%}1
+            {%- elif mode_sel == 'Gentle' -%}5
+            {%- else -%}7
+            {%- endif -%}
+      - if:
+          - condition: template
+            value_template: "{{ (zone_id | int(-1)) >= 0 }}"
+        then:
+          - action: shell_command.irrigoto_water_zone
+            data:
+              ip: "{{ states('sensor.<<DEV_USC>>_irrigoto_ip_address') }}"
+              zone_id: "{{ zone_id }}"
+              mode: "{{ mode_digit }}"
+              depth: "{{ depth8 }}"
+          - action: logbook.log
+            data:
+              name: irrigoto
+              message: >-
+                <<DEV_DASH>>: start watering {{ zone_sel }}
+                — {{ mode_sel }} {{ depth_sel }} (mode {{ mode_digit }})
+              domain: sensor
+              entity_id: sensor.<<DEV_USC>>_watering_log
+        else:
+          - action: logbook.log
+            data:
+              name: irrigoto
+              message: >-
+                <<DEV_DASH>>: start watering aborted — couldn't resolve a zone id
+                from "{{ zone_sel }}" (pick a zone once the list has loaded)
+              domain: sensor
+              entity_id: sensor.<<DEV_USC>>_watering_log
+
+  # b355: Force-push the HA-side desired schedule for THIS device immediately
+  # using the new sync_schedule service. Builds a sync payload that
+  # includes id + last_modified per HA-slot entry plus tombstones for
+  # any device-known IDs that are no longer represented in HA slots.
+  # Entries the device has that HA never knew about (id not in our
+  # last-seen set) are left alone -- web-UI adds survive.
+  <<DEV_USC>>_push_schedule:
+    alias: "irrigoto <<DEV_DASH>>: push desired schedule now"
+    icon: mdi:upload
+    mode: single
+    sequence:
+      - variables:
+          rendered_sync: >-
+            {{ state_attr('sensor.<<DEV_USC>>_desired_rendered', 'sync_payload')
+               | default('', true) }}
+          rendered_count: >-
+            {{ state_attr('sensor.<<DEV_USC>>_desired_rendered', 'sync_count')
+               | default(0) | int(0) }}
+      - if:
+          - condition: template
+            value_template: "{{ rendered_count > 0 }}"
+        then:
+          - action: esphome.<<DEV_USC>>_sync_schedule
+            data:
+              entries: "{{ rendered_sync }}"
+          - action: logbook.log
+            data:
+              name: irrigoto
+              message: >-
+                <<DEV_DASH>>: sync_schedule pushed
+                ({{ rendered_count }} entries / tombstones)
+              domain: sensor
+              entity_id: sensor.<<DEV_USC>>_watering_log
+
+# Logbook scoping — suppress state-change entries for the placeholder
+# "log" sensors below. We use them only as hooks to tag logbook.log
+# entries from the watering/cal automations against a dedicated entity,
+# so the dashboard's logbook card filtered to that entity shows only
+# those summary lines and nothing else (no "Auto-sleep turned on", no
+# "became available", etc).
+#
+# Two scopes for watering:
+#   - <<DEV_USC>>_watering_log: catch-all activity tag for sync_schedule
+#     pushes, CSV mirrors, reconciler pulls, push-blocked warnings, etc.
+#     The Device tab's "Recent activity" card filters to this.
+#   - <<DEV_USC>>_watering_completions: ONLY per-watering completion lines
+#     (one entry per finished cycle). The Trends tab's "Watering history"
+#     card filters to this so it stays free of sync/mirror chatter.
+logbook:
+  exclude:
+    entities:
+      - sensor.<<DEV_USC>>_watering_log
+      - sensor.<<DEV_USC>>_watering_completions
+      - sensor.<<DEV_USC>>_calibration_log
+
+# ── Valve open/close toggle ──────────────────────────────────────────
+# Single switch backing the dashboard valve toggle. turn_on/turn_off POST
+# to the device's /valve/open and /valve/close HTTP endpoints (moved off
+# the HA service bus in b370 to keep ListEntitiesServices under the
+# 2026.4.5 send-buffer ceiling). The displayed state is NOT optimistic —
+# it follows the b370 valve_open binary_sensor, which the device publishes
+# from its confirmed encoder angle. So the toggle only flips once the
+# device reports the valve actually moved.
+# (The valve toggle is defined as a MODERN template switch — the first
+# entry under the `template:` list below. The legacy `switch: platform:
+# template` form is removed in HA 2026.6.)
+
+# ── Template sensors ─────────────────────────────────────────────────
+# Trigger-based template sensors are evaluated only when the matching
+# event fires, then retain their value until the next event. Recorder
+# picks them up the same as any other sensor.
+#
+# The first three below are PLAIN (non-trigger) sensors with a constant
+# state. They exist purely as targets for logbook.log entries from the
+# <<DEV_USC>>_log_watering_completion / _cal_completion / system-activity
+# automations. Combined with the logbook: exclude block above, this
+# gives us a logbook view that contains ONLY the per-event summary lines.
+template:
+  # Valve open/close toggle (modern template switch). default_entity_id
+  # pins the entity_id so it never collides into a "_2" suffix. State
+  # follows the device's confirmed valve_open binary_sensor (not optimistic).
+  - switch:
+      - name: "<<DEV_DASH>> valve"
+        unique_id: <<DEV_USC>>_valve
+        default_entity_id: switch.<<DEV_USC>>_valve
+        icon: mdi:valve
+        state: >-
+          {{ is_state('binary_sensor.<<DEV_USC>>_irrigoto_valve_open', 'on') }}
+        turn_on:
+          - action: shell_command.irrigoto_valve_open
+            data:
+              ip: "{{ states('sensor.<<DEV_USC>>_irrigoto_ip_address') }}"
+        turn_off:
+          - action: shell_command.irrigoto_valve_close
+            data:
+              ip: "{{ states('sensor.<<DEV_USC>>_irrigoto_ip_address') }}"
+  # Per-zone existence flags driving chase/heatmap/overview card visibility
+  # (conditional cards only allow state conditions, not templates). TRIGGER-
+  # based with a guard condition so they update ONLY when the device's live
+  # zone list is actually available — when schedule_rest goes unavailable
+  # (device asleep) the trigger fires but the condition fails, so the sensors
+  # RETAIN their last value instead of flipping off (which would make every
+  # heatmap/chase card vanish on each sleep). Trigger-based template entities
+  # also restore their last state across HA restarts.
+  - trigger:
+      - trigger: state
+        entity_id: sensor.<<DEV_USC>>_schedule_rest
+        attribute: zones
+      - trigger: homeassistant
+        event: start
+    condition:
+      - condition: template
+        value_template: >-
+          {{ state_attr('sensor.<<DEV_USC>>_schedule_rest', 'zones')
+             | default([], true) | count > 0 }}
+    binary_sensor:
+      - name: "<<DEV_DASH>> zone 1 exists"
+        unique_id: <<DEV_USC>>_zone_1_exists
+        default_entity_id: binary_sensor.<<DEV_USC>>_zone_1_exists
+        state: "{{ 0 in (state_attr('sensor.<<DEV_USC>>_schedule_rest', 'zones') | map(attribute='id') | map('int') | list) }}"
+      - name: "<<DEV_DASH>> zone 2 exists"
+        unique_id: <<DEV_USC>>_zone_2_exists
+        default_entity_id: binary_sensor.<<DEV_USC>>_zone_2_exists
+        state: "{{ 1 in (state_attr('sensor.<<DEV_USC>>_schedule_rest', 'zones') | map(attribute='id') | map('int') | list) }}"
+      - name: "<<DEV_DASH>> zone 3 exists"
+        unique_id: <<DEV_USC>>_zone_3_exists
+        default_entity_id: binary_sensor.<<DEV_USC>>_zone_3_exists
+        state: "{{ 2 in (state_attr('sensor.<<DEV_USC>>_schedule_rest', 'zones') | map(attribute='id') | map('int') | list) }}"
+      - name: "<<DEV_DASH>> zone 4 exists"
+        unique_id: <<DEV_USC>>_zone_4_exists
+        default_entity_id: binary_sensor.<<DEV_USC>>_zone_4_exists
+        state: "{{ 3 in (state_attr('sensor.<<DEV_USC>>_schedule_rest', 'zones') | map(attribute='id') | map('int') | list) }}"
+      - name: "<<DEV_DASH>> zone 5 exists"
+        unique_id: <<DEV_USC>>_zone_5_exists
+        default_entity_id: binary_sensor.<<DEV_USC>>_zone_5_exists
+        state: "{{ 4 in (state_attr('sensor.<<DEV_USC>>_schedule_rest', 'zones') | map(attribute='id') | map('int') | list) }}"
+      - name: "<<DEV_DASH>> zone 6 exists"
+        unique_id: <<DEV_USC>>_zone_6_exists
+        default_entity_id: binary_sensor.<<DEV_USC>>_zone_6_exists
+        state: "{{ 5 in (state_attr('sensor.<<DEV_USC>>_schedule_rest', 'zones') | map(attribute='id') | map('int') | list) }}"
+      - name: "<<DEV_DASH>> zone 7 exists"
+        unique_id: <<DEV_USC>>_zone_7_exists
+        default_entity_id: binary_sensor.<<DEV_USC>>_zone_7_exists
+        state: "{{ 6 in (state_attr('sensor.<<DEV_USC>>_schedule_rest', 'zones') | map(attribute='id') | map('int') | list) }}"
+      - name: "<<DEV_DASH>> zone 8 exists"
+        unique_id: <<DEV_USC>>_zone_8_exists
+        default_entity_id: binary_sensor.<<DEV_USC>>_zone_8_exists
+        state: "{{ 7 in (state_attr('sensor.<<DEV_USC>>_schedule_rest', 'zones') | map(attribute='id') | map('int') | list) }}"
+  - sensor:
+      - name: <<DEV_DASH>> watering log
+        unique_id: <<DEV_USC>>_watering_log_v2
+        default_entity_id: sensor.<<DEV_USC>>_watering_log
+        icon: mdi:water-percent
+        state: active
+      - name: <<DEV_DASH>> watering completions
+        unique_id: <<DEV_USC>>_watering_completions_v2
+        default_entity_id: sensor.<<DEV_USC>>_watering_completions
+        icon: mdi:sprinkler-variant
+        state: active
+      - name: <<DEV_DASH>> calibration log
+        unique_id: <<DEV_USC>>_calibration_log_v2
+        default_entity_id: sensor.<<DEV_USC>>_calibration_log
+        icon: mdi:tune
+        state: active
+  - trigger:
+      - trigger: event
+        event_type: esphome.<<DEV_DASH>>_watering_complete
+    sensor:
+      - name: <<DEV_DASH>> last watering zone
+        unique_id: <<DEV_USC>>_last_watering_zone_v2
+        default_entity_id: sensor.<<DEV_USC>>_last_watering_zone
+        state: "{{ trigger.event.data.zone_name }}"
+        icon: mdi:sprinkler-variant
+
+      - name: <<DEV_DASH>> last watering volume
+        unique_id: <<DEV_USC>>_last_watering_volume_v2
+        default_entity_id: sensor.<<DEV_USC>>_last_watering_volume
+        unit_of_measurement: "L"
+        # No device_class: water -- HA requires total / total_increasing
+        # for that device class, but this sensor is a per-event point-in-
+        # time value, not a cumulative meter. The cumulative-volume
+        # sensors below DO declare device_class: water + total_increasing.
+        state_class: measurement
+        state: "{{ trigger.event.data.volume_l | float(0) }}"
+
+      - name: <<DEV_DASH>> last watering duration
+        unique_id: <<DEV_USC>>_last_watering_duration_v2
+        default_entity_id: sensor.<<DEV_USC>>_last_watering_duration
+        unit_of_measurement: "min"
+        state_class: measurement
+        icon: mdi:timer-outline
+        state: >-
+          {{ ((trigger.event.data.duration_s | float(0)) / 60.0) | round(1) }}
+
+      - name: <<DEV_DASH>> last watering area
+        unique_id: <<DEV_USC>>_last_watering_area_v2
+        default_entity_id: sensor.<<DEV_USC>>_last_watering_area
+        unit_of_measurement: "m²"
+        state_class: measurement
+        icon: mdi:texture-box
+        state: "{{ trigger.event.data.area_m2 | float(0) }}"
+
+      - name: <<DEV_DASH>> last watering score
+        unique_id: <<DEV_USC>>_last_watering_score_v2
+        default_entity_id: sensor.<<DEV_USC>>_last_watering_score
+        unit_of_measurement: "/5"
+        state_class: measurement
+        icon: mdi:star-outline
+        state: "{{ trigger.event.data.score | float(0) }}"
+
+      - name: <<DEV_DASH>> last watering status
+        unique_id: <<DEV_USC>>_last_watering_status_v2
+        default_entity_id: sensor.<<DEV_USC>>_last_watering_status
+        state: "{{ trigger.event.data.status }}"
+        icon: >-
+          {% set s = trigger.event.data.status %}
+          {% if s == 'completed' %}mdi:check-circle-outline
+          {% elif s == 'cancelled' %}mdi:cancel
+          {% else %}mdi:alert-circle-outline{% endif %}
+
+  # Cumulative water usage (all zones combined). state_class:
+  # total_increasing lets HA's long-term statistics engine bucket
+  # this into hourly samples that survive the recorder purge window
+  # (10 days for state history → 10 years for stats). The dashboard
+  # uses Statistics Graph card's stat_types: change to render this
+  # as "water delivered per day/hour" bars.
+  - trigger:
+      - trigger: event
+        event_type: esphome.<<DEV_DASH>>_watering_complete
+    sensor:
+      - name: <<DEV_DASH>> cumulative volume
+        unique_id: <<DEV_USC>>_cumulative_volume_v2
+        default_entity_id: sensor.<<DEV_USC>>_cumulative_volume
+        unit_of_measurement: "L"
+        device_class: water
+        state_class: total_increasing
+        icon: mdi:water-pump
+        state: >-
+          {{ ((states('sensor.<<DEV_USC>>_cumulative_volume') | float(0)) +
+              (trigger.event.data.volume_l | float(0))) | round(2) }}
+
+  # Per-zone cumulative volume — filtered version of the above. Each
+  # template group accepts only events with its own zone number, so a
+  # given watering only updates ONE of the per-zone sensors. Stats
+  # engine then lets us render a multi-zone bar chart (Statistics
+  # Graph, stat_types: change, period: day).
+  #
+  # The trigger filters on `zone` (1-based int from the event). Up to
+  # 8 zones — extend if you have more. Zones you don't actually have
+  # configured stay at 0 forever, harmless.
+  - trigger:
+      - trigger: event
+        event_type: esphome.<<DEV_DASH>>_watering_complete
+        event_data: {zone: "1"}
+    sensor:
+      - name: <<DEV_DASH>> zone 1 cumulative volume
+        unique_id: <<DEV_USC>>_zone_1_cumulative_volume_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_1_cumulative_volume
+        unit_of_measurement: "L"
+        device_class: water
+        state_class: total_increasing
+        icon: mdi:sprinkler-variant
+        state: >-
+          {{ ((states('sensor.<<DEV_USC>>_zone_1_cumulative_volume') | float(0)) +
+              (trigger.event.data.volume_l | float(0))) | round(2) }}
+      # Cumulative depth applied (cm). The device already computes
+      # per-event average depth and emits it as actual_avg_depth_mm
+      # in the watering_complete event (= volume_l / zone_area_m2);
+      # we just divide by 10 to get cm and accumulate. Stats:
+      # total_increasing so stat_types: change gives "depth applied
+      # per period" for the Trends chart.
+      #
+      # (Older revisions of this template did the volume/area math
+      # in Jinja from the raw zone_area_m2 field, but that returned 0
+      # consistently -- using the device's prepared field is both
+      # simpler and works.)
+      - name: <<DEV_DASH>> zone 1 cumulative depth
+        unique_id: <<DEV_USC>>_zone_1_cumulative_depth_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_1_cumulative_depth
+        unit_of_measurement: "cm"
+        # NOT device_class: precipitation -- HA auto-converts cm <-> in
+        # based on the user's measurement-system setting, which forced
+        # the chart axis into inches on an imperial install. Bare unit
+        # string is shown as-is. state_class alone is enough for stats.
+        state_class: total_increasing
+        icon: mdi:waves-arrow-up
+        state: >-
+          {% set d_mm = trigger.event.data.actual_avg_depth_mm | float(0) %}
+          {{ ((states('sensor.<<DEV_USC>>_zone_1_cumulative_depth') | float(0)) +
+              (d_mm / 10)) | round(3) }}
+  - trigger:
+      - trigger: event
+        event_type: esphome.<<DEV_DASH>>_watering_complete
+        event_data: {zone: "2"}
+    sensor:
+      - name: <<DEV_DASH>> zone 2 cumulative volume
+        unique_id: <<DEV_USC>>_zone_2_cumulative_volume_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_2_cumulative_volume
+        unit_of_measurement: "L"
+        device_class: water
+        state_class: total_increasing
+        icon: mdi:sprinkler-variant
+        state: >-
+          {{ ((states('sensor.<<DEV_USC>>_zone_2_cumulative_volume') | float(0)) +
+              (trigger.event.data.volume_l | float(0))) | round(2) }}
+      - name: <<DEV_DASH>> zone 2 cumulative depth
+        unique_id: <<DEV_USC>>_zone_2_cumulative_depth_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_2_cumulative_depth
+        unit_of_measurement: "cm"
+        # NOT device_class: precipitation -- HA auto-converts cm <-> in
+        # based on the user's measurement-system setting, which forced
+        # the chart axis into inches on an imperial install. Bare unit
+        # string is shown as-is. state_class alone is enough for stats.
+        state_class: total_increasing
+        icon: mdi:waves-arrow-up
+        state: >-
+          {% set d_mm = trigger.event.data.actual_avg_depth_mm | float(0) %}
+          {{ ((states('sensor.<<DEV_USC>>_zone_2_cumulative_depth') | float(0)) +
+              (d_mm / 10)) | round(3) }}
+  - trigger:
+      - trigger: event
+        event_type: esphome.<<DEV_DASH>>_watering_complete
+        event_data: {zone: "3"}
+    sensor:
+      - name: <<DEV_DASH>> zone 3 cumulative volume
+        unique_id: <<DEV_USC>>_zone_3_cumulative_volume_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_3_cumulative_volume
+        unit_of_measurement: "L"
+        device_class: water
+        state_class: total_increasing
+        icon: mdi:sprinkler-variant
+        state: >-
+          {{ ((states('sensor.<<DEV_USC>>_zone_3_cumulative_volume') | float(0)) +
+              (trigger.event.data.volume_l | float(0))) | round(2) }}
+      - name: <<DEV_DASH>> zone 3 cumulative depth
+        unique_id: <<DEV_USC>>_zone_3_cumulative_depth_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_3_cumulative_depth
+        unit_of_measurement: "cm"
+        # NOT device_class: precipitation -- HA auto-converts cm <-> in
+        # based on the user's measurement-system setting, which forced
+        # the chart axis into inches on an imperial install. Bare unit
+        # string is shown as-is. state_class alone is enough for stats.
+        state_class: total_increasing
+        icon: mdi:waves-arrow-up
+        state: >-
+          {% set d_mm = trigger.event.data.actual_avg_depth_mm | float(0) %}
+          {{ ((states('sensor.<<DEV_USC>>_zone_3_cumulative_depth') | float(0)) +
+              (d_mm / 10)) | round(3) }}
+  - trigger:
+      - trigger: event
+        event_type: esphome.<<DEV_DASH>>_watering_complete
+        event_data: {zone: "4"}
+    sensor:
+      - name: <<DEV_DASH>> zone 4 cumulative volume
+        unique_id: <<DEV_USC>>_zone_4_cumulative_volume_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_4_cumulative_volume
+        unit_of_measurement: "L"
+        device_class: water
+        state_class: total_increasing
+        icon: mdi:sprinkler-variant
+        state: >-
+          {{ ((states('sensor.<<DEV_USC>>_zone_4_cumulative_volume') | float(0)) +
+              (trigger.event.data.volume_l | float(0))) | round(2) }}
+      - name: <<DEV_DASH>> zone 4 cumulative depth
+        unique_id: <<DEV_USC>>_zone_4_cumulative_depth_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_4_cumulative_depth
+        unit_of_measurement: "cm"
+        # NOT device_class: precipitation -- HA auto-converts cm <-> in
+        # based on the user's measurement-system setting, which forced
+        # the chart axis into inches on an imperial install. Bare unit
+        # string is shown as-is. state_class alone is enough for stats.
+        state_class: total_increasing
+        icon: mdi:waves-arrow-up
+        state: >-
+          {% set d_mm = trigger.event.data.actual_avg_depth_mm | float(0) %}
+          {{ ((states('sensor.<<DEV_USC>>_zone_4_cumulative_depth') | float(0)) +
+              (d_mm / 10)) | round(3) }}
+  - trigger:
+      - trigger: event
+        event_type: esphome.<<DEV_DASH>>_watering_complete
+        event_data: {zone: "5"}
+    sensor:
+      - name: <<DEV_DASH>> zone 5 cumulative volume
+        unique_id: <<DEV_USC>>_zone_5_cumulative_volume_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_5_cumulative_volume
+        unit_of_measurement: "L"
+        device_class: water
+        state_class: total_increasing
+        icon: mdi:sprinkler-variant
+        state: >-
+          {{ ((states('sensor.<<DEV_USC>>_zone_5_cumulative_volume') | float(0)) +
+              (trigger.event.data.volume_l | float(0))) | round(2) }}
+      - name: <<DEV_DASH>> zone 5 cumulative depth
+        unique_id: <<DEV_USC>>_zone_5_cumulative_depth_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_5_cumulative_depth
+        unit_of_measurement: "cm"
+        # NOT device_class: precipitation -- HA auto-converts cm <-> in
+        # based on the user's measurement-system setting, which forced
+        # the chart axis into inches on an imperial install. Bare unit
+        # string is shown as-is. state_class alone is enough for stats.
+        state_class: total_increasing
+        icon: mdi:waves-arrow-up
+        state: >-
+          {% set d_mm = trigger.event.data.actual_avg_depth_mm | float(0) %}
+          {{ ((states('sensor.<<DEV_USC>>_zone_5_cumulative_depth') | float(0)) +
+              (d_mm / 10)) | round(3) }}
+  - trigger:
+      - trigger: event
+        event_type: esphome.<<DEV_DASH>>_watering_complete
+        event_data: {zone: "6"}
+    sensor:
+      - name: <<DEV_DASH>> zone 6 cumulative volume
+        unique_id: <<DEV_USC>>_zone_6_cumulative_volume_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_6_cumulative_volume
+        unit_of_measurement: "L"
+        device_class: water
+        state_class: total_increasing
+        icon: mdi:sprinkler-variant
+        state: >-
+          {{ ((states('sensor.<<DEV_USC>>_zone_6_cumulative_volume') | float(0)) +
+              (trigger.event.data.volume_l | float(0))) | round(2) }}
+      - name: <<DEV_DASH>> zone 6 cumulative depth
+        unique_id: <<DEV_USC>>_zone_6_cumulative_depth_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_6_cumulative_depth
+        unit_of_measurement: "cm"
+        # NOT device_class: precipitation -- HA auto-converts cm <-> in
+        # based on the user's measurement-system setting, which forced
+        # the chart axis into inches on an imperial install. Bare unit
+        # string is shown as-is. state_class alone is enough for stats.
+        state_class: total_increasing
+        icon: mdi:waves-arrow-up
+        state: >-
+          {% set d_mm = trigger.event.data.actual_avg_depth_mm | float(0) %}
+          {{ ((states('sensor.<<DEV_USC>>_zone_6_cumulative_depth') | float(0)) +
+              (d_mm / 10)) | round(3) }}
+  - trigger:
+      - trigger: event
+        event_type: esphome.<<DEV_DASH>>_watering_complete
+        event_data: {zone: "7"}
+    sensor:
+      - name: <<DEV_DASH>> zone 7 cumulative volume
+        unique_id: <<DEV_USC>>_zone_7_cumulative_volume_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_7_cumulative_volume
+        unit_of_measurement: "L"
+        device_class: water
+        state_class: total_increasing
+        icon: mdi:sprinkler-variant
+        state: >-
+          {{ ((states('sensor.<<DEV_USC>>_zone_7_cumulative_volume') | float(0)) +
+              (trigger.event.data.volume_l | float(0))) | round(2) }}
+      - name: <<DEV_DASH>> zone 7 cumulative depth
+        unique_id: <<DEV_USC>>_zone_7_cumulative_depth_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_7_cumulative_depth
+        unit_of_measurement: "cm"
+        # NOT device_class: precipitation -- HA auto-converts cm <-> in
+        # based on the user's measurement-system setting, which forced
+        # the chart axis into inches on an imperial install. Bare unit
+        # string is shown as-is. state_class alone is enough for stats.
+        state_class: total_increasing
+        icon: mdi:waves-arrow-up
+        state: >-
+          {% set d_mm = trigger.event.data.actual_avg_depth_mm | float(0) %}
+          {{ ((states('sensor.<<DEV_USC>>_zone_7_cumulative_depth') | float(0)) +
+              (d_mm / 10)) | round(3) }}
+  - trigger:
+      - trigger: event
+        event_type: esphome.<<DEV_DASH>>_watering_complete
+        event_data: {zone: "8"}
+    sensor:
+      - name: <<DEV_DASH>> zone 8 cumulative volume
+        unique_id: <<DEV_USC>>_zone_8_cumulative_volume_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_8_cumulative_volume
+        unit_of_measurement: "L"
+        device_class: water
+        state_class: total_increasing
+        icon: mdi:sprinkler-variant
+        state: >-
+          {{ ((states('sensor.<<DEV_USC>>_zone_8_cumulative_volume') | float(0)) +
+              (trigger.event.data.volume_l | float(0))) | round(2) }}
+      - name: <<DEV_DASH>> zone 8 cumulative depth
+        unique_id: <<DEV_USC>>_zone_8_cumulative_depth_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_8_cumulative_depth
+        unit_of_measurement: "cm"
+        # NOT device_class: precipitation -- HA auto-converts cm <-> in
+        # based on the user's measurement-system setting, which forced
+        # the chart axis into inches on an imperial install. Bare unit
+        # string is shown as-is. state_class alone is enough for stats.
+        state_class: total_increasing
+        icon: mdi:waves-arrow-up
+        state: >-
+          {% set d_mm = trigger.event.data.actual_avg_depth_mm | float(0) %}
+          {{ ((states('sensor.<<DEV_USC>>_zone_8_cumulative_depth') | float(0)) +
+              (d_mm / 10)) | round(3) }}
+
+  # Score also lives in its own trigger group so it gets a clean
+  # per-event update with measurement state_class. The score sensor
+  # already exists above for "last watering score"; this one is the
+  # SAME data but exposed with a separate unique_id so HA tracks it
+  # in long-term statistics. Statistics Graph with stat_types: mean,
+  # period: day renders a daily-average bar chart.
+  - trigger:
+      - trigger: event
+        event_type: esphome.<<DEV_DASH>>_watering_complete
+    sensor:
+      - name: <<DEV_DASH>> watering score
+        unique_id: <<DEV_USC>>_watering_score_v2
+        default_entity_id: sensor.<<DEV_USC>>_watering_score
+        unit_of_measurement: "/5"
+        state_class: measurement
+        icon: mdi:star-outline
+        state: "{{ trigger.event.data.score | float(0) }}"
+
+      # Polygon coverage (b277+): the *honest* "what fraction of the zone
+      # got water" answer. Firmware rasterizes the polygon and counts only
+      # cells INSIDE the polygon that received spray; over-spray past the
+      # edges is excluded. Bounded 0..100 by construction. Pair with
+      # spray_spread (below) to read both "how much of the zone got water"
+      # AND "how much water landed outside the zone" in one glance.
+      - name: <<DEV_DASH>> last watering polygon coverage
+        unique_id: <<DEV_USC>>_last_watering_polygon_coverage_v2
+        default_entity_id: sensor.<<DEV_USC>>_last_watering_polygon_coverage
+        unit_of_measurement: "%"
+        state_class: measurement
+        icon: mdi:vector-intersection
+        state: "{{ trigger.event.data.polygon_coverage_pct | float(0) }}"
+
+      # Legacy coverage ratio: area_m2 / zone_area_m2 capped at 100%. Kept
+      # for back-compat with anything that already references it, but the
+      # polygon_coverage sensor above is the better signal — it doesn't
+      # over-credit over-spray. Will be retired once dashboards migrate.
+      - name: <<DEV_DASH>> last watering coverage ratio
+        unique_id: <<DEV_USC>>_last_watering_coverage_ratio_v2
+        default_entity_id: sensor.<<DEV_USC>>_last_watering_coverage_ratio
+        unit_of_measurement: "%"
+        state_class: measurement
+        icon: mdi:vector-square
+        state: >-
+          {% set a = trigger.event.data.area_m2 | float(0) %}
+          {% set z = trigger.event.data.zone_area_m2 | float(0) %}
+          {{ [a / z * 100, 100] | min | round(1) if z > 0 else 0 }}
+
+      # Spray spread: same numerator/denominator but UNCAPPED. Tells
+      # you how far the spray pattern extends beyond the polygon. 100%
+      # = spray exactly matches polygon; 200% = sprayed area is twice
+      # the polygon (heavy over-spray); useful for diagnosing nozzle
+      # alignment and mode selection (smooth tends to land close to
+      # 100%, pulse/gentle commonly exceeds 150%).
+      - name: <<DEV_DASH>> last watering spray spread
+        unique_id: <<DEV_USC>>_last_watering_spray_spread_v2
+        default_entity_id: sensor.<<DEV_USC>>_last_watering_spray_spread
+        unit_of_measurement: "%"
+        state_class: measurement
+        icon: mdi:scatter-plot
+        state: >-
+          {% set a = trigger.event.data.area_m2 | float(0) %}
+          {% set z = trigger.event.data.zone_area_m2 | float(0) %}
+          {{ (a / z * 100) | round(1) if z > 0 else 0 }}
+
+      # ── Supply-pressure diagnostics (b281/b282) ──────────────────────
+      # Back-computed pre-valve (pump-side) supply pressure during the
+      # last run. Firmware uses the global pressure-cal table's f(valve_deg)
+      # to invert each ring's measured nozzle PSI into the supply PSI that
+      # would have produced it. On a well-pump system these numbers reveal
+      # the cycle dynamics: a wide max-min spread means the pump cut in/out
+      # multiple times during the run; a low avg means watering draw
+      # exceeded pump output and the cell was running thirsty.
+      #
+      # All three are 0.0 if the zone perimeter has insufficient cal data
+      # to back-compute (e.g., very small zones, single-throw zones).
+      - name: <<DEV_DASH>> last watering supply psi min
+        unique_id: <<DEV_USC>>_last_watering_supply_psi_min_v2
+        default_entity_id: sensor.<<DEV_USC>>_last_watering_supply_psi_min
+        unit_of_measurement: "psi"
+        state_class: measurement
+        icon: mdi:arrow-down-bold-outline
+        state: "{{ trigger.event.data.supply_psi_min | float(0) }}"
+
+      - name: <<DEV_DASH>> last watering supply psi max
+        unique_id: <<DEV_USC>>_last_watering_supply_psi_max_v2
+        default_entity_id: sensor.<<DEV_USC>>_last_watering_supply_psi_max
+        unit_of_measurement: "psi"
+        state_class: measurement
+        icon: mdi:arrow-up-bold-outline
+        state: "{{ trigger.event.data.supply_psi_max | float(0) }}"
+
+      - name: <<DEV_DASH>> last watering supply psi avg
+        unique_id: <<DEV_USC>>_last_watering_supply_psi_avg_v2
+        default_entity_id: sensor.<<DEV_USC>>_last_watering_supply_psi_avg
+        unit_of_measurement: "psi"
+        state_class: measurement
+        icon: mdi:gauge
+        state: "{{ trigger.event.data.supply_psi_avg | float(0) }}"
+
+      # Count of rings where the throw fell more than 10% short of target
+      # AND the back-computed supply pressure during that ring was more
+      # than 10% below the cal-time supply reference. These are the rings
+      # that under-delivered specifically because the pump couldn't keep
+      # up -- candidates for a future automatic cleanup pass (b288+) that
+      # re-waters them once supply has recovered. A consistently non-zero
+      # value across many runs means the zone is genuinely supply-limited
+      # and the current cal/zone configuration is asking for more throw
+      # than the pump can sustain.
+      - name: <<DEV_DASH>> last watering rings supply limited
+        unique_id: <<DEV_USC>>_last_watering_rings_supply_limited_v2
+        default_entity_id: sensor.<<DEV_USC>>_last_watering_rings_supply_limited
+        unit_of_measurement: "rings"
+        state_class: measurement
+        icon: mdi:water-alert-outline
+        state: "{{ trigger.event.data.rings_supply_limited | int(0) }}"
+
+  # ── Per-zone last-run details ──────────────────────────────────────
+  # For each zone 1..8 we capture the most recent watering's details
+  # in a tight group of sensors. The Trends-tab "Last by zone" panel
+  # uses conditional cards keyed off last_finished != unknown to
+  # auto-hide zones you don't have configured.
+  #
+  # state_class: measurement on the numerics lets HA build long-term
+  # statistics, so the per-zone score chart below can render daily-
+  # mean bars without any extra plumbing.
+  - trigger:
+      - trigger: event
+        event_type: esphome.<<DEV_DASH>>_watering_complete
+        event_data: {zone: "1"}
+    sensor:
+      - name: <<DEV_DASH>> zone 1 last finished
+        unique_id: <<DEV_USC>>_zone_1_last_finished_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_1_last_finished
+        device_class: timestamp
+        icon: mdi:clock-check-outline
+        state: "{{ now().isoformat() }}"
+      - name: <<DEV_DASH>> zone 1 last volume
+        unique_id: <<DEV_USC>>_zone_1_last_volume_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_1_last_volume
+        unit_of_measurement: "L"
+        state_class: measurement
+        icon: mdi:cup-water
+        state: "{{ trigger.event.data.volume_l | float(0) }}"
+      - name: <<DEV_DASH>> zone 1 last duration
+        unique_id: <<DEV_USC>>_zone_1_last_duration_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_1_last_duration
+        unit_of_measurement: "min"
+        state_class: measurement
+        icon: mdi:timer-outline
+        state: >-
+          {{ ((trigger.event.data.duration_s | float(0)) / 60.0) | round(1) }}
+      - name: <<DEV_DASH>> zone 1 last score
+        unique_id: <<DEV_USC>>_zone_1_last_score_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_1_last_score
+        unit_of_measurement: "/5"
+        state_class: measurement
+        icon: mdi:star-outline
+        state: "{{ trigger.event.data.score | float(0) }}"
+      - name: <<DEV_DASH>> zone 1 last coverage ratio
+        unique_id: <<DEV_USC>>_zone_1_last_coverage_ratio_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_1_last_coverage_ratio
+        unit_of_measurement: "%"
+        state_class: measurement
+        icon: mdi:vector-square
+        state: >-
+          {% set a = trigger.event.data.area_m2 | float(0) %}
+          {% set z = trigger.event.data.zone_area_m2 | float(0) %}
+          {{ [a / z * 100, 100] | min | round(1) if z > 0 else 0 }}
+      - name: <<DEV_DASH>> zone 1 last polygon coverage
+        unique_id: <<DEV_USC>>_zone_1_last_polygon_coverage_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_1_last_polygon_coverage
+        unit_of_measurement: "%"
+        state_class: measurement
+        icon: mdi:vector-intersection
+        state: "{{ trigger.event.data.polygon_coverage_pct | float(0) }}"
+      - name: <<DEV_DASH>> zone 1 last status
+        unique_id: <<DEV_USC>>_zone_1_last_status_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_1_last_status
+        icon: mdi:flag-checkered
+        state: "{{ trigger.event.data.status }}"
+
+  - trigger:
+      - trigger: event
+        event_type: esphome.<<DEV_DASH>>_watering_complete
+        event_data: {zone: "2"}
+    sensor:
+      - name: <<DEV_DASH>> zone 2 last finished
+        unique_id: <<DEV_USC>>_zone_2_last_finished_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_2_last_finished
+        device_class: timestamp
+        icon: mdi:clock-check-outline
+        state: "{{ now().isoformat() }}"
+      - name: <<DEV_DASH>> zone 2 last volume
+        unique_id: <<DEV_USC>>_zone_2_last_volume_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_2_last_volume
+        unit_of_measurement: "L"
+        state_class: measurement
+        icon: mdi:cup-water
+        state: "{{ trigger.event.data.volume_l | float(0) }}"
+      - name: <<DEV_DASH>> zone 2 last duration
+        unique_id: <<DEV_USC>>_zone_2_last_duration_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_2_last_duration
+        unit_of_measurement: "min"
+        state_class: measurement
+        icon: mdi:timer-outline
+        state: >-
+          {{ ((trigger.event.data.duration_s | float(0)) / 60.0) | round(1) }}
+      - name: <<DEV_DASH>> zone 2 last score
+        unique_id: <<DEV_USC>>_zone_2_last_score_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_2_last_score
+        unit_of_measurement: "/5"
+        state_class: measurement
+        icon: mdi:star-outline
+        state: "{{ trigger.event.data.score | float(0) }}"
+      - name: <<DEV_DASH>> zone 2 last coverage ratio
+        unique_id: <<DEV_USC>>_zone_2_last_coverage_ratio_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_2_last_coverage_ratio
+        unit_of_measurement: "%"
+        state_class: measurement
+        icon: mdi:vector-square
+        state: >-
+          {% set a = trigger.event.data.area_m2 | float(0) %}
+          {% set z = trigger.event.data.zone_area_m2 | float(0) %}
+          {{ [a / z * 100, 100] | min | round(1) if z > 0 else 0 }}
+      - name: <<DEV_DASH>> zone 2 last polygon coverage
+        unique_id: <<DEV_USC>>_zone_2_last_polygon_coverage_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_2_last_polygon_coverage
+        unit_of_measurement: "%"
+        state_class: measurement
+        icon: mdi:vector-intersection
+        state: "{{ trigger.event.data.polygon_coverage_pct | float(0) }}"
+      - name: <<DEV_DASH>> zone 2 last status
+        unique_id: <<DEV_USC>>_zone_2_last_status_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_2_last_status
+        icon: mdi:flag-checkered
+        state: "{{ trigger.event.data.status }}"
+
+  - trigger:
+      - trigger: event
+        event_type: esphome.<<DEV_DASH>>_watering_complete
+        event_data: {zone: "3"}
+    sensor:
+      - name: <<DEV_DASH>> zone 3 last finished
+        unique_id: <<DEV_USC>>_zone_3_last_finished_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_3_last_finished
+        device_class: timestamp
+        icon: mdi:clock-check-outline
+        state: "{{ now().isoformat() }}"
+      - name: <<DEV_DASH>> zone 3 last volume
+        unique_id: <<DEV_USC>>_zone_3_last_volume_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_3_last_volume
+        unit_of_measurement: "L"
+        state_class: measurement
+        icon: mdi:cup-water
+        state: "{{ trigger.event.data.volume_l | float(0) }}"
+      - name: <<DEV_DASH>> zone 3 last duration
+        unique_id: <<DEV_USC>>_zone_3_last_duration_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_3_last_duration
+        unit_of_measurement: "min"
+        state_class: measurement
+        icon: mdi:timer-outline
+        state: >-
+          {{ ((trigger.event.data.duration_s | float(0)) / 60.0) | round(1) }}
+      - name: <<DEV_DASH>> zone 3 last score
+        unique_id: <<DEV_USC>>_zone_3_last_score_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_3_last_score
+        unit_of_measurement: "/5"
+        state_class: measurement
+        icon: mdi:star-outline
+        state: "{{ trigger.event.data.score | float(0) }}"
+      - name: <<DEV_DASH>> zone 3 last coverage ratio
+        unique_id: <<DEV_USC>>_zone_3_last_coverage_ratio_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_3_last_coverage_ratio
+        unit_of_measurement: "%"
+        state_class: measurement
+        icon: mdi:vector-square
+        state: >-
+          {% set a = trigger.event.data.area_m2 | float(0) %}
+          {% set z = trigger.event.data.zone_area_m2 | float(0) %}
+          {{ [a / z * 100, 100] | min | round(1) if z > 0 else 0 }}
+      - name: <<DEV_DASH>> zone 3 last polygon coverage
+        unique_id: <<DEV_USC>>_zone_3_last_polygon_coverage_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_3_last_polygon_coverage
+        unit_of_measurement: "%"
+        state_class: measurement
+        icon: mdi:vector-intersection
+        state: "{{ trigger.event.data.polygon_coverage_pct | float(0) }}"
+      - name: <<DEV_DASH>> zone 3 last status
+        unique_id: <<DEV_USC>>_zone_3_last_status_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_3_last_status
+        icon: mdi:flag-checkered
+        state: "{{ trigger.event.data.status }}"
+
+  - trigger:
+      - trigger: event
+        event_type: esphome.<<DEV_DASH>>_watering_complete
+        event_data: {zone: "4"}
+    sensor:
+      - name: <<DEV_DASH>> zone 4 last finished
+        unique_id: <<DEV_USC>>_zone_4_last_finished_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_4_last_finished
+        device_class: timestamp
+        icon: mdi:clock-check-outline
+        state: "{{ now().isoformat() }}"
+      - name: <<DEV_DASH>> zone 4 last volume
+        unique_id: <<DEV_USC>>_zone_4_last_volume_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_4_last_volume
+        unit_of_measurement: "L"
+        state_class: measurement
+        icon: mdi:cup-water
+        state: "{{ trigger.event.data.volume_l | float(0) }}"
+      - name: <<DEV_DASH>> zone 4 last duration
+        unique_id: <<DEV_USC>>_zone_4_last_duration_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_4_last_duration
+        unit_of_measurement: "min"
+        state_class: measurement
+        icon: mdi:timer-outline
+        state: >-
+          {{ ((trigger.event.data.duration_s | float(0)) / 60.0) | round(1) }}
+      - name: <<DEV_DASH>> zone 4 last score
+        unique_id: <<DEV_USC>>_zone_4_last_score_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_4_last_score
+        unit_of_measurement: "/5"
+        state_class: measurement
+        icon: mdi:star-outline
+        state: "{{ trigger.event.data.score | float(0) }}"
+      - name: <<DEV_DASH>> zone 4 last coverage ratio
+        unique_id: <<DEV_USC>>_zone_4_last_coverage_ratio_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_4_last_coverage_ratio
+        unit_of_measurement: "%"
+        state_class: measurement
+        icon: mdi:vector-square
+        state: >-
+          {% set a = trigger.event.data.area_m2 | float(0) %}
+          {% set z = trigger.event.data.zone_area_m2 | float(0) %}
+          {{ [a / z * 100, 100] | min | round(1) if z > 0 else 0 }}
+      - name: <<DEV_DASH>> zone 4 last polygon coverage
+        unique_id: <<DEV_USC>>_zone_4_last_polygon_coverage_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_4_last_polygon_coverage
+        unit_of_measurement: "%"
+        state_class: measurement
+        icon: mdi:vector-intersection
+        state: "{{ trigger.event.data.polygon_coverage_pct | float(0) }}"
+      - name: <<DEV_DASH>> zone 4 last status
+        unique_id: <<DEV_USC>>_zone_4_last_status_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_4_last_status
+        icon: mdi:flag-checkered
+        state: "{{ trigger.event.data.status }}"
+
+  - trigger:
+      - trigger: event
+        event_type: esphome.<<DEV_DASH>>_watering_complete
+        event_data: {zone: "5"}
+    sensor:
+      - name: <<DEV_DASH>> zone 5 last finished
+        unique_id: <<DEV_USC>>_zone_5_last_finished_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_5_last_finished
+        device_class: timestamp
+        icon: mdi:clock-check-outline
+        state: "{{ now().isoformat() }}"
+      - name: <<DEV_DASH>> zone 5 last volume
+        unique_id: <<DEV_USC>>_zone_5_last_volume_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_5_last_volume
+        unit_of_measurement: "L"
+        state_class: measurement
+        icon: mdi:cup-water
+        state: "{{ trigger.event.data.volume_l | float(0) }}"
+      - name: <<DEV_DASH>> zone 5 last duration
+        unique_id: <<DEV_USC>>_zone_5_last_duration_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_5_last_duration
+        unit_of_measurement: "min"
+        state_class: measurement
+        icon: mdi:timer-outline
+        state: >-
+          {{ ((trigger.event.data.duration_s | float(0)) / 60.0) | round(1) }}
+      - name: <<DEV_DASH>> zone 5 last score
+        unique_id: <<DEV_USC>>_zone_5_last_score_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_5_last_score
+        unit_of_measurement: "/5"
+        state_class: measurement
+        icon: mdi:star-outline
+        state: "{{ trigger.event.data.score | float(0) }}"
+      - name: <<DEV_DASH>> zone 5 last coverage ratio
+        unique_id: <<DEV_USC>>_zone_5_last_coverage_ratio_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_5_last_coverage_ratio
+        unit_of_measurement: "%"
+        state_class: measurement
+        icon: mdi:vector-square
+        state: >-
+          {% set a = trigger.event.data.area_m2 | float(0) %}
+          {% set z = trigger.event.data.zone_area_m2 | float(0) %}
+          {{ [a / z * 100, 100] | min | round(1) if z > 0 else 0 }}
+      - name: <<DEV_DASH>> zone 5 last polygon coverage
+        unique_id: <<DEV_USC>>_zone_5_last_polygon_coverage_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_5_last_polygon_coverage
+        unit_of_measurement: "%"
+        state_class: measurement
+        icon: mdi:vector-intersection
+        state: "{{ trigger.event.data.polygon_coverage_pct | float(0) }}"
+      - name: <<DEV_DASH>> zone 5 last status
+        unique_id: <<DEV_USC>>_zone_5_last_status_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_5_last_status
+        icon: mdi:flag-checkered
+        state: "{{ trigger.event.data.status }}"
+
+  - trigger:
+      - trigger: event
+        event_type: esphome.<<DEV_DASH>>_watering_complete
+        event_data: {zone: "6"}
+    sensor:
+      - name: <<DEV_DASH>> zone 6 last finished
+        unique_id: <<DEV_USC>>_zone_6_last_finished_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_6_last_finished
+        device_class: timestamp
+        icon: mdi:clock-check-outline
+        state: "{{ now().isoformat() }}"
+      - name: <<DEV_DASH>> zone 6 last volume
+        unique_id: <<DEV_USC>>_zone_6_last_volume_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_6_last_volume
+        unit_of_measurement: "L"
+        state_class: measurement
+        icon: mdi:cup-water
+        state: "{{ trigger.event.data.volume_l | float(0) }}"
+      - name: <<DEV_DASH>> zone 6 last duration
+        unique_id: <<DEV_USC>>_zone_6_last_duration_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_6_last_duration
+        unit_of_measurement: "min"
+        state_class: measurement
+        icon: mdi:timer-outline
+        state: >-
+          {{ ((trigger.event.data.duration_s | float(0)) / 60.0) | round(1) }}
+      - name: <<DEV_DASH>> zone 6 last score
+        unique_id: <<DEV_USC>>_zone_6_last_score_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_6_last_score
+        unit_of_measurement: "/5"
+        state_class: measurement
+        icon: mdi:star-outline
+        state: "{{ trigger.event.data.score | float(0) }}"
+      - name: <<DEV_DASH>> zone 6 last coverage ratio
+        unique_id: <<DEV_USC>>_zone_6_last_coverage_ratio_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_6_last_coverage_ratio
+        unit_of_measurement: "%"
+        state_class: measurement
+        icon: mdi:vector-square
+        state: >-
+          {% set a = trigger.event.data.area_m2 | float(0) %}
+          {% set z = trigger.event.data.zone_area_m2 | float(0) %}
+          {{ [a / z * 100, 100] | min | round(1) if z > 0 else 0 }}
+      - name: <<DEV_DASH>> zone 6 last polygon coverage
+        unique_id: <<DEV_USC>>_zone_6_last_polygon_coverage_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_6_last_polygon_coverage
+        unit_of_measurement: "%"
+        state_class: measurement
+        icon: mdi:vector-intersection
+        state: "{{ trigger.event.data.polygon_coverage_pct | float(0) }}"
+      - name: <<DEV_DASH>> zone 6 last status
+        unique_id: <<DEV_USC>>_zone_6_last_status_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_6_last_status
+        icon: mdi:flag-checkered
+        state: "{{ trigger.event.data.status }}"
+
+  - trigger:
+      - trigger: event
+        event_type: esphome.<<DEV_DASH>>_watering_complete
+        event_data: {zone: "7"}
+    sensor:
+      - name: <<DEV_DASH>> zone 7 last finished
+        unique_id: <<DEV_USC>>_zone_7_last_finished_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_7_last_finished
+        device_class: timestamp
+        icon: mdi:clock-check-outline
+        state: "{{ now().isoformat() }}"
+      - name: <<DEV_DASH>> zone 7 last volume
+        unique_id: <<DEV_USC>>_zone_7_last_volume_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_7_last_volume
+        unit_of_measurement: "L"
+        state_class: measurement
+        icon: mdi:cup-water
+        state: "{{ trigger.event.data.volume_l | float(0) }}"
+      - name: <<DEV_DASH>> zone 7 last duration
+        unique_id: <<DEV_USC>>_zone_7_last_duration_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_7_last_duration
+        unit_of_measurement: "min"
+        state_class: measurement
+        icon: mdi:timer-outline
+        state: >-
+          {{ ((trigger.event.data.duration_s | float(0)) / 60.0) | round(1) }}
+      - name: <<DEV_DASH>> zone 7 last score
+        unique_id: <<DEV_USC>>_zone_7_last_score_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_7_last_score
+        unit_of_measurement: "/5"
+        state_class: measurement
+        icon: mdi:star-outline
+        state: "{{ trigger.event.data.score | float(0) }}"
+      - name: <<DEV_DASH>> zone 7 last coverage ratio
+        unique_id: <<DEV_USC>>_zone_7_last_coverage_ratio_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_7_last_coverage_ratio
+        unit_of_measurement: "%"
+        state_class: measurement
+        icon: mdi:vector-square
+        state: >-
+          {% set a = trigger.event.data.area_m2 | float(0) %}
+          {% set z = trigger.event.data.zone_area_m2 | float(0) %}
+          {{ [a / z * 100, 100] | min | round(1) if z > 0 else 0 }}
+      - name: <<DEV_DASH>> zone 7 last polygon coverage
+        unique_id: <<DEV_USC>>_zone_7_last_polygon_coverage_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_7_last_polygon_coverage
+        unit_of_measurement: "%"
+        state_class: measurement
+        icon: mdi:vector-intersection
+        state: "{{ trigger.event.data.polygon_coverage_pct | float(0) }}"
+      - name: <<DEV_DASH>> zone 7 last status
+        unique_id: <<DEV_USC>>_zone_7_last_status_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_7_last_status
+        icon: mdi:flag-checkered
+        state: "{{ trigger.event.data.status }}"
+
+  - trigger:
+      - trigger: event
+        event_type: esphome.<<DEV_DASH>>_watering_complete
+        event_data: {zone: "8"}
+    sensor:
+      - name: <<DEV_DASH>> zone 8 last finished
+        unique_id: <<DEV_USC>>_zone_8_last_finished_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_8_last_finished
+        device_class: timestamp
+        icon: mdi:clock-check-outline
+        state: "{{ now().isoformat() }}"
+      - name: <<DEV_DASH>> zone 8 last volume
+        unique_id: <<DEV_USC>>_zone_8_last_volume_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_8_last_volume
+        unit_of_measurement: "L"
+        state_class: measurement
+        icon: mdi:cup-water
+        state: "{{ trigger.event.data.volume_l | float(0) }}"
+      - name: <<DEV_DASH>> zone 8 last duration
+        unique_id: <<DEV_USC>>_zone_8_last_duration_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_8_last_duration
+        unit_of_measurement: "min"
+        state_class: measurement
+        icon: mdi:timer-outline
+        state: >-
+          {{ ((trigger.event.data.duration_s | float(0)) / 60.0) | round(1) }}
+      - name: <<DEV_DASH>> zone 8 last score
+        unique_id: <<DEV_USC>>_zone_8_last_score_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_8_last_score
+        unit_of_measurement: "/5"
+        state_class: measurement
+        icon: mdi:star-outline
+        state: "{{ trigger.event.data.score | float(0) }}"
+      - name: <<DEV_DASH>> zone 8 last coverage ratio
+        unique_id: <<DEV_USC>>_zone_8_last_coverage_ratio_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_8_last_coverage_ratio
+        unit_of_measurement: "%"
+        state_class: measurement
+        icon: mdi:vector-square
+        state: >-
+          {% set a = trigger.event.data.area_m2 | float(0) %}
+          {% set z = trigger.event.data.zone_area_m2 | float(0) %}
+          {{ [a / z * 100, 100] | min | round(1) if z > 0 else 0 }}
+      - name: <<DEV_DASH>> zone 8 last polygon coverage
+        unique_id: <<DEV_USC>>_zone_8_last_polygon_coverage_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_8_last_polygon_coverage
+        unit_of_measurement: "%"
+        state_class: measurement
+        icon: mdi:vector-intersection
+        state: "{{ trigger.event.data.polygon_coverage_pct | float(0) }}"
+      - name: <<DEV_DASH>> zone 8 last status
+        unique_id: <<DEV_USC>>_zone_8_last_status_v2
+        default_entity_id: sensor.<<DEV_USC>>_zone_8_last_status
+        icon: mdi:flag-checkered
+        state: "{{ trigger.event.data.status }}"
+
+  # ── HA-side schedule push: per-device sensors (b355 bidirectional) ─
+  # Four sensors per device — combined with sensor.<<DEV_USC>>_desired_
+  # schedule (defined in <<DEV_USC>>_schedule.yaml, sourced from the HA
+  # slot input_texts) and the reconciler automation (defined further
+  # down) they implement bidirectional sync using IDs + per-entry
+  # last_modified + a device-wide schedule_version counter. See
+  # docs/schedule_sync_design.md for the conflict rules and migration.
+  #
+  # ① schedule_full              -- last schedule_changed event payload:
+  #                                  count, sorted-canonical (legacy),
+  #                                  text_full (id+lm+...+source per
+  #                                  entry), by_id map for O(1) lookups,
+  #                                  next_run_epoch, delay_until,
+  #                                  schedule_version.
+  #
+  # ② desired_rendered           -- per-device slice of HA slots, with
+  #                                  the prepared sync_schedule wire
+  #                                  payload (`sync_payload`) and its
+  #                                  line count (`sync_count`).
+  #
+  # ③ schedule_pending_outbound  -- "HA has changes to push to the
+  #                                  device" badge:
+  #                                    disabled       no HA slots for this device
+  #                                    synced         sync_count == 0
+  #                                    blocked: X     overlap conflict
+  #                                    pending - device asleep / pushing
+  #                                    push failed: X
+  #
+  # ④ schedule_pending_inbound   -- "device has a newer schedule_version
+  #                                  than HA last observed":
+  #                                    synced         dev_v <= last_seen
+  #                                    pending - pulling / HA offline
+  - trigger:
+      - trigger: event
+        event_type: esphome.<<DEV_DASH>>_schedule_changed
+    sensor:
+      - name: <<DEV_DASH>> schedule full
+        unique_id: <<DEV_USC>>_schedule_full
+        default_entity_id: sensor.<<DEV_USC>>_schedule_full
+        icon: mdi:calendar-text
+        unit_of_measurement: entries
+        state: "{{ trigger.event.data.count | int(0) }}"
+        attributes:
+          canonical: >-
+            {%- set raw = trigger.event.data.text | default('') -%}
+            {%- set entries = raw.split(';')
+                              | map('trim')
+                              | reject('equalto','')
+                              | list | sort -%}
+            {{ entries | join(';') }}
+          raw_text: "{{ trigger.event.data.text | default('') }}"
+          # Structured blob per entry: id,last_modified,zone,...,source.
+          # Used by the reconciler to match HA slots to device IDs.
+          text_full: "{{ trigger.event.data.text_full | default('') }}"
+          schedule_version: "{{ trigger.event.data.schedule_version | default(0) | int(0) }}"
+          # Map id -> entry-dict for fast lookup. Built once when the
+          # event fires; downstream templates iterate this instead of
+          # re-parsing text_full on every recompute.
+          by_id: >-
+            {%- set raw = trigger.event.data.text_full | default('') -%}
+            {%- set ns = namespace(d={}) -%}
+            {%- for csv in raw.split(';') | reject('equalto','') | list -%}
+              {%- set f = csv.split(',') -%}
+              {%- if f | length >= 10 -%}
+                {%- set entry = {
+                  'id': f[0] | int(0),
+                  'last_modified': f[1] | int(0),
+                  'zone': f[2] | int(0),
+                  'mode': f[3] | int(0),
+                  'depth': f[4] | int(0),
+                  'hour': f[5] | int(0),
+                  'minute': f[6] | int(0),
+                  'days_mask': f[7] | int(0),
+                  'enabled': f[8] | int(0),
+                  'source': f[9] | int(0)
+                } -%}
+                {%- set ns.d = dict(ns.d, **{f[0]: entry}) -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {{ ns.d }}
+          next_run_epoch: "{{ trigger.event.data.next_run | default(0) | int(0) }}"
+          delay_until: "{{ trigger.event.data.delay_until | default(0) | int(0) }}"
+
+  # b355: New ID-based desired_rendered. The reconciler consumes
+  # `sync_payload` (the wire format for sync_schedule) instead of the
+  # legacy semicolon-joined CSV. Device-side entries with IDs HA doesn't
+  # know about are left alone by the device (sync_schedule preserves
+  # un-mentioned IDs) — no merge-mode toggle needed.
+  - sensor:
+      - name: <<DEV_DASH>> desired rendered
+        unique_id: <<DEV_USC>>_desired_rendered
+        default_entity_id: sensor.<<DEV_USC>>_desired_rendered
+        icon: mdi:calendar-arrow-right
+        unit_of_measurement: entries
+        state: >-
+          {%- set entries = (state_attr('sensor.irrigoto_desired_schedule',
+                                         'per_device_entries') or {}).get('<<DEV_DASH>>', []) -%}
+          {{ entries | count }}
+        attributes:
+          # Just the HA-slot portion in the legacy 7-field CSV, kept for
+          # any older dashboards that displayed it.
+          ha_canonical: >-
+            {{ (state_attr('sensor.irrigoto_desired_schedule', 'per_device')
+                or {}).get('<<DEV_DASH>>', '') }}
+          # sync_count: how many lines the sync_payload will contain
+          # (upserts + tombstones). 0 means nothing to push.
+          #
+          # b359: device-side IDs come from sensor.<<DEV_USC>>_schedule_rest's
+          # entries attribute (HTTP-polled from /api/schedule), not from
+          # the now-empty schedule_full.by_id. Same logic, different source:
+          # any device ID not represented in HA's slots gets a tombstone.
+          sync_count: >-
+            {%- set entries = (state_attr('sensor.irrigoto_desired_schedule',
+                                           'per_device_entries') or {}).get('<<DEV_DASH>>', []) -%}
+            {%- set dev_entries = state_attr('sensor.<<DEV_USC>>_schedule_rest',
+                                              'entries') | default([], true) -%}
+            {%- set ns = namespace(c=0) -%}
+            {%- for e in entries -%}
+              {%- set ns2 = namespace(found=none) -%}
+              {%- for d in dev_entries -%}
+                {%- if (d.id | int(0)) == (e.id | int(0)) -%}
+                  {%- set ns2.found = d -%}
+                {%- endif -%}
+              {%- endfor -%}
+              {%- if ns2.found is none or (e.last_modified | int(0)) > (ns2.found.last_modified | int(0)) -%}
+                {%- set ns.c = ns.c + 1 -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {%- set ha_ids = entries | map(attribute='id') | map('int') | list -%}
+            {%- for d in dev_entries -%}
+              {%- set idn = d.id | int(0) -%}
+              {%- if idn > 0 and idn not in ha_ids -%}
+                {%- set ns.c = ns.c + 1 -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {{ ns.c }}
+          # sync_payload: the ';'-separated wire format for sync_schedule.
+          # For each HA slot we emit an upsert with the slot's id+lm and
+          # tombstone=0. For each device id that HA no longer references,
+          # emit a tombstone (id,lm,0,0,0,0,0,0,0,0,1). For brand-new
+          # entries (id=0) we still emit so the device allocates.
+          # Includes ALL HA entries every time — the device's LWW logic
+          # ignores no-ops (incoming lm <= stored lm), keeping payloads
+          # simple.
+          #
+          # b359: tombstones derived from schedule_rest.entries (HTTP poll)
+          # instead of schedule_full.by_id (empty since b357 dropped
+          # text_full from the schedule_changed event).
+          sync_payload: >-
+            {%- set entries = (state_attr('sensor.irrigoto_desired_schedule',
+                                           'per_device_entries') or {}).get('<<DEV_DASH>>', []) -%}
+            {%- set dev_entries = state_attr('sensor.<<DEV_USC>>_schedule_rest',
+                                              'entries') | default([], true) -%}
+            {%- set ns = namespace(lines=[]) -%}
+            {%- for e in entries -%}
+              {%- set line = (e.id | int(0)) ~ ',' ~ (e.last_modified | int(0)) ~ ','
+                              ~ e.zone ~ ',' ~ e.mode ~ ',' ~ e.depth ~ ','
+                              ~ e.hour ~ ',' ~ e.minute ~ ',' ~ e.days_mask ~ ','
+                              ~ e.enabled ~ ',2,0' -%}
+              {%- set ns.lines = ns.lines + [line] -%}
+            {%- endfor -%}
+            {%- set ha_ids = entries | map(attribute='id') | map('int') | list -%}
+            {%- for d in dev_entries -%}
+              {%- set idn = d.id | int(0) -%}
+              {%- if idn > 0 and idn not in ha_ids -%}
+                {%- set line = idn ~ ',' ~ (now().timestamp() | int(0))
+                                ~ ',0,0,0,0,0,0,0,0,1' -%}
+                {%- set ns.lines = ns.lines + [line] -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {{ ns.lines | join(';') }}
+
+      # b355: pending-OUTBOUND -- "HA has changes to push to the device."
+      # Derived from sync_count: any HA-slot edit (last_modified newer
+      # than device's) or any HA-side delete (id removed from slots)
+      # surfaces here. Replaces the merged-canonical comparison that the
+      # old schedule_pending sensor did.
+      - name: <<DEV_DASH>> schedule pending outbound
+        unique_id: <<DEV_USC>>_schedule_pending_outbound
+        default_entity_id: sensor.<<DEV_USC>>_schedule_pending_outbound
+        icon: >-
+          {%- set s = states('sensor.<<DEV_USC>>_schedule_pending_outbound') -%}
+          {%- if s == 'synced' -%} mdi:check-circle-outline
+          {%- elif s == 'disabled' -%} mdi:circle-off-outline
+          {%- elif s.startswith('pending') -%} mdi:upload-outline
+          {%- else -%} mdi:alert-circle-outline
+          {%- endif -%}
+        state: >-
+          {%- set entries = (state_attr('sensor.irrigoto_desired_schedule',
+                                         'per_device_entries') or {}).get('<<DEV_DASH>>', []) -%}
+          {%- set sync_count = state_attr('sensor.<<DEV_USC>>_desired_rendered',
+                                           'sync_count') | default(0) | int(0) -%}
+          {%- if entries | count == 0 -%}
+            disabled
+          {%- elif sync_count == 0 -%}
+            synced
+          {%- else -%}
+            {%- set online = is_state('binary_sensor.<<DEV_USC>>_irrigoto_online', 'on') -%}
+            {%- set status = states('sensor.<<DEV_USC>>_irrigoto_last_schedule_update')
+                             | default('', true) -%}
+            {%- set overlap = states('sensor.irrigoto_schedule_overlap_status') | default('ok', true) -%}
+            {%- set override = is_state('input_boolean.irrigoto_schedule_overlap_override', 'on') -%}
+            {%- if overlap != 'ok' and not override -%}
+              blocked: {{ overlap }}
+            {%- elif not online -%}
+              pending - device asleep
+            {%- elif status.startswith('ok') or status.startswith('sync ok')
+                    or status.startswith('sync no-op')
+                    or status == 'no schedule pushed yet' -%}
+              pending - pushing
+            {%- else -%}
+              push failed: {{ status }}
+            {%- endif -%}
+          {%- endif -%}
+        attributes:
+          sync_count: >-
+            {{ state_attr('sensor.<<DEV_USC>>_desired_rendered', 'sync_count') }}
+          ha_entry_count: >-
+            {{ (state_attr('sensor.irrigoto_desired_schedule', 'per_device_entries')
+                or {}).get('<<DEV_DASH>>', []) | count }}
+          last_push_status: >-
+            {{ states('sensor.<<DEV_USC>>_irrigoto_last_schedule_update') }}
+          device_online: >-
+            {{ is_state('binary_sensor.<<DEV_USC>>_irrigoto_online', 'on') }}
+          overlap_status: >-
+            {{ states('sensor.irrigoto_schedule_overlap_status') }}
+          overlap_first: >-
+            {{ state_attr('sensor.irrigoto_schedule_overlap_status', 'first') }}
+
+      # b355: pending-INBOUND -- "the device has a newer schedule_version
+      # than HA last observed."
+      # b358: source of dev_v changed from the (now-removed) standalone
+      # sensor.<<DEV_USC>>_irrigoto_schedule_version text_sensor to the
+      # `schedule_version` attribute on sensor.<<DEV_USC>>_schedule_full,
+      # which is event-driven (updates on every schedule_changed event
+      # the device fires). The standalone sensor was retired with b357's
+      # service trim to stop the API send-buffer overflow.
+      - name: <<DEV_DASH>> schedule pending inbound
+        unique_id: <<DEV_USC>>_schedule_pending_inbound
+        default_entity_id: sensor.<<DEV_USC>>_schedule_pending_inbound
+        icon: >-
+          {%- set s = states('sensor.<<DEV_USC>>_schedule_pending_inbound') -%}
+          {%- if s == 'synced' -%} mdi:check-circle-outline
+          {%- elif s.startswith('pending') -%} mdi:download-outline
+          {%- else -%} mdi:alert-circle-outline
+          {%- endif -%}
+        state: >-
+          {%- set dev_v_raw = state_attr('sensor.<<DEV_USC>>_schedule_full',
+                                          'schedule_version') | default(0) -%}
+          {%- set ha_v_str = states('input_text.<<DEV_USC>>_last_seen_schedule_version')
+                              | default('0', true) -%}
+          {%- set dev_v = dev_v_raw | int(0) -%}
+          {%- set ha_v = (ha_v_str if ha_v_str not in ['unknown', 'unavailable', 'none'] else '0') | int(0) -%}
+          {%- if dev_v == 0 -%}
+            {# Device hasn't published a version yet (just booted, or never #}
+            {# fired schedule_changed). Treat as synced -- nothing to pull. #}
+            synced
+          {%- elif dev_v <= ha_v -%}
+            synced
+          {%- else -%}
+            {%- set online = is_state('binary_sensor.<<DEV_USC>>_irrigoto_online', 'on') -%}
+            {%- if not online -%}
+              pending - HA offline
+            {%- else -%}
+              pending - pulling
+            {%- endif -%}
+          {%- endif -%}
+        attributes:
+          device_version: >-
+            {{ state_attr('sensor.<<DEV_USC>>_schedule_full', 'schedule_version') }}
+          last_seen_version: >-
+            {{ states('input_text.<<DEV_USC>>_last_seen_schedule_version') }}
+
+# ── HTTP-PULL: mirror device schedule into HA slots ────────────────
+# b359: REST sensor that periodically fetches the device's structured
+# schedule (with IDs and last_modified) via its HTTP /api/schedule
+# endpoint. Restores the b355 PULL functionality that was lost when
+# b357 dropped text_full from the ESPHome schedule_changed event
+# (necessary to stay under the API send-buffer ceiling).
+#
+# Two attributes drive the mirror automation:
+#   entries          — list of dicts with id, last_modified, zone,
+#                      mode, depth, hour, minute, days_mask, enabled,
+#                      source — direct from the device
+#   schedule_version — uint counter that bumps on every device-side
+#                      mutation; the automation triggers on this
+#
+# Polling interval is intentionally low (30s) — device-side edits via
+# the web UI propagate to HA slots within that window. HA-side edits
+# push to the device through the existing reconciler (PUSH path); the
+# next poll then reconciles HA's slots back to whatever the device
+# stored. So the two surfaces converge bidirectionally with at most
+# 30s of staleness.
+#
+# Uses the sensor-platform form (sensor: - platform: rest) rather
+# than the newer top-level `rest:` integration. The top-level form
+# is sometimes finicky inside packages; the platform form is
+# universally supported across HA versions.
+sensor:
+  - platform: rest
+    name: <<DEV_USC>>_schedule_rest
+    resource: <<DEV_URL>>/api/schedule
+    method: GET
+    scan_interval: 30
+    timeout: 8
+    value_template: "{{ value_json.schedule_version | default(0) | int(0) }}"
+    json_attributes:
+      - entries
+      - schedule_version
+      - max_entries
+      - last_status
+      # b359: the device's configured zone list, used to populate the
+      # Compose form's Zone dropdown with friendly names instead of raw
+      # 1..8. Each entry: {id, name}. id is 1-based; "Zone" is the
+      # placeholder for unconfigured slot 0 (we filter it out).
+      - zones
+
+# ── Automations ──────────────────────────────────────────────────────
+automation:
+  # Keep the device awake when you connect to work on it. Fires once
+  # on the offline → online edge, only if auto-sleep is currently on.
+  # You re-enable auto-sleep manually when you're done.
+  - id: <<DEV_USC>>_disable_auto_sleep_on_connect
+    alias: "irrigoto <<DEV_DASH>>: disable auto-sleep when device comes online"
+    description: >-
+      When the irrigoto reconnects to HA, immediately turn off its
+      auto-sleep switch so it stays awake. Useful when you're actively
+      working on the device (web UI, calibration, schedule edits) and
+      don't want it disappearing on you mid-session.
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.<<DEV_USC>>_irrigoto_online
+        from: "off"
+        to: "on"
+    conditions:
+      - condition: state
+        entity_id: switch.<<DEV_USC>>_irrigoto_auto_sleep
+        state: "on"
+    actions:
+      - delay: "00:00:03"   # let NVS-restored state settle first
+      - action: switch.turn_off
+        target:
+          entity_id: switch.<<DEV_USC>>_irrigoto_auto_sleep
+
+  # Per-watering Logbook entry. Shows up in HA's Logbook view as a
+  # human-readable line — handy for scrolling recent activity without
+  # opening a graph.
+  #
+  # Tagged against the dedicated sensor.<<DEV_USC>>_watering_completions
+  # placeholder entity (defined in template: above), which is in the
+  # logbook: exclude list so its state changes don't pollute the
+  # filtered view. Net result: the Trends tab's "Watering history"
+  # logbook card filtered to that entity shows exactly these summary
+  # lines and nothing else — no sync_schedule pushes, no CSV-mirror
+  # chatter, no reconciler messages.
+  - id: <<DEV_USC>>_log_watering_completion
+    alias: "irrigoto <<DEV_DASH>>: log watering completion"
+    description: >-
+      Append a Logbook entry every time a zone finishes watering, with
+      mode, duration, volume, area, score, and status all in one line.
+    mode: parallel
+    triggers:
+      - trigger: event
+        event_type: esphome.<<DEV_DASH>>_watering_complete
+    actions:
+      - action: logbook.log
+        data:
+          name: irrigoto
+          message: >-
+            {{ trigger.event.data.zone_name }}
+            ({{ trigger.event.data.mode_label }})
+            {{ '%.1f' | format(trigger.event.data.duration_s | float / 60.0) }} min,
+            {{ trigger.event.data.volume_l }} L over
+            {{ trigger.event.data.area_m2 }} m² —
+            score {{ trigger.event.data.score }}/5 —
+            {{ trigger.event.data.status }}
+          domain: sensor
+          entity_id: sensor.<<DEV_USC>>_watering_completions
+
+  # Bootstrap the HA mirror folder whenever the device transitions
+  # offline -> online. The per-watering mirror only refreshes ONE
+  # zone (the one that just watered), so without this bootstrap the
+  # other zones' files can stay missing forever -- which means the
+  # heatmap card has nothing to render from while the device is
+  # asleep. This automation runs through all 8 zone slots; missing
+  # zones harmlessly 404 (the shell_command's per-curl `|| true`
+  # absorbs that). One sleep-wake cycle populates the entire folder.
+  #
+  # mode: single + the existing online/auto-sleep automation
+  # combine to give us a stable awake window: when device comes
+  # online, auto-sleep gets turned off (3s delay), keeping the
+  # device awake long enough for this loop to complete (~30s for 8
+  # zones).
+  - id: <<DEV_USC>>_bootstrap_mirror_on_online
+    alias: "irrigoto <<DEV_DASH>>: bootstrap heatmap mirror when device comes online"
+    description: >-
+      Walk all 8 zone slots and mirror api/all + per-zone
+      last_water JSON + water CSV. Idempotent. Runs once per
+      offline->online edge so the HA-side mirror folder always has
+      a recent snapshot regardless of which zones recently watered.
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.<<DEV_USC>>_irrigoto_online
+        from: "off"
+        to: "on"
+    conditions:
+      - condition: template
+        value_template: >-
+          {{ states('sensor.<<DEV_USC>>_irrigoto_ip_address')
+             is match('^\d+\.\d+\.\d+\.\d+$') }}
+    actions:
+      - delay: "00:00:05"   # let device settle after wake
+      - repeat:
+          count: 8
+          sequence:
+            - action: shell_command.irrigoto_mirror_zone
+              data:
+                ip: "{{ states('sensor.<<DEV_USC>>_irrigoto_ip_address') }}"
+                zone_id: "{{ repeat.index - 1 }}"
+                slug: "<<DEV_DASH>>"
+      - action: logbook.log
+        data:
+          name: irrigoto
+          message: "bootstrapped HA heatmap mirror for 8 zone slots"
+          domain: sensor
+          entity_id: sensor.<<DEV_USC>>_watering_log
+
+  # Mirror per-zone heatmap CSV + last_water JSON + api/all from the
+  # device to HA's static-file root right after a watering finishes.
+  # The heatmap card uses these as a fallback when the device is in
+  # deep sleep, so the dashboard always renders the most recent
+  # heatmap without waking the device. A short delay lets the device
+  # finalize its wbin write before we read the CSV.
+  #
+  # mode: parallel so back-to-back zones (multi-zone schedule) don't
+  # serialize -- shell_command.irrigoto_mirror_zone handles its own
+  # locking via filesystem write semantics.
+  - id: <<DEV_USC>>_mirror_csv_after_watering
+    alias: "irrigoto <<DEV_DASH>>: mirror CSV to HA after watering"
+    description: >-
+      Pull /zone/water_csv, /zone/last_water, and /api/all from the
+      device after each watering completes; save under
+      /config/www/community/irrigoto/csv/. The heatmap card's
+      fallback chain serves these when the device sleeps.
+    mode: parallel
+    triggers:
+      - trigger: event
+        event_type: esphome.<<DEV_DASH>>_watering_complete
+    conditions:
+      # Only run if we have a usable IP for the device. Without
+      # wifi_info text_sensor exposing the IP, this whole mirror is
+      # a no-op (the card still works via direct fetch when device
+      # is awake).
+      - condition: template
+        value_template: >-
+          {{ states('sensor.<<DEV_USC>>_irrigoto_ip_address')
+             is match('^\d+\.\d+\.\d+\.\d+$') }}
+    actions:
+      - delay: "00:00:03"   # let device finish flushing the wbin
+      - action: shell_command.irrigoto_mirror_zone
+        data:
+          ip: "{{ states('sensor.<<DEV_USC>>_irrigoto_ip_address') }}"
+          zone_id: "{{ (trigger.event.data.zone | int) - 1 }}"
+          slug: "<<DEV_DASH>>"
+      # Stamp the dashboard's watering logbook (sensor.irrigoto_
+      # watering_log, defined in template:) so you can verify the
+      # mirror fired and see which zone_id was used. Lands as a
+      # one-line entry per watering on the dashboard's filtered
+      # logbook card.
+      - action: logbook.log
+        data:
+          name: irrigoto
+          message: >-
+            mirrored CSV for zone_id {{ (trigger.event.data.zone | int) - 1 }}
+            ({{ trigger.event.data.zone_name }}) ->
+            /config/www/community/irrigoto/csv/zone_{{ (trigger.event.data.zone | int) - 1 }}.csv
+          domain: sensor
+          entity_id: sensor.<<DEV_USC>>_watering_log
+
+  # Cal completion goes to its OWN dedicated log entity so the
+  # watering-history dashboard card stays clean. A separate dashboard
+  # card filtered to sensor.<<DEV_USC>>_calibration_log shows cal events.
+  - id: <<DEV_USC>>_log_cal_completion
+    alias: "irrigoto <<DEV_DASH>>: log calibration completion"
+    description: Append a Logbook entry when pressure or nozzle cal finishes.
+    mode: parallel
+    triggers:
+      - trigger: event
+        event_type: esphome.<<DEV_DASH>>_cal_complete
+    actions:
+      - action: logbook.log
+        data:
+          name: irrigoto
+          message: >-
+            {{ trigger.event.data.type }} calibration —
+            {{ trigger.event.data.status }}
+          domain: sensor
+          entity_id: sensor.<<DEV_USC>>_calibration_log
+
+  # Mirror the device's live schedule into an input_text helper. Every
+  # time the schedule changes (HA push, web-UI edit, clear), we copy
+  # the canonical text from the device. Dashboards can display it,
+  # automations can compare against last-known, etc.
+  - id: <<DEV_USC>>_mirror_schedule
+    alias: "irrigoto <<DEV_DASH>>: mirror schedule into input_text"
+    description: >-
+      Keep input_text.<<DEV_USC>>_schedule_mirror in sync with the device's
+      live schedule. Source of truth stays on the device.
+    mode: single
+    triggers:
+      - trigger: event
+        event_type: esphome.<<DEV_DASH>>_schedule_changed
+    actions:
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.<<DEV_USC>>_schedule_mirror
+        data:
+          # input_text caps at 255 chars; same truncation budget the
+          # device's schedule_text sensor uses.
+          value: "{{ trigger.event.data.text | truncate(255, true, '...') }}"
+
+  # ── HA-side schedule reconciler (b358: push-only after b357 trim) ──
+  # State machine that keeps HA's slots and the device's schedule in
+  # lockstep. Originally a two-way sync (b355); the b357 firmware fix
+  # dropped the schedule_version text_sensor and text_full event field
+  # to stop the API send-buffer overflow, which degraded this to
+  # effectively push-only.
+  #
+  # Triggers:
+  #   - device transitions offline -> online (e.g. wake from deep sleep)
+  #   - device schedule_version attribute on schedule_full sensor moves
+  #     forward (i.e. a schedule_changed event arrived from the device)
+  #   - any HA slot input_text changes (HA-side edit)
+  #
+  # Each fire goes through:
+  #   1. PULL (inbound) — DEGRADED. The PULL phase used to walk the
+  #      device's by_id (built from text_full in the schedule_changed
+  #      event) to mirror device IDs into HA slots. With text_full
+  #      removed in b357, by_id is permanently empty and the PULL is
+  #      a no-op. Device-side web-UI edits no longer auto-appear in
+  #      HA slots. Workaround: edit HA slots to match what the device
+  #      shows, OR call /api/schedule on the device via curl + jq for
+  #      programmatic mirroring (future work).
+  #   2. PUSH (outbound). If HA has any slots populated, emit a
+  #      sync_schedule payload of upserts. Tombstones can't be
+  #      computed without by_id, so HA-side deletes don't propagate
+  #      to the device; the user clears device-side via web UI.
+  #      Device's LWW logic ignores no-ops, so periodic re-pushes
+  #      are cheap.
+  #
+  # Debounce: mode: restart + 3s delay coalesces burst edits.
+  - id: <<DEV_USC>>_reconcile_schedule
+    alias: "irrigoto <<DEV_DASH>>: reconcile schedule (b358 push-only)"
+    description: >-
+      Pushes HA-side schedule edits into the device via sync_schedule.
+      PULL phase is a no-op since b357 removed text_full from the
+      schedule_changed event; device-side edits no longer auto-mirror
+      into HA slots.
+    mode: restart
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.<<DEV_USC>>_irrigoto_online
+        from: "off"
+        to: "on"
+      - trigger: state
+        entity_id: sensor.<<DEV_USC>>_schedule_full
+        attribute: schedule_version
+      - trigger: state
+        entity_id:
+          - input_text.irrigoto_sched_1
+          - input_text.irrigoto_sched_2
+          - input_text.irrigoto_sched_3
+          - input_text.irrigoto_sched_4
+          - input_text.irrigoto_sched_5
+          - input_text.irrigoto_sched_6
+          - input_text.irrigoto_sched_7
+          - input_text.irrigoto_sched_8
+          - input_text.irrigoto_sched_9
+          - input_text.irrigoto_sched_10
+    conditions:
+      - condition: state
+        entity_id: binary_sensor.<<DEV_USC>>_irrigoto_online
+        state: "on"
+    actions:
+      # Debounce burst edits.
+      - delay: "00:00:03"
+
+      # ── PULL: degraded ─────────────────────────────────────────────
+      # Compute dev_v / ha_v for the inbound-pending indicator. PULL
+      # itself is no-op (by_id permanently empty in b358+). Stamping
+      # last_seen_schedule_version still happens via the separate
+      # track_schedule_version automation below, which reads the event
+      # payload directly.
+      - variables:
+          dev_v: >-
+            {%- set v = state_attr('sensor.<<DEV_USC>>_schedule_full',
+                                    'schedule_version') | default(0) -%}
+            {{ v | int(0) }}
+          ha_v: >-
+            {%- set v = states('input_text.<<DEV_USC>>_last_seen_schedule_version')
+                        | default('0', true) -%}
+            {{ (v if v not in ['unknown', 'unavailable', 'none'] else '0') | int(0) }}
+      - if:
+          - condition: template
+            value_template: "{{ dev_v > ha_v and dev_v > 0 }}"
+        then:
+          # Walk this device's by_id; for each device entry, find the
+          # HA slot that already references its id (if any). If found,
+          # if HA's last_modified is OLDER than the device's, overwrite
+          # the slot with the device's values. If no slot matches, drop
+          # the entry into the first empty slot. (Brand-new device
+          # entries land in HA this way.)
+          #
+          # For HA slots whose id is no longer in by_id (device deleted
+          # the entry), clear the slot.
+          - variables:
+              by_id: >-
+                {{ state_attr('sensor.<<DEV_USC>>_schedule_full', 'by_id')
+                   | default({}, true) }}
+              ha_entries: >-
+                {{ (state_attr('sensor.irrigoto_desired_schedule',
+                               'per_device_entries')
+                    or {}).get('<<DEV_DASH>>', []) }}
+          # Phase A: clear slots whose IDs the device no longer has.
+          - repeat:
+              for_each: "{{ ha_entries }}"
+              sequence:
+                - variables:
+                    ent: "{{ repeat.item }}"
+                    id_str: "{{ ent.id | int(0) | string }}"
+                - if:
+                    - condition: template
+                      value_template: >-
+                        {{ (ent.id | int(0)) > 0
+                           and id_str not in by_id }}
+                  then:
+                    - action: input_text.set_value
+                      target:
+                        entity_id: "input_text.irrigoto_sched_{{ ent.slot }}"
+                      data:
+                        value: ""
+          # Phase B: for each device entry, upsert into a slot.
+          - repeat:
+              for_each: >-
+                {{ (state_attr('sensor.<<DEV_USC>>_schedule_full', 'by_id')
+                    or {}).values() | list }}
+              sequence:
+                - variables:
+                    dev_e: "{{ repeat.item }}"
+                    # Locate the HA slot currently bound to this id.
+                    # If no slot exists, pick the lowest-numbered empty one.
+                    cur_slot: >-
+                      {%- set entries = (state_attr('sensor.irrigoto_desired_schedule',
+                                                     'per_device_entries')
+                                          or {}).get('<<DEV_DASH>>', []) -%}
+                      {%- set ns = namespace(s=0) -%}
+                      {%- for e in entries -%}
+                        {%- if e.id == dev_e.id and ns.s == 0 -%}
+                          {%- set ns.s = e.slot -%}
+                        {%- endif -%}
+                      {%- endfor -%}
+                      {{ ns.s }}
+                    first_empty: >-
+                      {%- set ns = namespace(s=0) -%}
+                      {%- for i in range(1, 11) -%}
+                        {%- set raw = states('input_text.irrigoto_sched_' ~ i)
+                                        | default('', true) | trim -%}
+                        {%- if raw == '' and ns.s == 0 -%}
+                          {%- set ns.s = i -%}
+                        {%- endif -%}
+                      {%- endfor -%}
+                      {{ ns.s }}
+                    target_slot: "{{ cur_slot if cur_slot > 0 else first_empty }}"
+                    cur_lm: >-
+                      {%- set entries = (state_attr('sensor.irrigoto_desired_schedule',
+                                                     'per_device_entries')
+                                          or {}).get('<<DEV_DASH>>', []) -%}
+                      {%- set ns = namespace(lm=0) -%}
+                      {%- for e in entries -%}
+                        {%- if e.id == dev_e.id -%}
+                          {%- set ns.lm = e.last_modified | int(0) -%}
+                        {%- endif -%}
+                      {%- endfor -%}
+                      {{ ns.lm }}
+                # Apply if we have a slot AND the device's lm is at least
+                # as new as HA's (device-wins-tiebreak from the design doc).
+                - if:
+                    - condition: template
+                      value_template: >-
+                        {{ target_slot > 0
+                           and (dev_e.last_modified | int(0)) >= (cur_lm | int(0)) }}
+                  then:
+                    - action: input_text.set_value
+                      target:
+                        entity_id: "input_text.irrigoto_sched_{{ target_slot }}"
+                      data:
+                        value: >-
+                          {{ dev_e.id }},{{ dev_e.last_modified }},<<DEV_DASH>>|{{
+                          dev_e.zone }},{{ dev_e.mode }},{{ dev_e.depth }},{{
+                          dev_e.hour }},{{ dev_e.minute }},{{ dev_e.days_mask
+                          }},{{ dev_e.enabled }}
+          # Stamp last_seen_version. We deliberately set it to the
+          # device's current value so a second outbound push that lands
+          # before the device's schedule_changed event fires doesn't
+          # spuriously look "inbound."
+          - action: input_text.set_value
+            target:
+              entity_id: input_text.<<DEV_USC>>_last_seen_schedule_version
+            data:
+              value: "{{ dev_v }}"
+          - action: logbook.log
+            data:
+              name: irrigoto
+              message: >-
+                <<DEV_DASH>>: pulled device schedule v={{ dev_v }}
+                (HA had v={{ ha_v }})
+              domain: sensor
+              entity_id: sensor.<<DEV_USC>>_watering_log
+          # Give the just-rewritten slots a tick to flow through the
+          # template sensors before the push phase reads sync_count.
+          - delay: "00:00:01"
+
+      # ── PUSH: HA → device ────────────────────────────────────────
+      # Only runs when sync_count > 0 (HA has at least one upsert or
+      # tombstone the device hasn't acknowledged) AND the overlap
+      # validator is clean (or override is on).
+      #
+      # Safety guard: refuse to push a payload that is 100% tombstones
+      # against a non-empty device. That's the "HA was just enabled,
+      # has no slots, device already has entries" shape, which would
+      # otherwise wipe the schedule. The legitimate "user cleared all
+      # HA slots to delete all entries" case lands in the same shape,
+      # so we require the user to also flip the overlap override on
+      # to actually push the wipe — clunky but matches the design's
+      # "safe defaults: never wipe blind" principle.
+      - variables:
+          sync_payload: >-
+            {{ state_attr('sensor.<<DEV_USC>>_desired_rendered', 'sync_payload')
+               | default('', true) }}
+          sync_count: >-
+            {{ state_attr('sensor.<<DEV_USC>>_desired_rendered', 'sync_count')
+               | default(0) | int(0) }}
+          ha_entry_count: >-
+            {{ (state_attr('sensor.irrigoto_desired_schedule',
+                            'per_device_entries')
+                or {}).get('<<DEV_DASH>>', []) | count }}
+          dev_entry_count: >-
+            {{ state_attr('sensor.<<DEV_USC>>_schedule_rest', 'entries')
+               | default([], true) | count }}
+          overlap_ok: >-
+            {{ is_state('sensor.irrigoto_schedule_overlap_status', 'ok')
+               or is_state('input_boolean.irrigoto_schedule_overlap_override', 'on') }}
+          tombstone_wipe: >-
+            {{ ha_entry_count | int(0) == 0
+               and dev_entry_count | int(0) > 0
+               and not is_state('input_boolean.irrigoto_schedule_overlap_override', 'on') }}
+      - if:
+          - condition: template
+            value_template: "{{ tombstone_wipe }}"
+        then:
+          - action: logbook.log
+            data:
+              name: irrigoto
+              message: >-
+                <<DEV_DASH>>: sync_schedule push BLOCKED (would wipe device).
+                HA has 0 slots, device has {{ dev_entry_count }} entries.
+                If this is intentional (you want to delete everything),
+                turn on input_boolean.irrigoto_schedule_overlap_override.
+              domain: sensor
+              entity_id: sensor.<<DEV_USC>>_watering_log
+          - stop: "tombstone-wipe guard"
+      - if:
+          - condition: template
+            value_template: "{{ sync_count > 0 and overlap_ok }}"
+        then:
+          - action: esphome.<<DEV_USC>>_sync_schedule
+            data:
+              entries: "{{ sync_payload }}"
+          - action: logbook.log
+            data:
+              name: irrigoto
+              message: >-
+                <<DEV_DASH>>: sync_schedule pushed
+                ({{ sync_count }} upserts / tombstones)
+              domain: sensor
+              entity_id: sensor.<<DEV_USC>>_watering_log
+
+  # b358 (RE-ADDED, safe again): auto-stamp last_seen_schedule_version
+  # from every schedule_changed event. The original draft was removed
+  # in b357 (commit 9e040fd) because it raced ahead of the reconciler
+  # and caused tombstone-wipes — by stamping last_seen first, the
+  # reconciler's PULL phase was skipped, and the PUSH phase saw "HA
+  # empty + device has entries" and emitted tombstones for everything.
+  #
+  # That race is permanently gone in b358: the b357 firmware removed
+  # text_full from the schedule_changed event, so by_id is permanently
+  # empty, so the PUSH phase's tombstone loop can't emit anything even
+  # if the race condition triggers. PUSH is now upserts-only.
+  - id: <<DEV_USC>>_track_schedule_version
+    alias: "irrigoto <<DEV_DASH>>: track device schedule_version"
+    description: >-
+      Update input_text.<<DEV_USC>>_last_seen_schedule_version
+      to the device's reported value on every schedule_changed event.
+      Drives the inbound-pending indicator and keeps HA in step with
+      the device's mutation counter even though PULL is no-op in b358.
+    mode: queued
+    triggers:
+      - trigger: event
+        event_type: esphome.<<DEV_DASH>>_schedule_changed
+    actions:
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.<<DEV_USC>>_last_seen_schedule_version
+        data:
+          value: "{{ trigger.event.data.schedule_version | default(0) | int(0) | string }}"
+
+  # b359: populate the compose Zone dropdown from the device's actual
+  # zones list. The static "1".."8" options in the shared package are
+  # a fallback for first-boot before the REST sensor has polled; this
+  # automation replaces them with "<name> (#<id>)" entries (e.g.
+  # "N3 (#3)") matching the device's web UI convention. Filters out
+  # id=0 (the "Zone" placeholder for unconfigured slot).
+  - id: <<DEV_USC>>_update_compose_zone_options
+    alias: "irrigoto <<DEV_DASH>>: update compose zone dropdown from device"
+    description: >-
+      When the device's zones list changes (REST poll or HA startup),
+      rewrite input_select.irrigoto_compose_zone's options to show
+      friendly zone names instead of raw numbers.
+    mode: restart
+    triggers:
+      - trigger: state
+        entity_id: sensor.<<DEV_USC>>_schedule_rest
+        attribute: zones
+      - trigger: homeassistant
+        event: start
+    actions:
+      - delay: "00:00:05"
+      - variables:
+          zones: >-
+            {{ state_attr('sensor.<<DEV_USC>>_schedule_rest', 'zones')
+               | default([], true) }}
+          opts: >-
+            {%- set ns = namespace(o=[]) -%}
+            {%- for z in zones if (z.id | int(0)) > 0 and z.name != 'Zone' -%}
+              {%- set ns.o = ns.o + [z.name ~ ' (#' ~ (z.id | string) ~ ')'] -%}
+            {%- endfor -%}
+            {{ ns.o }}
+      - if:
+          - condition: template
+            value_template: "{{ opts | count > 0 }}"
+        then:
+          - action: input_select.set_options
+            target:
+              entity_id: input_select.irrigoto_compose_zone
+            data:
+              options: "{{ opts }}"
+
+  # Populate the "Start watering" zone picker from the device's live zone
+  # list as "Name (#id)". Unlike the compose dropdown this includes EVERY
+  # zone (id 0 too), so the first zone is waterable. The id rides along in
+  # the label so water_now resolves it unambiguously.
+  - id: <<DEV_USC>>_update_water_zone_options
+    alias: "irrigoto <<DEV_DASH>>: update water-zone picker from device"
+    mode: restart
+    triggers:
+      - trigger: state
+        entity_id: sensor.<<DEV_USC>>_schedule_rest
+        attribute: zones
+      - trigger: homeassistant
+        event: start
+    actions:
+      - delay: "00:00:05"
+      - variables:
+          zones: >-
+            {{ state_attr('sensor.<<DEV_USC>>_schedule_rest', 'zones')
+               | default([], true) }}
+          opts: >-
+            {%- set ns = namespace(o=[]) -%}
+            {%- for z in zones -%}
+              {%- set ns.o = ns.o + [z.name ~ ' (#' ~ (z.id | string) ~ ')'] -%}
+            {%- endfor -%}
+            {{ ns.o }}
+      - if:
+          - condition: template
+            value_template: "{{ opts | count > 0 }}"
+        then:
+          - action: input_select.set_options
+            target:
+              entity_id: input_select.<<DEV_USC>>_water_zone
+            data:
+              options: "{{ opts }}"
+
+  # b359: mirror device schedule into HA slots via the schedule_rest
+  # sensor. Triggers on EITHER:
+  #   - rest sensor state change (the periodic 30s poll observed a
+  #     device-side edit, OR our own push landed and the next poll
+  #     reflects it)
+  #   - schedule_changed event (immediate — fires within ~2s of any
+  #     device-side mutation). In that path we force-refresh the rest
+  #     sensor first, then wait briefly for the fetch to complete
+  #     before mirroring. Without this trigger, device-side edits
+  #     would take up to 30s to appear in HA slots.
+  #
+  # Idempotent — re-mirroring an already-synced state writes back the
+  # same values, no downstream churn.
+  #
+  # Behavior: walks slots 1..10 in order. Slots 1..N get the device's
+  # entries (preserving their device-assigned IDs). Slots N+1..10 are
+  # cleared if they belonged to this device, leaving slots for OTHER
+  # devices alone.
+  #
+  # Avoids clobbering user mid-edit by checking each slot's stored
+  # last_modified against the device's entry: if the slot is NEWER
+  # than the device's view, we leave it (the reconciler PUSH will
+  # then sync the slot to the device on its next fire).
+  - id: <<DEV_USC>>_mirror_device_schedule_to_slots
+    alias: "irrigoto <<DEV_DASH>>: mirror device schedule into HA slots"
+    description: >-
+      Mirror the device's schedule into HA slots, on either the REST
+      poll or an instant schedule_changed event. Preserves slot entries
+      whose HA-side last_modified is newer than the device's.
+    mode: restart
+    triggers:
+      - trigger: state
+        entity_id: sensor.<<DEV_USC>>_schedule_rest
+      - trigger: event
+        event_type: esphome.<<DEV_DASH>>_schedule_changed
+    actions:
+      # If we're firing from the event, the REST sensor's cached data
+      # is stale (next poll is up to 30s away). Force-refresh it now
+      # so the mirror writes the fresh entries+IDs.
+      - if:
+          - condition: template
+            value_template: "{{ trigger.platform == 'event' }}"
+        then:
+          - action: homeassistant.update_entity
+            target:
+              entity_id: sensor.<<DEV_USC>>_schedule_rest
+          - delay: "00:00:02"
+      - delay: "00:00:01"
+      # b359: SAFETY GUARD against device-offline scenarios. When the
+      # device goes to sleep / loses WiFi, the REST poll fails and the
+      # sensor state goes to unavailable/unknown; state_attr('entries')
+      # returns None, our `| default([], true)` turns that into an empty
+      # list, and without this guard the mirror would interpret "empty
+      # list" as "device has no entries" and CLEAR every HA slot — the
+      # cached schedule would vanish until the device wakes. Stop here
+      # if the device isn't actually reachable AND online.
+      - variables:
+          rest_state: "{{ states('sensor.<<DEV_USC>>_schedule_rest') }}"
+          online: "{{ is_state('binary_sensor.<<DEV_USC>>_irrigoto_online', 'on') }}"
+      - if:
+          - condition: template
+            value_template: >-
+              {{ rest_state in ['unknown', 'unavailable', 'none']
+                 or not online }}
+        then:
+          - stop: "device offline; preserving cached HA slots"
+      - variables:
+          entries: >-
+            {{ state_attr('sensor.<<DEV_USC>>_schedule_rest', 'entries')
+               | default([], true) }}
+      - repeat:
+          for_each: [1,2,3,4,5,6,7,8,9,10]
+          sequence:
+            - variables:
+                slot_n: "{{ repeat.item | int(0) }}"
+                dev_idx: "{{ slot_n - 1 }}"
+                dev_e: >-
+                  {{ entries[dev_idx] if dev_idx < (entries | count) else none }}
+                slot_raw: >-
+                  {{ states('input_text.irrigoto_sched_' ~ slot_n) | default('', true) | trim }}
+                slot_belongs_to_us: >-
+                  {{ '<<DEV_DASH>>|' in slot_raw }}
+                slot_head: >-
+                  {%- if '|' in slot_raw -%}{{ slot_raw.split('|', 1)[0] }}{%- else -%}{%- endif -%}
+                slot_lm: >-
+                  {%- set head = slot_head -%}
+                  {%- if ',' in head and head.split(',') | length >= 2 -%}
+                    {{ head.split(',')[1] | int(0) }}
+                  {%- else -%}0{%- endif -%}
+            - choose:
+                # Case A: device has an entry for this slot. Write it
+                # unless the HA slot's stored lm is newer (user mid-edit
+                # — let the reconciler PUSH it instead).
+                - conditions: "{{ dev_e is not none }}"
+                  sequence:
+                    - if:
+                        - condition: template
+                          value_template: >-
+                            {{ (slot_lm | int(0)) <= ((dev_e.last_modified | int(0)) if dev_e else 0) }}
+                      then:
+                        - action: input_text.set_value
+                          target:
+                            entity_id: "input_text.irrigoto_sched_{{ slot_n }}"
+                          data:
+                            value: >-
+                              {{ dev_e.id }},{{ dev_e.last_modified
+                              }},<<DEV_DASH>>|{{ dev_e.zone }},{{ dev_e.mode
+                              }},{{ dev_e.depth }},{{ dev_e.hour }},{{
+                              dev_e.minute }},{{ dev_e.days_mask }},{{
+                              dev_e.enabled }}
+                # Case B: device has no entry for this slot index. If
+                # the HA slot belongs to THIS device, clear it. If it's
+                # empty or belongs to another device, leave alone.
+                - conditions: "{{ slot_belongs_to_us }}"
+                  sequence:
+                    - action: input_text.set_value
+                      target:
+                        entity_id: "input_text.irrigoto_sched_{{ slot_n }}"
+                      data:
+                        value: ""
+      - action: logbook.log
+        data:
+          name: irrigoto
+          message: >-
+            <<DEV_DASH>>: mirrored device schedule into HA slots
+            ({{ entries | count }} entries from device)
+          domain: sensor
+          entity_id: sensor.<<DEV_USC>>_watering_log
+
+  # Companion to the reconciler: when HA has changes to push BUT a
+  # cross-device overlap blocks the sync, log the block so the user
+  # can see why nothing happened.
+  - id: <<DEV_USC>>_log_overlap_block
+    alias: "irrigoto <<DEV_DASH>>: log overlap-blocked push attempt"
+    description: >-
+      Fires when an HA-side edit OR a wake would otherwise trigger a
+      reconciler push, but the overlap validator flagged a conflict
+      and the override is off.
+    mode: restart
+    triggers:
+      - trigger: state
+        entity_id: sensor.<<DEV_USC>>_schedule_pending_outbound
+      - trigger: state
+        entity_id: binary_sensor.<<DEV_USC>>_irrigoto_online
+        from: "off"
+        to: "on"
+    conditions:
+      - condition: state
+        entity_id: binary_sensor.<<DEV_USC>>_irrigoto_online
+        state: "on"
+      - condition: template
+        value_template: >-
+          {{ (state_attr('sensor.<<DEV_USC>>_desired_rendered', 'sync_count')
+              | default(0) | int(0)) > 0 }}
+      - condition: template
+        value_template: >-
+          {{ not is_state('sensor.irrigoto_schedule_overlap_status', 'ok')
+             and not is_state('input_boolean.irrigoto_schedule_overlap_override', 'on') }}
+    actions:
+      - delay: "00:00:03"
+      - action: logbook.log
+        data:
+          name: irrigoto
+          message: >-
+            <<DEV_DASH>>: schedule push BLOCKED -- overlap conflict
+            ({{ states('sensor.irrigoto_schedule_overlap_status') }}):
+            {{ state_attr('sensor.irrigoto_schedule_overlap_status', 'first') }}.
+            Set input_boolean.irrigoto_schedule_overlap_override on to
+            push anyway.
+          domain: sensor
+          entity_id: sensor.<<DEV_USC>>_watering_log
+
+  # ── Rain delay glue ────────────────────────────────────────────────
+  # Two automations that drive the device's delay_schedule_hours
+  # service from a weather entity. Both are commented out by default
+  # because they reference weather.home — you almost certainly want
+  # to point them at your own weather integration (Met, OpenWeather,
+  # AccuWeather, etc.). Uncomment + change the entity_id and they
+  # work as-is. The schedule_delay sensor is the source of truth and
+  # is checked in both directions so we don't fight a real user-set
+  # delay from the web UI.
+  #
+  # Example 1: 24-hour rain delay when forecast says rainy. Checked
+  # hourly; the condition skips if a delay is already active so we
+  # don't keep re-arming the timer.
+  #
+  # - id: <<DEV_USC>>_rain_delay_on_forecast
+  #   alias: "irrigoto: delay schedule 24h when rain forecast"
+  #   mode: single
+  #   triggers:
+  #     - trigger: time_pattern
+  #       hours: "/1"   # check hourly
+  #   conditions:
+  #     - condition: state
+  #       entity_id: weather.home          # ← CHANGE to your weather entity
+  #       state: "rainy"
+  #     - condition: state
+  #       entity_id: sensor.<<DEV_USC>>_irrigoto_schedule_delay
+  #       state: "off"
+  #   actions:
+  #     - action: esphome.<<DEV_USC>>_delay_schedule_hours
+  #       data:
+  #         hours: 24
+  #
+  # Example 2: clear the delay when conditions turn sunny. Skip if
+  # there's no delay active anyway, to avoid pointless service calls.
+  #
+  # - id: <<DEV_USC>>_clear_delay_when_clear
+  #   alias: "irrigoto: clear schedule delay when weather clears"
+  #   mode: single
+  #   triggers:
+  #     - trigger: state
+  #       entity_id: weather.home          # ← CHANGE to your weather entity
+  #       to: "sunny"
+  #   conditions:
+  #     - condition: not
+  #       conditions:
+  #         - condition: state
+  #           entity_id: sensor.<<DEV_USC>>_irrigoto_schedule_delay
+  #           state: "off"
+  #   actions:
+  #     - action: esphome.<<DEV_USC>>_delay_schedule_hours
+  #       data:
+  #         hours: 0   # 0 cancels
+  #
+  # The delay also persists across reboot / deep-sleep wake, so an
+  # automation that fires once and then the device sleeps for 10
+  # minutes will still see the delay active when it wakes up.
