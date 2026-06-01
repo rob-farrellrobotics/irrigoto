@@ -1,0 +1,31 @@
+# irrigoto device fleet manifest (EXAMPLE)
+#
+# Copy this file to devices.yaml (same directory) and edit it for your
+# setup, then regenerate the HA config:
+#
+#   python tools/ha-regen.py
+#
+# Adding another device is just another entry here + a re-run — no YAML
+# surgery, no per-device find/replace. devices.yaml is gitignored (it
+# carries your device MACs / LAN addresses); this example is committed.
+#
+# Each device needs three fields:
+#
+#   slug  Dash-form device slug shown under the device title at
+#         Settings → Devices & Services → ESPHome (e.g. irrigoto-ab12cd).
+#         Lowercase letters, digits, and dashes only.
+#
+#   name  Friendly label. This is what the dashboard's device picker
+#         shows and how cards are grouped. Must be unique across devices.
+#
+#   url   Base URL the heatmap card and HTTP-poll sensors fetch from.
+#         Use the device IP (http://192.168.x.y) if <slug>.local does not
+#         resolve from your HA host — that is the common case.
+devices:
+  - slug: irrigoto-ab12cd
+    name: Front Yard
+    url:  http://192.168.1.50
+
+  - slug: irrigoto-ef34gh
+    name: Back Yard
+    url:  http://192.168.1.51

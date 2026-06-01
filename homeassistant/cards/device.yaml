@@ -1,0 +1,83 @@
+# irrigoto — Device status + power management card snippets
+#
+# Replace <<DEV_USC>> with your underscored device slug
+# (e.g. irrigoto_xxxxxx).
+
+# ── Card A: Status at a glance ───────────────────────────────────────
+type: entities
+title: Device status
+show_header_toggle: false
+entities:
+  - entity: binary_sensor.<<DEV_USC>>_irrigoto_online
+    name: Online
+  - entity: sensor.<<DEV_USC>>_irrigoto_status
+    name: Activity
+  - entity: sensor.<<DEV_USC>>_irrigoto_last_sleep_reason
+    name: Last sleep reason
+  - entity: sensor.<<DEV_USC>>_irrigoto_reset_reason
+    name: Reset reason
+  - entity: sensor.<<DEV_USC>>_irrigoto_boot_diag
+    name: Boot diagnostics
+  - entity: sensor.<<DEV_USC>>_irrigoto_battery_voltage
+    name: Battery
+  - entity: sensor.<<DEV_USC>>_irrigoto_pressure
+    name: Supply pressure
+
+# ── Card B: Power management knobs ───────────────────────────────────
+# Paste separately.
+#
+# type: entities
+# title: Power management
+# show_header_toggle: false
+# entities:
+#   - entity: switch.<<DEV_USC>>_irrigoto_auto_sleep
+#     name: Auto-sleep enabled
+#   - entity: number.<<DEV_USC>>_irrigoto_inactivity_timeout
+#     name: Inactivity timeout (min)
+#   - entity: number.<<DEV_USC>>_irrigoto_sleep_duration
+#     name: Sleep duration (s)
+#   - entity: number.<<DEV_USC>>_irrigoto_nozzle_dwell_timeout
+#     name: Nozzle dwell watchdog (s)
+
+# ── Card C: Compact status tiles ─────────────────────────────────────
+# Three small tiles in a row — colored online / watering / auto-sleep
+# indicators that double as quick toggles for auto-sleep.
+#
+# type: horizontal-stack
+# cards:
+#   - type: tile
+#     entity: binary_sensor.<<DEV_USC>>_irrigoto_online
+#     name: Online
+#     color: green
+#   - type: tile
+#     entity: binary_sensor.<<DEV_USC>>_irrigoto_watering
+#     name: Watering
+#     color: blue
+#   - type: tile
+#     entity: switch.<<DEV_USC>>_irrigoto_auto_sleep
+#     name: Auto-sleep
+#     color: orange
+#     tap_action:
+#       action: toggle
+
+# ── Card D: Manual control (selects + stop button) ──────────────────
+# start_watering takes zone / mode / duration parameters that an
+# entity-row can't pick at click-time. Either pick them on the device's
+# web UI, or build a separate Lovelace input_helper + script wrapper
+# if you want it driveable from a dashboard.
+#
+# type: entities
+# title: Current zone / mode
+# show_header_toggle: false
+# entities:
+#   - entity: select.<<DEV_USC>>_irrigoto_zone
+#     name: Zone
+#   - entity: select.<<DEV_USC>>_irrigoto_water_mode
+#     name: Mode
+#
+# type: button
+# name: Stop watering
+# icon: mdi:stop-circle-outline
+# tap_action:
+#   action: perform-action
+#   perform_action: esphome.<<DEV_USC>>_stop

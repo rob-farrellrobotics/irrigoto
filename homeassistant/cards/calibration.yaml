@@ -1,0 +1,24 @@
+# irrigoto — Calibration card snippet
+#
+# Replace <<DEV_USC>> with your underscored device slug
+# (e.g. irrigoto_xxxxxx) and <<DEV_DASH>> with the dash form
+# (irrigoto-xxxxxx) where it appears in the weblink URL.
+
+# ── Card A: Cal state ────────────────────────────────────────────────
+type: entities
+title: Calibration
+show_header_toggle: false
+entities:
+  - entity: sensor.<<DEV_USC>>_irrigoto_calibration_state
+    name: Current state
+
+# ── Card B: Link to the device cal page ──────────────────────────────
+# Pressure + nozzle calibration are run entirely from the device web UI
+# (interactive, measure-as-you-go). There are no HA cal trigger services;
+# just link to the device's /cal page.
+# type: button
+# name: Open cal page on device
+# icon: mdi:open-in-new
+# tap_action:
+#   action: url
+#   url_path: "http://<<DEV_DASH>>.local/cal"
