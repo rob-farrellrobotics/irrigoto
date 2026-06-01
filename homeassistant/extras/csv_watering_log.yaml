@@ -1,0 +1,53 @@
+# irrigoto — optional CSV watering log
+#
+# Appends one CSV row per completed watering to /config/irrigoto_waterings.csv.
+# Useful if you want a flat-file audit trail to open in a spreadsheet.
+#
+# This is NOT part of the main package because the data is already
+# captured by:
+#   • binary_sensor.irrigoto_watering — state history (start/end times)
+#   • sensor.irrigoto_cumulative_volume — long-term volume statistics
+#   • Logbook entries from the main package — human-readable summary
+#
+# Enable only if you want the CSV in addition.
+#
+# To install: copy the two top-level blocks below into your
+# configuration.yaml (notify + automation). Then either restart HA
+# or reload notify and automations from Developer Tools → YAML.
+#
+# REPLACE: <<DEV_DASH>> → irrigoto-xxxxxx (your device's MAC-suffixed
+# slug, dash-form — see homeassistant/packages/irrigoto.yaml header
+# for the full explanation of the three naming forms).
+# ─────────────────────────────────────────────────────────────────────
+
+# notify entry — defines a file-append target. Filename is relative
+# to /config, so the CSV lands at /config/irrigoto_waterings.csv.
+notify:
+  - platform: file
+    name: file_irrigoto_log
+    filename: irrigoto_waterings.csv
+    timestamp: false
+
+# Automation — listens for watering_complete and appends a row.
+# Headers are NOT auto-written; if you want them, manually seed the
+# file once with:
+#   timestamp,zone,zone_name,mode,duration_s,volume_l,area_m2,score,status
+# (Done via the File Editor add-on or `nano /config/irrigoto_waterings.csv`.)
+automation:
+  - id: irrigoto_csv_log_watering
+    alias: "irrigoto: append watering to CSV"
+    description: Append a row to /config/irrigoto_waterings.csv per watering.
+    mode: parallel
+    triggers:
+      - trigger: event
+        event_type: esphome.<<DEV_DASH>>_watering_complete
+    actions:
+      - action: notify.send_message
+        target:
+          entity_id: notify.file_irrigoto_log
+        data:
+          message: >-
+            {{ now().isoformat() }},{{ trigger.event.data.zone }},{{ trigger.event.data.zone_name
+            }},{{ trigger.event.data.mode_label }},{{ trigger.event.data.duration_s
+            }},{{ trigger.event.data.volume_l }},{{ trigger.event.data.area_m2
+            }},{{ trigger.event.data.score }},{{ trigger.event.data.status }}

@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""ha-regen.py — generate personalized Home Assistant config for an irrigoto
+fleet from a single manifest.
+
+Usage:
+    python tools/ha-regen.py [--manifest PATH] [--check]
+
+Reads homeassistant/devices.yaml (the fleet manifest) and writes the
+personalized files HA actually loads into homeassistant/generated/. Adding
+a device is just another entry in the manifest followed by a re-run — no
+per-device find/replace, no hand-edited copies.
+
+Outputs (the whole generated/ folder is gitignored; copy 1:1 into HA):
+    generated/packages/irrigoto_common.yaml            (one, shared)
+    generated/packages/irrigoto_schedule.yaml          (one, shared)
+    generated/packages/irrigoto_device_<slug_usc>.yaml (one per device)
+    generated/dashboards/irrigoto.yaml                 (one, device picker + per-device cards)
+
+Templating contract:
+    <<DEV_DASH>>  device dash-slug (irrigoto-ab12cd)   — events, filenames
+    <<DEV_USC>>   device underscore-slug               — entity IDs
+    <<DEV_URL>>   device base URL                       — HTTP-poll sensors
+    <<DEV_NAME>>  device friendly name                  — picker / card titles
+    irrigoto-xxxxxx                                     — legacy literal slug
+
+Shared (once) files may also use list placeholders, replaced with a YAML
+list built from the manifest (indentation preserved):
+    <<DEVICE_NAME_OPTIONS>>   friendly names   (device picker)
+    <<DEVICE_SLUG_OPTIONS>>   dash-slugs       (compose-form device dropdown)
+    <<FIRST_DEVICE_SLUG>>     first dash-slug  (compose-form default)
+    <<DEVICE_NAME_SLUG_MAP>>  {"name": "slug", ...} flow mapping (name->slug)
+    <<DEVICE_REST_SENSORS>>   sensor.<usc>_schedule_rest list (state-trigger ids)
+
+and per-device repetition blocks, emitted once per device:
+    # >>>PER-DEVICE-START<<<
+    ... block referencing <<DEV_*>> ...
+    # >>>PER-DEVICE-END<<<
+"""
+import argparse
+import copy
+import re
+import sys
+from pathlib import Path
+
+try:
+    import yaml
+except ImportError:
+    sys.exit("ha-regen.py needs PyYAML (pip install pyyaml; it ships with esphome)")
+
+ROOT = Path(__file__).resolve().parent.parent
+# Source templates (committed).
+PACKAGES = ROOT / "homeassistant" / "packages"
+DASHBOARDS = ROOT / "homeassistant" / "dashboards"
+# Generated output (gitignored). Plain .yaml names ready to copy 1:1 into
+# HA — config/packages/ from OUT_PACKAGES, the dashboard from OUT_DASHBOARDS.
+OUT_PACKAGES = ROOT / "homeassistant" / "generated" / "packages"
+OUT_DASHBOARDS = ROOT / "homeassistant" / "generated" / "dashboards"
+
+SLUG_RE = re.compile(r"^[a-z0-9-]+$")
+STRIP_RE = re.compile(
+    r"(?ms)^# >>>STRIP-ON-REGEN-START<<<.*?^# >>>STRIP-ON-REGEN-END<<<[ \t]*\n?"
+)
+BLOCK_RE = re.compile(
+    r"(?ms)^[ \t]*# >>>PER-DEVICE-START<<<[ \t]*\n(.*?)^[ \t]*# >>>PER-DEVICE-END<<<[ \t]*\n"
+)
+
+
+def load_manifest(path: Path):
+    if not path.exists():
+        sys.exit(
+            f"manifest not found: {path}\n"
+            f"  copy homeassistant/devices.example.yaml to devices.yaml and edit it."
+        )
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    devices = data.get("devices")
+    if not devices:
+        sys.exit(f"{path}: no 'devices:' entries found")
+
+    seen_slug, seen_name = set(), set()
+    out = []
+    for i, d in enumerate(devices):
+        slug = str(d.get("slug", "")).strip()
+        name = str(d.get("name", "")).strip()
+        url = str(d.get("url", "")).strip().rstrip("/")
+        where = f"device #{i + 1}"
+        if not SLUG_RE.match(slug):
+            sys.exit(f"{where}: bad slug {slug!r} (lowercase letters, digits, dashes only)")
+        if not name:
+            sys.exit(f"{where} ({slug}): missing 'name'")
+        if not url:
+            sys.exit(f"{where} ({slug}): missing 'url'")
+        if slug in seen_slug:
+            sys.exit(f"duplicate slug {slug!r} in manifest")
+        if name in seen_name:
+            sys.exit(f"duplicate name {name!r} in manifest (picker needs unique names)")
+        seen_slug.add(slug)
+        seen_name.add(name)
+        out.append({"slug": slug, "usc": slug.replace("-", "_"), "url": url, "name": name})
+    return out
+
+
+def subst_device(text: str, dev: dict) -> str:
+    text = text.replace("<<DEV_DASH>>", dev["slug"])
+    text = text.replace("<<DEV_USC>>", dev["usc"])
+    text = text.replace("<<DEV_URL>>", dev["url"])
+    text = text.replace("<<DEV_NAME>>", dev["name"])
+    text = text.replace("irrigoto-xxxxxx", dev["slug"])
+    return text
+
+
+def subst_list(text: str, token: str, values) -> str:
+    pat = re.compile(r"(?m)^([ \t]*)" + re.escape(token) + r"[ \t]*$")
+
+    def rep(m):
+        indent = m.group(1)
+        return "\n".join(f'{indent}- "{v}"' for v in values)
+
+    return pat.sub(rep, text)
+
+
+def subst_scalar(text: str, token: str, value: str) -> str:
+    return text.replace(token, value)
+
+
+def expand_blocks(text: str, devices) -> str:
+    def rep(m):
+        block = m.group(1)
+        return "".join(subst_device(block, d) for d in devices)
+
+    return BLOCK_RE.sub(rep, text)
+
+
+def gen_header(src_rel: str, manifest_rel: str, n_devices: int) -> str:
+    return (
+        f"# ─── GENERATED by tools/ha-regen.py — DO NOT EDIT ───────────────────\n"
+        f"# Source template: {src_rel}\n"
+        f"# Fleet manifest : {manifest_rel} ({n_devices} device(s))\n"
+        f"# Edit the template or the manifest, then re-run: python tools/ha-regen.py\n"
+        f"# ─────────────────────────────────────────────────────────────────────\n"
+    )
+
+
+def render_once(src: Path, devices, manifest_rel: str) -> str:
+    text = src.read_text(encoding="utf-8")
+    text = STRIP_RE.sub("", text)
+    text = subst_list(text, "<<DEVICE_NAME_OPTIONS>>", [d["name"] for d in devices])
+    text = subst_list(text, "<<DEVICE_SLUG_OPTIONS>>", [d["slug"] for d in devices])
+    text = subst_scalar(text, "<<FIRST_DEVICE_SLUG>>", devices[0]["slug"])
+    text = subst_scalar(text, "<<FIRST_DEVICE_NAME>>", devices[0]["name"])
+    # name->slug as a YAML/JSON flow mapping, for automations that translate the
+    # active-device picker (friendly names) to a compose-form slug.
+    name_slug_map = "{" + ", ".join(f'"{d["name"]}": "{d["slug"]}"' for d in devices) + "}"
+    text = subst_scalar(text, "<<DEVICE_NAME_SLUG_MAP>>", name_slug_map)
+    text = subst_list(text, "<<DEVICE_REST_SENSORS>>",
+                      [f'sensor.{d["usc"]}_schedule_rest' for d in devices])
+    text = expand_blocks(text, devices)
+    return gen_header(src.relative_to(ROOT).as_posix(), manifest_rel, len(devices)) + "\n" + text
+
+
+def render_device(src: Path, dev: dict, manifest_rel: str) -> str:
+    text = src.read_text(encoding="utf-8")
+    text = STRIP_RE.sub("", text)
+    text = subst_device(text, dev)
+    head = gen_header(src.relative_to(ROOT).as_posix(), manifest_rel, 1)
+    head += f'# Personalized for device "{dev["slug"]}" ({dev["name"]}).\n'
+    return head + "\n" + text
+
+
+def deep_subst(obj, dev: dict):
+    """Recursively substitute <<DEV_*>> placeholders in every string leaf."""
+    if isinstance(obj, str):
+        return subst_device(obj, dev)
+    if isinstance(obj, list):
+        return [deep_subst(x, dev) for x in obj]
+    if isinstance(obj, dict):
+        return {k: deep_subst(v, dev) for k, v in obj.items()}
+    return obj
+
+
+def _picker_card():
+    return {
+        "type": "entities",
+        "title": "Device",
+        "entities": [
+            {"entity": "input_select.irrigoto_active_device", "name": "Showing"}
+        ],
+    }
+
+
+def _conditionalize(cards, devices):
+    """Return one conditional card per device, each wrapping `cards`
+    (substituted for that device) and shown only when the picker selects it."""
+    out = []
+    for dev in devices:
+        out.append({
+            "type": "conditional",
+            "conditions": [{
+                "entity": "input_select.irrigoto_active_device",
+                "state": dev["name"],
+            }],
+            "card": {
+                "type": "vertical-stack",
+                "cards": deep_subst(copy.deepcopy(cards), dev),
+            },
+        })
+    return out
+
+
+def render_dashboard(src: Path, devices, manifest_rel: str) -> str:
+    raw = STRIP_RE.sub("", src.read_text(encoding="utf-8"))
+    doc = yaml.safe_load(raw)
+    if not isinstance(doc, dict) or "views" not in doc:
+        sys.exit(f"{src}: dashboard template has no top-level 'views:'")
+
+    if len(devices) == 1:
+        # One device: no picker, no conditional wrappers — just a plain,
+        # fully-substituted single-device dashboard.
+        doc = deep_subst(doc, devices[0])
+    else:
+        for view in doc["views"]:
+            if "cards" in view:  # masonry layout
+                multiplied = [_picker_card()] + _conditionalize(view["cards"], devices)
+                # Always collapse to a single root card. Two reasons:
+                #   • Panel views (panel: true) legally allow only one root
+                #     card — several siblings throw "panel view can only show
+                #     1 card".
+                #   • Masonry views (panel: false) distribute top-level cards
+                #     across columns by a height-balancing pass. The per-device
+                #     conditionals land in different columns, so the *visible*
+                #     device's cards jump position when you switch devices.
+                # One vertical-stack root pins the layout: picker on top, the
+                # selected device's stack below, identical for every device.
+                view["cards"] = [{"type": "vertical-stack", "cards": multiplied}]
+            elif "sections" in view:  # sections layout
+                picker_section = {"type": "grid", "cards": [_picker_card()]}
+                new_sections = [picker_section]
+                for sec in view["sections"]:
+                    sec["cards"] = _conditionalize(sec.get("cards", []), devices)
+                    new_sections.append(sec)
+                view["sections"] = new_sections
+            else:
+                print(f"  NOTE: view {view.get('title')!r} has neither cards nor "
+                      f"sections; left unwrapped (placeholders will remain).")
+
+    body = yaml.safe_dump(doc, sort_keys=False, allow_unicode=True, width=4096)
+    return gen_header(src.relative_to(ROOT).as_posix(), manifest_rel, len(devices)) + "\n" + body
+
+
+def check_unsubstituted(path: Path) -> list:
+    text = path.read_text(encoding="utf-8")
+    return sorted(set(re.findall(r"<<[A-Z_]+>>", text)))
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Regenerate irrigoto HA config from the fleet manifest.")
+    ap.add_argument("--manifest", default=str(ROOT / "homeassistant" / "devices.yaml"))
+    ap.add_argument("--check", action="store_true",
+                    help="after writing, fail if any <<PLACEHOLDER>> remains")
+    args = ap.parse_args()
+
+    manifest_path = Path(args.manifest)
+    manifest_rel = manifest_path.relative_to(ROOT).as_posix() if manifest_path.is_absolute() \
+        and ROOT in manifest_path.parents else str(manifest_path)
+    devices = load_manifest(manifest_path)
+
+    OUT_PACKAGES.mkdir(parents=True, exist_ok=True)
+    OUT_DASHBOARDS.mkdir(parents=True, exist_ok=True)
+    written = []
+
+    # Shared package files, once.
+    for src, dst in [
+        (PACKAGES / "irrigoto_common.yaml", OUT_PACKAGES / "irrigoto_common.yaml"),
+        (PACKAGES / "irrigoto_schedule.yaml", OUT_PACKAGES / "irrigoto_schedule.yaml"),
+    ]:
+        if not src.exists():
+            print(f"  skip (missing template): {src.relative_to(ROOT).as_posix()}")
+            continue
+        dst.write_text(render_once(src, devices, manifest_rel), encoding="utf-8")
+        written.append(dst)
+        print(f"  wrote {dst.relative_to(ROOT).as_posix()}")
+
+    # Dashboard: structural multiplication (picker + per-device conditionals).
+    dash_src = DASHBOARDS / "irrigoto.yaml"
+    if dash_src.exists():
+        dash_dst = OUT_DASHBOARDS / "irrigoto.yaml"
+        dash_dst.write_text(render_dashboard(dash_src, devices, manifest_rel), encoding="utf-8")
+        written.append(dash_dst)
+        print(f"  wrote {dash_dst.relative_to(ROOT).as_posix()}")
+
+    # Per-device. Filename uses the UNDERSCORE slug: HA's !include_dir_named
+    # turns each filename into a package name, which must be a valid slug
+    # (no dashes), so irrigoto_device_irrigoto-ab12cd.yaml would be rejected.
+    dev_src = PACKAGES / "irrigoto_device.yaml"
+    for dev in devices:
+        dst = OUT_PACKAGES / f"irrigoto_device_{dev['usc']}.yaml"
+        dst.write_text(render_device(dev_src, dev, manifest_rel), encoding="utf-8")
+        written.append(dst)
+        print(f"  wrote {dst.relative_to(ROOT).as_posix()}")
+
+    # Remove stale per-device files for slugs no longer in the manifest, so
+    # the output folder is always a faithful 1:1 copy of the current fleet.
+    current = {p.name for p in written}
+    for p in OUT_PACKAGES.glob("irrigoto_device_*.yaml"):
+        if p.name not in current:
+            p.unlink()
+            print(f"  removed stale (device no longer in manifest): "
+                  f"{p.relative_to(ROOT).as_posix()}")
+
+    problems = {}
+    for p in written:
+        leftover = check_unsubstituted(p)
+        if leftover:
+            problems[p] = leftover
+    if problems:
+        print("\nWARNING: unsubstituted placeholders remain:")
+        for p, toks in problems.items():
+            print(f"  {p.relative_to(ROOT).as_posix()}: {', '.join(toks)}")
+        if args.check:
+            sys.exit(1)
+
+    names = ", ".join(f'{d["name"]} ({d["slug"]})' for d in devices)
+    print(f"\ndone - {len(devices)} device(s): {names}")
+    print(f"Copy {OUT_PACKAGES.relative_to(ROOT).as_posix()}/*.yaml -> your HA config/packages/")
+    print(f"and  {(OUT_DASHBOARDS / 'irrigoto.yaml').relative_to(ROOT).as_posix()} -> your Irrigoto dashboard's raw config.")
+
+
+if __name__ == "__main__":
+    main()

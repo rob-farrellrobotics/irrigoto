@@ -1,0 +1,190 @@
+# irrigoto — Schedule card snippet
+#
+# Drop into any dashboard: open the dashboard, three-dot menu →
+# "Edit dashboard" → click "+ ADD CARD" → "Manual" → paste the
+# desired top-level card from below.
+#
+# Replace <<DEV_USC>> with your underscored device slug (e.g.
+# irrigoto_xxxxxx) and <<DEV_DASH>> with the dashed form. The entity-
+# id prefix construction is explained in homeassistant/README.md.
+
+# ── Card A: Schedule overview (next run, delay, last update) ─────────
+type: entities
+title: Schedule
+show_header_toggle: false
+entities:
+  - entity: sensor.<<DEV_USC>>_irrigoto_next_scheduled_run
+    name: Next run
+    icon: mdi:clock-outline
+  - entity: sensor.<<DEV_USC>>_irrigoto_schedule_delay
+    name: Rain delay
+    icon: mdi:weather-pouring
+  - entity: sensor.<<DEV_USC>>_irrigoto_last_schedule_update
+    name: Last update
+    icon: mdi:calendar-check-outline
+  - entity: input_text.<<DEV_USC>>_schedule_mirror
+    name: Live schedule
+    icon: mdi:calendar-text
+
+# ── Card B: Rain delay quick buttons (paste as a separate card) ──────
+# Pair with the conditional below; the conditional flips visibility
+# based on whether a delay is currently active.
+#
+# type: conditional
+# conditions:
+#   - entity: sensor.<<DEV_USC>>_irrigoto_schedule_delay
+#     state: "off"
+# card:
+#   type: horizontal-stack
+#   cards:
+#     - type: button
+#       name: Delay 6h
+#       icon: mdi:timer-sand
+#       tap_action:
+#         action: perform-action
+#         perform_action: esphome.<<DEV_USC>>_delay_schedule_hours
+#         data:
+#           hours: 6
+#     - type: button
+#       name: Delay 24h
+#       icon: mdi:timer-sand
+#       tap_action:
+#         action: perform-action
+#         perform_action: esphome.<<DEV_USC>>_delay_schedule_hours
+#         data:
+#           hours: 24
+#     - type: button
+#       name: Delay 48h
+#       icon: mdi:timer-sand
+#       tap_action:
+#         action: perform-action
+#         perform_action: esphome.<<DEV_USC>>_delay_schedule_hours
+#         data:
+#           hours: 48
+#
+# type: conditional
+# conditions:
+#   - entity: sensor.<<DEV_USC>>_irrigoto_schedule_delay
+#     state_not: "off"
+# card:
+#   type: button
+#   name: Cancel rain delay
+#   icon: mdi:close-circle-outline
+#   tap_action:
+#     action: perform-action
+#     perform_action: esphome.<<DEV_USC>>_delay_schedule_hours
+#     data:
+#       hours: 0
+
+# ── Card C: HA-side schedule (per device) ────────────────────────────
+# b355: edits flow bidirectionally between HA's per-slot input_texts
+# and the device's NVS schedule. Edit either surface — the reconciler
+# automation in irrigoto.yaml uses sync_schedule with per-entry IDs +
+# last_modified to merge both sides; LWW resolves conflicts, device
+# wins on tie. Three sub-cards: a decoded human-readable view of
+# the HA-side schedule, an action row, and a status block with both
+# pending indicators. Paste each as a SEPARATE Manual card.
+
+# ── Card C-View: Decoded desired schedule (markdown) ─────────────────
+# (When copying into HA's Manual card editor, copy from `type:` down --
+# the leading `---` is a YAML document separator that keeps this
+# snippets file syntactically valid; HA accepts it either way but it's
+# cleaner to omit.)
+---
+type: markdown
+title: HA-side schedule
+content: |
+  {% set entries = state_attr('sensor.irrigoto_desired_schedule', 'entries') | default([], true) -%}
+  {%- set err = state_attr('sensor.irrigoto_desired_schedule', 'error') -%}
+  {%- if err -%}
+  **Parse error:** `{{ err }}`
+  {%- elif entries | count == 0 -%}
+  _No HA-side schedule set. Use the compose form (further down) to save entries
+  to slots; the reconciler will sync them to the device on its next wake._
+  {%- else -%}
+  | # | Device | ID | Zone | Mode | Depth | Time | Days | On | Last modified |
+  |---|--------|----|------|------|-------|------|------|----|---------------|
+  {% for e in entries -%}
+  | {{ loop.index }} | {{ e.device }} | {{ e.id if e.id else 'new' }} | {{ e.zone }} | {{ e.mode }} | {{ e.depth }} | {{ e.time }} | {{ e.days if e.days is string else (e.days | join(', ')) }} | {{ '✓' if e.enabled else '✗' }} | {{ (e.last_modified | as_datetime | as_local).strftime('%Y-%m-%d %H:%M') if (e.last_modified | int(0)) > 1700000000 else '—' }} |
+  {% endfor -%}
+  {%- endif %}
+
+# ── Card C-Action: push / open device editor ─────────────────────────
+---
+type: horizontal-stack
+cards:
+  - type: button
+    name: Push to <<DEV_DASH>>
+    icon: mdi:upload
+    tap_action:
+      action: perform-action
+      perform_action: script.<<DEV_USC>>_push_schedule
+  - type: button
+    name: Open device editor
+    icon: mdi:open-in-new
+    tap_action:
+      action: url
+      url_path: <<DEV_URL>>/schedule
+
+# ── Card C-Status: per-device pending + overlap status ───────────────
+# b355: BOTH directions surfaced. Outbound = HA has changes to push;
+# inbound = device's schedule_version moved ahead of HA's last_seen.
+---
+type: entities
+title: Schedule status (<<DEV_DASH>>)
+show_header_toggle: false
+entities:
+  - entity: sensor.irrigoto_desired_schedule
+    name: Desired (count)
+    secondary_info: last-updated
+  - entity: sensor.irrigoto_schedule_overlap_status
+    name: Cross-device overlap
+    secondary_info: last-updated
+  - entity: input_boolean.irrigoto_schedule_overlap_override
+    name: Push anyway on conflict
+  - entity: sensor.<<DEV_USC>>_schedule_pending_outbound
+    name: Push to device (HA → device)
+    secondary_info: last-updated
+  - entity: sensor.<<DEV_USC>>_schedule_pending_inbound
+    name: Pull from device (device → HA)
+    secondary_info: last-updated
+  - entity: sensor.<<DEV_USC>>_desired_rendered
+    name: This device's slice
+    icon: mdi:calendar-arrow-right
+  - entity: sensor.<<DEV_USC>>_schedule_full
+    name: This device reports
+    icon: mdi:calendar-text
+  # b358: device's schedule_version is now an attribute on
+  # schedule_full (the standalone text_sensor was retired with b357's
+  # service trim to stop the API send-buffer overflow).
+  - type: attribute
+    entity: sensor.<<DEV_USC>>_schedule_full
+    attribute: schedule_version
+    name: Device schedule_version
+    icon: mdi:counter
+  - entity: input_text.<<DEV_USC>>_last_seen_schedule_version
+    name: HA last-seen version
+    icon: mdi:counter
+
+# ── Card D: Pending-status conditional warning ───────────────────────
+# Renders only when a push is in progress or has failed. Pair with
+# Card C so the user gets a prominent visual when something is off.
+#
+# type: conditional
+# conditions:
+#   - entity: sensor.<<DEV_USC>>_schedule_pending_outbound
+#     state_not: synced
+#   - entity: sensor.<<DEV_USC>>_schedule_pending_outbound
+#     state_not: disabled
+# card:
+#   type: markdown
+#   content: >
+#     ### Schedule out of sync
+#
+#     **<<DEV_DASH>>**: {{ states('sensor.<<DEV_USC>>_schedule_pending_outbound') }}
+#
+#     sync_count: {{ state_attr('sensor.<<DEV_USC>>_desired_rendered',
+#                               'sync_count') }}
+#
+#     Last push status: {{ state_attr('sensor.<<DEV_USC>>_schedule_pending_outbound',
+#                                     'last_push_status') }}

@@ -1,0 +1,11 @@
+# Name,   Type, SubType, Offset,  Size, Flags
+# ota_0 must start at 0x10000 because ESPHome hardcodes that offset for
+# firmware.bin in its esptool invocation (esphome/__main__.py:748).
+# nvs shrunk from 0x6000 to 0x4000 to make room for otadata before 0x10000.
+# phy_init partition dropped — CONFIG_ESP_PHY_INIT_DATA_IN_PARTITION is off,
+# so PHY init data lives in the bootloader and no partition is required.
+nvs,      data, nvs,     0x9000,  0x4000,
+otadata,  data, ota,     0xd000,  0x2000,
+ota_0,    app,  ota_0,   0x10000, 0x1E0000,
+ota_1,    app,  ota_1,   0x1F0000,0x1E0000,
+littlefs, data, spiffs,  0x3D0000,0x80000,
