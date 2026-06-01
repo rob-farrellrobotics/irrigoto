@@ -1,0 +1,789 @@
+# irrigoto — Home Assistant scheduling package (shared, device-agnostic)
+#
+# Shared across the whole fleet — installed once. tools/ha-regen.py writes
+# generated/packages/irrigoto_schedule.yaml (filling the compose-form device
+# dropdown from devices.yaml); drop that alongside the common + per-device
+# files in your HA config/packages/ directory.
+# >>>STRIP-ON-REGEN-START<<<
+# The only per-fleet substitution here is the compose-form device list
+# (<<DEVICE_SLUG_OPTIONS>> / <<FIRST_DEVICE_SLUG>>); everything else is
+# literal and shared across all irrigoto devices.
+# >>>STRIP-ON-REGEN-END<<<
+#
+# STORAGE: pure HA helpers, no files
+# ──────────────────────────────────
+# Schedule entries live in 10 per-slot input_text helpers
+# (input_text.irrigoto_sched_1 .. _10). b355: each slot now carries the
+# entry's device-side ID + last_modified epoch so HA and the device can
+# reconcile by ID via the new sync_schedule service (see
+# docs/schedule_sync_design.md):
+#
+#   0,1716759600,irrigoto-xxxxxx|2,2,0,6,30,127,1
+#   | |          |               | | | | | |   enabled (0|1)
+#   | |          |               | | | | | days_mask (127 = all days, bit0=Sun..bit6=Sat)
+#   | |          |               | | | | minute
+#   | |          |               | | | hour
+#   | |          |               | | depth (eighths of an inch, 1..8 = 1/8".. 1")
+#   | |          |               | mode (0 = Pulse, 1 = Gentle, 2 = Smooth)
+#   | |          |               zone (1-based)
+#   | |          device slug
+#   | last_modified (unix epoch when this slot was last saved by HA)
+#   id  device-assigned ID. 0 = "new, device will allocate on next sync"
+#
+# Empty string = slot unused. sensor.irrigoto_desired_schedule
+# aggregates non-empty slots into the same shape downstream code
+# already consumes (entries list + per_device dict). No command_line,
+# no YAML file, no File Editor add-on needed.
+#
+# MIGRATION FROM THE OLD SLOT FORMAT (pre-b355)
+# Slots saved in the old `<dev-slug>|<zone>,...` format are parsed as
+# id=0, last_modified=0 — the reconciler treats them as new, so the
+# device assigns IDs on the first sync. No manual rewrite needed.
+#
+# EDIT FORM (compose helpers + scripts)
+# ─────────────────────────────────────
+# Form helpers (compose_*) hold the values being edited:
+#   compose_device   device-slug select
+#   compose_zone     1..8
+#   compose_mode     Pulse | Gentle | Smooth
+#   compose_depth    1/8" .. 1" (eighths)
+#   compose_time     time picker
+#   compose_days     Daily | Weekdays | Weekends | MWF | TTh | each
+#                    individual day | Custom (raw mask below)
+#   compose_days_custom 0..127 raw mask, used when compose_days = Custom
+#   compose_enabled  on | off
+#   compose_slot     1..10 -- which slot to save into / load from
+#
+# Scripts wire the form to the slots:
+#   compose_save_to_slot    serialize compose_* → slot N
+#   compose_load_from_slot  parse slot N → compose_* (for editing existing)
+#   compose_clear_slot      empty slot N
+#   compose_clear_all       empty all slots
+#
+# DEVICE STATE
+# ────────────
+# The device's currently-stored schedule is captured by the per-device
+# sensor.<dev>_schedule_full (trigger template sensor on the
+# schedule_changed event in irrigoto.yaml). Its `canonical` attribute
+# holds the full sorted CSV; the dashboard's "Device's current schedule"
+# markdown card decodes it into a human-readable table. No file or
+# helper script needed for this -- everything is in HA state.
+
+# ── Per-slot schedule storage ────────────────────────────────────────
+# b355: slots now carry id + last_modified prefix, ~24 extra chars; bumped
+# max to 128 so even devices with long slug names (irrigoto-xxxxxx + a
+# couple-of-digit zone) fit comfortably.
+input_text:
+  irrigoto_sched_1:  {name: "irrigoto schedule slot 1",  max: 128, initial: ""}
+  irrigoto_sched_2:  {name: "irrigoto schedule slot 2",  max: 128, initial: ""}
+  irrigoto_sched_3:  {name: "irrigoto schedule slot 3",  max: 128, initial: ""}
+  irrigoto_sched_4:  {name: "irrigoto schedule slot 4",  max: 128, initial: ""}
+  irrigoto_sched_5:  {name: "irrigoto schedule slot 5",  max: 128, initial: ""}
+  irrigoto_sched_6:  {name: "irrigoto schedule slot 6",  max: 128, initial: ""}
+  irrigoto_sched_7:  {name: "irrigoto schedule slot 7",  max: 128, initial: ""}
+  irrigoto_sched_8:  {name: "irrigoto schedule slot 8",  max: 128, initial: ""}
+  irrigoto_sched_9:  {name: "irrigoto schedule slot 9",  max: 128, initial: ""}
+  irrigoto_sched_10: {name: "irrigoto schedule slot 10", max: 128, initial: ""}
+  # Custom days mask shown in compose form when compose_days = Custom.
+  # input_number can't be used (we need it free-form 0..127); using
+  # input_text + cast-to-int in the save script.
+  irrigoto_compose_days_custom:
+    name: "irrigoto compose: custom days_mask"
+    max: 3
+    initial: "127"
+
+# ── Form / compose helpers ───────────────────────────────────────────
+input_select:
+  irrigoto_compose_device:
+    name: "irrigoto compose: device"
+    icon: mdi:chip
+    # Options are the device dash-slugs from homeassistant/devices.yaml,
+    # filled in by tools/ha-regen.py. The save script writes the selected
+    # slug as the slot's device prefix; the per-device renderer in
+    # irrigoto_device.yaml matches on that slug. Add a device to the
+    # manifest and re-run regen to extend this list.
+    options:
+      <<DEVICE_SLUG_OPTIONS>>
+    initial: "<<FIRST_DEVICE_SLUG>>"
+
+  irrigoto_compose_zone:
+    name: "irrigoto compose: zone"
+    icon: mdi:sprinkler-variant
+    options: ["1", "2", "3", "4", "5", "6", "7", "8"]
+    initial: "1"
+
+  irrigoto_compose_mode:
+    name: "irrigoto compose: mode"
+    icon: mdi:water-pump
+    options: [Pulse, Gentle, Smooth]
+    initial: Smooth
+
+  irrigoto_compose_depth:
+    name: "irrigoto compose: depth"
+    icon: mdi:cup-water
+    options: ['1/8"', '1/4"', '3/8"', '1/2"', '5/8"', '3/4"', '7/8"', '1"']
+    initial: '1/8"'
+
+  irrigoto_compose_days:
+    name: "irrigoto compose: days"
+    icon: mdi:calendar-week
+    options:
+      - Daily
+      - Weekdays
+      - Weekends
+      - MWF
+      - TTh
+      - Sun
+      - Mon
+      - Tue
+      - Wed
+      - Thu
+      - Fri
+      - Sat
+      - Custom
+    initial: Daily
+
+input_number:
+  irrigoto_compose_slot:
+    name: "irrigoto compose: slot to save/load"
+    icon: mdi:numeric
+    min: 1
+    max: 10
+    step: 1
+    initial: 1
+    mode: slider
+
+input_datetime:
+  irrigoto_compose_time:
+    name: "irrigoto compose: time"
+    icon: mdi:clock-outline
+    has_date: false
+    has_time: true
+
+input_boolean:
+  irrigoto_compose_enabled:
+    name: "irrigoto compose: enabled"
+    icon: mdi:toggle-switch-outline
+    initial: true
+  # Override the cross-device overlap gate.
+  irrigoto_schedule_overlap_override:
+    name: "irrigoto schedule overlap override"
+    icon: mdi:alert-octagon-outline
+    initial: false
+  # b355: the old `irrigoto_schedule_merge_mode` toggle has been retired
+  # — the ID-based sync model preserves device-side entries unconditionally
+  # (entries the device has whose IDs HA doesn't mention are left alone),
+  # so the "merge vs replace" choice is no longer meaningful. If your
+  # automations referenced this helper, drop the reference.
+
+# ── Scripts ──────────────────────────────────────────────────────────
+script:
+  # Serialize the compose form into a CSV entry and write to slot N.
+  # Overwrites whatever was in slot N.
+  #
+  # b355: slot format now carries id + last_modified prefix:
+  #   <id>,<lm>,<dev>|<zone>,<mode>,<depth>,<hour>,<minute>,<days_mask>,<enabled>
+  # When editing an existing slot we KEEP the prior id so the device
+  # treats it as an update to the same entry (LWW by last_modified).
+  # When saving to an empty slot the id is 0 — sentinel for "device,
+  # please allocate one on the next sync." last_modified is always set
+  # to now() so the reconciler's outbound state machine flags this slot
+  # as fresher than the device's view.
+  irrigoto_compose_save_to_slot:
+    alias: "irrigoto: save compose form to slot"
+    icon: mdi:content-save-outline
+    mode: single
+    sequence:
+      - variables:
+          slot: "{{ states('input_number.irrigoto_compose_slot') | int(1) }}"
+          prev_raw: >-
+            {{ states('input_text.irrigoto_sched_' ~ slot) | default('', true) | trim }}
+          # Extract the prior id if the slot was already populated in the
+          # new format. Defensive against legacy slots (id stays 0 so the
+          # device allocates on first sync).
+          prev_id: >-
+            {%- if ',' in prev_raw and '|' in prev_raw -%}
+              {%- set head = prev_raw.split('|', 1)[0] -%}
+              {%- if ',' in head and head.split(',') | length >= 2 -%}
+                {{ head.split(',')[0] | int(0) }}
+              {%- else -%}0{%- endif -%}
+            {%- else -%}0{%- endif -%}
+          dev: "{{ states('input_select.irrigoto_compose_device') }}"
+          # b359: option format is "<name> (#<id>)" (e.g. "N3 (#3)") when
+          # the zone dropdown was populated from the device. Extract the
+          # numeric id from the "(#N)" suffix. Falls back to int-parsing
+          # the whole string if no "(#" present (legacy "1".."8" options).
+          zone: >-
+            {%- set sel = states('input_select.irrigoto_compose_zone') -%}
+            {%- if '(#' in sel and ')' in sel -%}
+              {{ sel.split('(#')[1].split(')')[0] | int(0) }}
+            {%- else -%}
+              {{ sel | int(0) }}
+            {%- endif -%}
+          mode_int: >-
+            {{ {'Pulse':0,'Gentle':1,'Smooth':2}.get(
+                  states('input_select.irrigoto_compose_mode'), 2) }}
+          depth_int: >-
+            {{ {'1/8"':1,'1/4"':2,'3/8"':3,'1/2"':4,
+                '5/8"':5,'3/4"':6,'7/8"':7,'1"':8}.get(
+                  states('input_select.irrigoto_compose_depth'), 1) }}
+          t: "{{ states('input_datetime.irrigoto_compose_time') | default('06:30:00') }}"
+          hour: "{{ t.split(':')[0] | int(0) }}"
+          minute: "{{ t.split(':')[1] | int(0) }}"
+          days_choice: "{{ states('input_select.irrigoto_compose_days') }}"
+          days_mask: >-
+            {%- set presets = {
+              'Daily': 127, 'Weekdays': 62, 'Weekends': 65,
+              'MWF': 42, 'TTh': 20,
+              'Sun': 1, 'Mon': 2, 'Tue': 4, 'Wed': 8,
+              'Thu': 16, 'Fri': 32, 'Sat': 64
+            } -%}
+            {%- if days_choice in presets -%}
+              {{ presets[days_choice] }}
+            {%- else -%}
+              {{ states('input_text.irrigoto_compose_days_custom') | int(127) }}
+            {%- endif -%}
+          enabled_int: "{{ 1 if is_state('input_boolean.irrigoto_compose_enabled', 'on') else 0 }}"
+          lm: "{{ now().timestamp() | int(0) }}"
+          entry: >-
+            {{ prev_id }},{{ lm }},{{ dev }}|{{ zone }},{{ mode_int }},{{
+            depth_int }},{{ hour }},{{ minute }},{{ days_mask }},{{ enabled_int }}
+      - action: input_text.set_value
+        target:
+          entity_id: "input_text.irrigoto_sched_{{ slot }}"
+        data:
+          value: "{{ entry }}"
+      - action: logbook.log
+        data:
+          name: irrigoto
+          message: "saved compose form to slot {{ slot }}: {{ entry }}"
+          domain: sensor
+          entity_id: sensor.irrigoto_activity_log
+
+  # Read slot N and populate the compose form. Lets the user "edit
+  # entry N" by loading -> tweaking -> saving back to the same slot.
+  #
+  # b355: handles both the new format (id,lm,dev|csv) and the legacy
+  # one (dev|csv) — the new prefix is detected by ',' appearing in
+  # the head before '|'. Legacy slots will be promoted on the next save.
+  #
+  # b358: accepts a `quiet` field (defaults to false). When true, an
+  # empty-slot load is a silent no-op instead of a persistent_notification
+  # popup — used by the auto-load-on-slot-change automation below so
+  # scrolling past an empty slot doesn't spam notifications.
+  irrigoto_compose_load_from_slot:
+    alias: "irrigoto: load slot into compose form"
+    icon: mdi:download-outline
+    mode: single
+    fields:
+      quiet:
+        description: "If true, silently skip empty slots instead of notifying."
+        example: "false"
+    sequence:
+      - variables:
+          slot: "{{ states('input_number.irrigoto_compose_slot') | int(1) }}"
+          raw: "{{ states('input_text.irrigoto_sched_' ~ slot) | default('', true) }}"
+          quiet_bool: "{{ quiet | default(false) | bool(false) }}"
+      - if:
+          - condition: template
+            value_template: "{{ '|' not in raw }}"
+        then:
+          - if:
+              - condition: template
+                value_template: "{{ not quiet_bool }}"
+            then:
+              - action: persistent_notification.create
+                data:
+                  title: "irrigoto: load skipped"
+                  message: "Slot {{ slot }} is empty -- nothing to load."
+          - stop: "empty slot"
+      # b358: parse the slot in a single namespace render — between-step
+      # variables can come back as HA TupleWrapper objects, which break
+      # subsequent `.split()` chains ("'TupleWrapper object' has no
+      # attribute 'split'"). Doing the whole parse here and forcing each
+      # output through `| string` / `| int` keeps everything plain.
+      - variables:
+          parsed: >-
+            {%- set raw_s = raw | string -%}
+            {%- set bar = raw_s.find('|') -%}
+            {%- set head_s = raw_s[:bar] -%}
+            {%- set csv_s  = raw_s[bar+1:] -%}
+            {%- set hf = head_s.split(',') -%}
+            {%- if hf | length >= 2 -%}
+              {%- set dev_v = hf[2:] | join(',') -%}
+            {%- else -%}
+              {%- set dev_v = head_s -%}
+            {%- endif -%}
+            {%- set f = csv_s.split(',') -%}
+            {%- set MODES = ['Pulse','Gentle','Smooth'] -%}
+            {%- set DEPTHS = {1:'1/8"',2:'1/4"',3:'3/8"',4:'1/2"',5:'5/8"',6:'3/4"',7:'7/8"',8:'1"'} -%}
+            {%- set INV = {
+              127: 'Daily', 62: 'Weekdays', 65: 'Weekends',
+              42: 'MWF', 20: 'TTh',
+              1: 'Sun', 2: 'Mon', 4: 'Tue', 8: 'Wed',
+              16: 'Thu', 32: 'Fri', 64: 'Sat'
+            } -%}
+            {%- set mask_v = f[5] | int(0) -%}
+            {{ {
+              'dev': dev_v | string,
+              'zone': f[0] | string,
+              'mode_name': MODES[f[1] | int(0)],
+              'depth_name': DEPTHS.get(f[2] | int(0), '1/8"'),
+              'hour_s': '%02d' | format(f[3] | int(0)),
+              'minute_s': '%02d' | format(f[4] | int(0)),
+              'mask': mask_v,
+              'days_name': INV.get(mask_v, 'Custom'),
+              'enabled_state': 'on' if (f[6] | int(0)) == 1 else 'off'
+            } }}
+          dev: "{{ parsed.dev }}"
+          mode_name: "{{ parsed.mode_name }}"
+          depth_name: "{{ parsed.depth_name }}"
+          hour_s: "{{ parsed.hour_s }}"
+          minute_s: "{{ parsed.minute_s }}"
+          mask: "{{ parsed.mask }}"
+          days_name: "{{ parsed.days_name }}"
+          enabled_state: "{{ parsed.enabled_state }}"
+          zone_s: "{{ parsed.zone }}"
+      - action: input_select.select_option
+        target:
+          entity_id: input_select.irrigoto_compose_device
+        data:
+          option: "{{ dev }}"
+        continue_on_error: true
+      # b359: stored slot has zone as a number (e.g. "3"). The compose
+      # zone dropdown is now populated with "<name> (#<id>)" options
+      # (e.g. "N3 (#3)"). Find the option whose "(#N)" suffix matches
+      # the stored zone number; fall back to the raw number for legacy
+      # dropdowns.
+      - variables:
+          zone_option: >-
+            {%- set zone_n = zone_s | string -%}
+            {%- set opts = state_attr('input_select.irrigoto_compose_zone', 'options')
+                            | default([], true) -%}
+            {%- set ns = namespace(match=zone_n) -%}
+            {%- for o in opts -%}
+              {%- if o.endswith('(#' ~ zone_n ~ ')') or o == zone_n -%}
+                {%- set ns.match = o -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {{ ns.match }}
+      - action: input_select.select_option
+        target:
+          entity_id: input_select.irrigoto_compose_zone
+        data:
+          option: "{{ zone_option }}"
+        continue_on_error: true
+      - action: input_select.select_option
+        target:
+          entity_id: input_select.irrigoto_compose_mode
+        data:
+          option: "{{ mode_name }}"
+        continue_on_error: true
+      - action: input_select.select_option
+        target:
+          entity_id: input_select.irrigoto_compose_depth
+        data:
+          option: "{{ depth_name }}"
+        continue_on_error: true
+      - action: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.irrigoto_compose_time
+        data:
+          time: "{{ hour_s ~ ':' ~ minute_s ~ ':00' }}"
+      - action: input_select.select_option
+        target:
+          entity_id: input_select.irrigoto_compose_days
+        data:
+          option: "{{ days_name }}"
+        continue_on_error: true
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.irrigoto_compose_days_custom
+        data:
+          value: "{{ mask | string }}"
+      # b359: replaced an if/then/else around input_boolean.turn_on /
+      # turn_off with a single templated action. Some HA versions don't
+      # execute the else branch reliably inside scripts called via
+      # `action:` from another automation (the autoload firing this).
+      # Templating the action name avoids the conditional entirely.
+      - action: "input_boolean.turn_{{ enabled_state }}"
+        target: {entity_id: input_boolean.irrigoto_compose_enabled}
+
+  # Empty the slot selected in input_number.irrigoto_compose_slot, and
+  # reset the compose form to its defaults so the user lands on a
+  # clean slate ready to fill in something new.
+  irrigoto_compose_clear_slot:
+    alias: "irrigoto: clear selected slot"
+    icon: mdi:close-circle-outline
+    mode: single
+    sequence:
+      - action: input_text.set_value
+        target:
+          entity_id: >-
+            input_text.irrigoto_sched_{{
+              states('input_number.irrigoto_compose_slot') | int(1)
+            }}
+        data:
+          value: ""
+      # b359: also reset the compose form to defaults. Without this the
+      # form keeps showing whatever was last loaded, which is confusing
+      # after the slot is empty.
+      - action: input_select.select_first
+        target: {entity_id: input_select.irrigoto_compose_zone}
+      - action: input_select.select_option
+        target: {entity_id: input_select.irrigoto_compose_mode}
+        data: {option: Smooth}
+        continue_on_error: true
+      - action: input_select.select_option
+        target: {entity_id: input_select.irrigoto_compose_depth}
+        data: {option: '1/8"'}
+        continue_on_error: true
+      - action: input_datetime.set_datetime
+        target: {entity_id: input_datetime.irrigoto_compose_time}
+        data: {time: "06:00:00"}
+      - action: input_select.select_option
+        target: {entity_id: input_select.irrigoto_compose_days}
+        data: {option: Daily}
+        continue_on_error: true
+      - action: input_text.set_value
+        target: {entity_id: input_text.irrigoto_compose_days_custom}
+        data: {value: "127"}
+      - action: input_boolean.turn_on
+        target: {entity_id: input_boolean.irrigoto_compose_enabled}
+      - action: logbook.log
+        data:
+          name: irrigoto
+          message: >-
+            cleared slot {{ states('input_number.irrigoto_compose_slot') | int(1) }}
+          domain: sensor
+          entity_id: sensor.irrigoto_activity_log
+
+  # Empty ALL slots (nuclear option).
+  irrigoto_compose_clear_all:
+    alias: "irrigoto: clear all schedule slots"
+    icon: mdi:delete-sweep-outline
+    mode: single
+    sequence:
+      - repeat:
+          count: 10
+          sequence:
+            - action: input_text.set_value
+              target:
+                entity_id: "input_text.irrigoto_sched_{{ repeat.index }}"
+              data:
+                value: ""
+      - action: logbook.log
+        data:
+          name: irrigoto
+          message: "cleared all 10 schedule slots"
+          domain: sensor
+          entity_id: sensor.irrigoto_activity_log
+
+# ── Aggregated desired-schedule sensor ───────────────────────────────
+# Parses 10 per-slot input_texts into entries + per_device dict.
+# Same shape downstream code (per-device renderer / reconciler /
+# overlap validator) already consumes.
+#
+# b355: slots now carry id + last_modified prefix. The aggregator:
+#   - extracts (id, last_modified) per slot, defaulting to (0, now()) for
+#     legacy-format slots so they migrate cleanly on the next push;
+#   - exposes per_device_entries: dict of dev-slug → list of entry dicts
+#     with id, last_modified, zone, mode, depth, hour, minute,
+#     days_mask, enabled. The reconciler builds the sync_schedule wire
+#     format from this — see the per-device push_schedule script
+#     in irrigoto.yaml.
+#   - per_device (legacy, kept for back-compat) is now the SAME canonical
+#     7-field CSV the old set_schedule path consumed (no id / lm), so
+#     other automations don't need to migrate yet.
+template:
+  - sensor:
+      - name: irrigoto desired schedule
+        unique_id: irrigoto_desired_schedule
+        unit_of_measurement: entries
+        icon: mdi:calendar-edit
+        state: >-
+          {%- set ns = namespace(c=0) -%}
+          {%- for i in range(1, 11) -%}
+            {%- set s = states('input_text.irrigoto_sched_' ~ i) | default('', true) | trim -%}
+            {%- if s != '' and '|' in s -%}{%- set ns.c = ns.c + 1 -%}{%- endif -%}
+          {%- endfor -%}
+          {{ ns.c }}
+        attributes:
+          error: ""
+          entries: >-
+            {%- set MODES = ['Pulse','Gentle','Smooth'] -%}
+            {%- set DEPTHS = {1:'1/8"',2:'1/4"',3:'3/8"',4:'1/2"',5:'5/8"',6:'3/4"',7:'7/8"',8:'1"'} -%}
+            {%- set PRESETS = {127:'Daily', 62:'Weekdays', 65:'Weekends', 42:'MWF', 20:'TTh',
+                                1:'Sun', 2:'Mon', 4:'Tue', 8:'Wed', 16:'Thu', 32:'Fri', 64:'Sat'} -%}
+            {%- set DLET = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'] -%}
+            {%- set ns = namespace(entries=[]) -%}
+            {%- for i in range(1, 11) -%}
+              {%- set raw = states('input_text.irrigoto_sched_' ~ i) | default('', true) | trim -%}
+              {%- if raw != '' and '|' in raw -%}
+                {%- set head = raw.split('|', 1)[0] -%}
+                {%- set csv = raw.split('|', 1)[1] -%}
+                {%- set is_new = (',' in head) and (head.split(',') | length >= 2) -%}
+                {%- if is_new -%}
+                  {%- set hf = head.split(',') -%}
+                  {%- set entry_id = hf[0] | int(0) -%}
+                  {%- set entry_lm = hf[1] | int(0) -%}
+                  {%- set dev = hf[2:] | join(',') -%}
+                {%- else -%}
+                  {%- set entry_id = 0 -%}
+                  {%- set entry_lm = 0 -%}
+                  {%- set dev = head -%}
+                {%- endif -%}
+                {%- set f = csv.split(',') -%}
+                {%- if f | length >= 7 -%}
+                  {%- set mask = f[5] | int(0) -%}
+                  {%- if mask in PRESETS -%}
+                    {%- set days_val = PRESETS[mask] -%}
+                  {%- else -%}
+                    {%- set dns = namespace(l=[]) -%}
+                    {%- for b in range(7) -%}
+                      {%- if mask | bitwise_and(2**b) > 0 -%}
+                        {%- set dns.l = dns.l + [DLET[b]] -%}
+                      {%- endif -%}
+                    {%- endfor -%}
+                    {%- set days_val = dns.l -%}
+                  {%- endif -%}
+                  {%- set entry = {
+                    'slot': i,
+                    'id': entry_id,
+                    'last_modified': entry_lm,
+                    'device': dev,
+                    'zone': f[0] | int(0),
+                    'mode': MODES[f[1] | int(0)],
+                    'depth': DEPTHS.get(f[2] | int(0), '1/8"'),
+                    'time': '%02d:%02d' | format(f[3] | int(0), f[4] | int(0)),
+                    'days': days_val,
+                    'enabled': (f[6] | int(0)) == 1
+                  } -%}
+                  {%- set ns.entries = ns.entries + [entry] -%}
+                {%- endif -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {{ ns.entries }}
+          # Legacy: 7-field CSV (no id / lm) per device, kept for older
+          # automations (set_schedule replace-all path).
+          per_device: >-
+            {%- set ns = namespace(pd={}) -%}
+            {%- for i in range(1, 11) -%}
+              {%- set raw = states('input_text.irrigoto_sched_' ~ i) | default('', true) | trim -%}
+              {%- if raw != '' and '|' in raw -%}
+                {%- set head = raw.split('|', 1)[0] -%}
+                {%- set csv = raw.split('|', 1)[1] -%}
+                {%- set is_new = (',' in head) and (head.split(',') | length >= 2) -%}
+                {%- if is_new -%}
+                  {%- set hf = head.split(',') -%}
+                  {%- set dev = hf[2:] | join(',') -%}
+                {%- else -%}
+                  {%- set dev = head -%}
+                {%- endif -%}
+                {%- set existing = ns.pd.get(dev, []) -%}
+                {%- set ns.pd = dict(ns.pd, **{dev: existing + [csv]}) -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {%- set sorted_ns = namespace(pd={}) -%}
+            {%- for dev, csvs in ns.pd.items() -%}
+              {%- set sorted_ns.pd = dict(sorted_ns.pd, **{dev: (csvs | sort | join(';'))}) -%}
+            {%- endfor -%}
+            {{ sorted_ns.pd }}
+          # b355: structured per-device entries with id + last_modified.
+          # Reconciler reads this dict to build the sync_schedule payload.
+          per_device_entries: >-
+            {%- set ns = namespace(pd={}) -%}
+            {%- for i in range(1, 11) -%}
+              {%- set raw = states('input_text.irrigoto_sched_' ~ i) | default('', true) | trim -%}
+              {%- if raw != '' and '|' in raw -%}
+                {%- set head = raw.split('|', 1)[0] -%}
+                {%- set csv = raw.split('|', 1)[1] -%}
+                {%- set is_new = (',' in head) and (head.split(',') | length >= 2) -%}
+                {%- if is_new -%}
+                  {%- set hf = head.split(',') -%}
+                  {%- set entry_id = hf[0] | int(0) -%}
+                  {%- set entry_lm = hf[1] | int(0) -%}
+                  {%- set dev = hf[2:] | join(',') -%}
+                {%- else -%}
+                  {%- set entry_id = 0 -%}
+                  {%- set entry_lm = 0 -%}
+                  {%- set dev = head -%}
+                {%- endif -%}
+                {%- set f = csv.split(',') -%}
+                {%- if f | length >= 7 -%}
+                  {%- set entry = {
+                    'slot': i,
+                    'id': entry_id,
+                    'last_modified': entry_lm,
+                    'zone': f[0] | int(0),
+                    'mode': f[1] | int(0),
+                    'depth': f[2] | int(0),
+                    'hour': f[3] | int(0),
+                    'minute': f[4] | int(0),
+                    'days_mask': f[5] | int(0),
+                    'enabled': f[6] | int(0)
+                  } -%}
+                  {%- set existing = ns.pd.get(dev, []) -%}
+                  {%- set ns.pd = dict(ns.pd, **{dev: existing + [entry]}) -%}
+                {%- endif -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {{ ns.pd }}
+
+      # Cross-device overlap validator -- unchanged logic, reads
+      # entries from sensor.irrigoto_desired_schedule like before.
+      - name: irrigoto schedule overlap status
+        unique_id: irrigoto_schedule_overlap_status
+        icon: >-
+          {%- if states('sensor.irrigoto_schedule_overlap_status') == 'ok' -%}
+            mdi:check-circle-outline
+          {%- elif states('sensor.irrigoto_schedule_overlap_status') | regex_match('^\\d') -%}
+            mdi:alert-octagon-outline
+          {%- else -%}
+            mdi:help-circle-outline
+          {%- endif -%}
+        state: >-
+          {%- set entries = state_attr('sensor.irrigoto_desired_schedule', 'entries') | default([], true) -%}
+          {%- if entries | count == 0 -%}
+            ok
+          {%- else -%}
+            {%- set MODES = {'Pulse':0,'Gentle':1,'Smooth':2} -%}
+            {%- set PRESETS = {'Daily':127,'Weekdays':62,'Weekends':65,'MWF':42,'TTh':20} -%}
+            {%- set DBITS = {'Sun':0,'Mon':1,'Tue':2,'Wed':3,'Thu':4,'Fri':5,'Sat':6} -%}
+            {%- set ns = namespace(items=[], conflicts=[]) -%}
+            {%- for e in entries if e.enabled -%}
+              {%- set mode = MODES.get(e.mode, 2) -%}
+              {%- set depth = {'1/8"':1,'1/4"':2,'3/8"':3,'1/2"':4,'5/8"':5,'3/4"':6,'7/8"':7,'1"':8}.get(e.depth, 1) -%}
+              {%- set base = 30 if mode == 2 else (15 if mode == 1 else 8) -%}
+              {%- set est = base * depth -%}
+              {%- set est_pad = ((est * 110 + 99) // 100) -%}
+              {%- set t = (e.time | string).split(':') -%}
+              {%- set start = (t[0] | int(0)) * 60 + (t[1] | int(0)) -%}
+              {%- set mns = namespace(m=0) -%}
+              {%- set days = e.days -%}
+              {%- if days is string -%}
+                {%- set mns.m = PRESETS.get(days, 0) -%}
+              {%- elif days is number -%}
+                {%- set mns.m = days | int(0) -%}
+              {%- elif days is iterable -%}
+                {%- for d in days -%}
+                  {%- if d in DBITS -%}{%- set mns.m = mns.m + (2 ** DBITS[d]) -%}{%- endif -%}
+                {%- endfor -%}
+              {%- endif -%}
+              {%- set ns.items = ns.items + [{
+                  'dev': e.device, 'zone': e.zone,
+                  'days': mns.m, 'start': start, 'end': start + est_pad
+              }] -%}
+            {%- endfor -%}
+            {%- for i in range(ns.items | count) -%}
+              {%- set a = ns.items[i] -%}
+              {%- if a.end > 1440 -%}
+                {%- set msg = a.dev ~ ' Z' ~ a.zone|string ~ ' @ ' ~ '%02d:%02d' | format(a.start // 60, a.start % 60) ~ ' overflows past midnight (+' ~ (a.end - 1440)|string ~ ' min)' -%}
+                {%- set ns.conflicts = ns.conflicts + [msg] -%}
+              {%- endif -%}
+              {%- for j in range(i + 1, ns.items | count) -%}
+                {%- set b = ns.items[j] -%}
+                {%- set shared = a.days | bitwise_and(b.days) -%}
+                {%- if shared > 0 and a.start < b.end and b.start < a.end -%}
+                  {%- set msg = a.dev ~ ' Z' ~ a.zone|string ~ ' @ ' ~ '%02d:%02d' | format(a.start // 60, a.start % 60) ~ ' vs ' ~ b.dev ~ ' Z' ~ b.zone|string ~ ' @ ' ~ '%02d:%02d' | format(b.start // 60, b.start % 60) -%}
+                  {%- set ns.conflicts = ns.conflicts + [msg] -%}
+                {%- endif -%}
+              {%- endfor -%}
+            {%- endfor -%}
+            {%- if ns.conflicts | count == 0 -%}
+              ok
+            {%- else -%}
+              {{ ns.conflicts | count }} conflict{{ 's' if ns.conflicts | count != 1 else '' }}
+            {%- endif -%}
+          {%- endif -%}
+        attributes:
+          first: >-
+            {%- set entries = state_attr('sensor.irrigoto_desired_schedule', 'entries') | default([], true) -%}
+            {%- if entries | count == 0 -%}{{ '' }}
+            {%- else -%}
+              {%- set MODES = {'Pulse':0,'Gentle':1,'Smooth':2} -%}
+              {%- set PRESETS = {'Daily':127,'Weekdays':62,'Weekends':65,'MWF':42,'TTh':20} -%}
+              {%- set DBITS = {'Sun':0,'Mon':1,'Tue':2,'Wed':3,'Thu':4,'Fri':5,'Sat':6} -%}
+              {%- set ns = namespace(items=[], first='') -%}
+              {%- for e in entries if e.enabled -%}
+                {%- set mode = MODES.get(e.mode, 2) -%}
+                {%- set depth = {'1/8"':1,'1/4"':2,'3/8"':3,'1/2"':4,'5/8"':5,'3/4"':6,'7/8"':7,'1"':8}.get(e.depth, 1) -%}
+                {%- set base = 30 if mode == 2 else (15 if mode == 1 else 8) -%}
+                {%- set est = base * depth -%}
+                {%- set est_pad = ((est * 110 + 99) // 100) -%}
+                {%- set t = (e.time | string).split(':') -%}
+                {%- set start = (t[0] | int(0)) * 60 + (t[1] | int(0)) -%}
+                {%- set mns = namespace(m=0) -%}
+                {%- set days = e.days -%}
+                {%- if days is string -%}{%- set mns.m = PRESETS.get(days, 0) -%}
+                {%- elif days is number -%}{%- set mns.m = days | int(0) -%}
+                {%- elif days is iterable -%}
+                  {%- for d in days -%}{%- if d in DBITS -%}{%- set mns.m = mns.m + (2 ** DBITS[d]) -%}{%- endif -%}{%- endfor -%}
+                {%- endif -%}
+                {%- set ns.items = ns.items + [{'dev': e.device, 'zone': e.zone, 'days': mns.m, 'start': start, 'end': start + est_pad}] -%}
+              {%- endfor -%}
+              {%- for i in range(ns.items | count) -%}
+                {%- set a = ns.items[i] -%}
+                {%- if a.end > 1440 and ns.first == '' -%}
+                  {%- set ns.first = a.dev ~ ' Z' ~ a.zone|string ~ ' overflows past midnight' -%}
+                {%- endif -%}
+                {%- for j in range(i + 1, ns.items | count) -%}
+                  {%- set b = ns.items[j] -%}
+                  {%- set shared = a.days | bitwise_and(b.days) -%}
+                  {%- if shared > 0 and a.start < b.end and b.start < a.end and ns.first == '' -%}
+                    {%- set ns.first = a.dev ~ ' Z' ~ a.zone|string ~ ' overlaps ' ~ b.dev ~ ' Z' ~ b.zone|string -%}
+                  {%- endif -%}
+                {%- endfor -%}
+              {%- endfor -%}
+              {{ ns.first }}
+            {%- endif -%}
+          override_active: "{{ is_state('input_boolean.irrigoto_schedule_overlap_override', 'on') }}"
+
+# ── Auto-load compose form on slot change ────────────────────────────
+# b358: when the user changes the slot picker, populate the compose form
+# from that slot automatically. Empty slots are a silent no-op (the
+# quiet:true flag suppresses the empty-slot notification popup that the
+# manual Load button still uses).
+#
+# Trade-off: if the user is mid-edit and changes the slot to pick a
+# DIFFERENT save target, their in-progress values get overwritten. The
+# alternative (manual click) is one extra tap per edit. We err toward
+# fewer clicks; if it bites, the workaround is to keep the slot picker
+# parked on the target and edit fields directly.
+automation:
+  - id: irrigoto_compose_autoload_on_slot_change
+    alias: "irrigoto: auto-load compose form when slot picker changes"
+    description: >-
+      On every change to input_number.irrigoto_compose_slot, populate the
+      compose form from that slot's contents. Silent no-op for empty slots.
+    mode: restart
+    triggers:
+      - trigger: state
+        entity_id: input_number.irrigoto_compose_slot
+    actions:
+      - action: script.irrigoto_compose_load_from_slot
+        data:
+          quiet: true
+
+  # b358: HA restart resets compose helpers to their `initial:` values AND
+  # parks the slot picker at 1 — no state change fires for the picker on
+  # boot, so the on-slot-change automation never triggers. Result: the
+  # form shows defaults (Zone 1, Daily, 12:00 AM) even when slot 1 holds
+  # real data the user wants to edit. Fire once on HA startup to populate
+  # the form from whatever slot the picker landed on.
+  - id: irrigoto_compose_autoload_on_startup
+    alias: "irrigoto: auto-load compose form on HA startup"
+    description: >-
+      After HA finishes starting, populate the compose form from the
+      currently-selected slot. Silent no-op for empty slots.
+    mode: single
+    triggers:
+      - trigger: homeassistant
+        event: start
+    actions:
+      # Short delay so input_text slot values, the device sensor restore,
+      # and the reconciler's first PULL all settle before we try to read.
+      - delay: "00:00:10"
+      - action: script.irrigoto_compose_load_from_slot
+        data:
+          quiet: true
