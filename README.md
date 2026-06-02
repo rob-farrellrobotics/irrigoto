@@ -59,10 +59,9 @@ firmware build, edit both `ref: main` lines and point them at a release tag
 like `ref: v392`. Each published release is tagged `v<build>`; tags are
 immutable, while `main` is a flattened snapshot replaced on each release.
 
-After the device comes online, drop the YAML in `homeassistant/packages/`
-into your HA `config/packages/` directory and register the Lovelace card
-from `homeassistant/lovelace/` to get the template sensors, automations,
-and per-zone watering heatmap.
+After the device comes online, set up the Home Assistant side — see
+[Home Assistant integration](#home-assistant-integration) below for the
+template sensors, automations, schedule sync, and per-zone heatmap.
 
 ## Local development (compile from a clone)
 
@@ -72,10 +71,13 @@ For modifying the firmware itself rather than just deploying a release.
 
 - Windows 10/11 build host (Linux/macOS work too with the obvious shell
   substitutions)
-- ESPHome installed in its own Python venv:
+- ESPHome installed in its own Python venv. Install from the pinned
+  `requirements.txt`, not a bare `pip install esphome` — the latter
+  re-resolves to whatever is newest, which has shipped regressions that
+  only surface at runtime (e.g. a 2026.5.x post-OTA HA-reconnect crash):
   ```powershell
   python -m venv C:\esphome-env
-  C:\esphome-env\Scripts\pip install esphome
+  C:\esphome-env\Scripts\pip install -r requirements.txt
   ```
 - For the initial flash, a USB-UART adapter connected to the device at
   J2 (GPIO16=RxD, GPIO17=TxD, GND). Subsequent flashes use ESPHome OTA
@@ -136,10 +138,39 @@ Both share `irrigoto-core.yaml` via the `packages:` mechanism, so adding
 a new HA service or sensor only needs to be edited in one place.
 
 Once flashed, the device announces itself to Home Assistant via the
-native ESPHome API. Drop the YAML in `homeassistant/packages/` into
-your HA `config/packages/` directory and register the Lovelace card
-from `homeassistant/lovelace/` to get template sensors, automations,
-and the per-zone watering heatmap.
+native ESPHome API. See [Home Assistant integration](#home-assistant-integration)
+to load the template sensors, automations, and heatmap dashboard.
+
+## Home Assistant integration
+
+The HA-side config — template sensors, automations, schedule sync, and the
+per-zone heatmap dashboard — is generated per-fleet from a manifest. The
+files under `homeassistant/packages/` and `homeassistant/dashboards/` are
+**templates** with `<<DEV_*>>` placeholders and will NOT load as-is; run the
+generator first.
+
+1. Describe your devices. Copy the example manifest and edit it:
+   ```bash
+   cp homeassistant/devices.example.yaml homeassistant/devices.yaml
+   ```
+   One entry per device — `slug` (the ESPHome node name, e.g.
+   `irrigoto-ab12cd`), a friendly `name`, and the device `url`.
+
+2. Generate the personalized config:
+   ```bash
+   python tools/ha-regen.py
+   ```
+   This writes `homeassistant/generated/packages/*.yaml` and
+   `homeassistant/generated/dashboards/irrigoto.yaml`.
+
+3. Copy the generated files into Home Assistant:
+   - `homeassistant/generated/packages/*.yaml` → your HA `config/packages/`
+     (with `homeassistant: packages: !include_dir_named packages` enabled)
+   - `homeassistant/generated/dashboards/irrigoto.yaml` → a dashboard
+   - register `homeassistant/lovelace/irrigoto-heatmap-card.js` as a
+     Lovelace resource for the per-zone watering heatmap
+
+Re-run `python tools/ha-regen.py` whenever you add or rename a device.
 
 ## Entering bootloader mode (USB flash only)
 
