@@ -14138,7 +14138,20 @@ static bool last_water_count_cells(int *out_covered, int *out_missed,
 
     const float BEARING_STEP = 2.0f;     // degrees
     const float RADIAL_STEP  = 200.0f;   // mm
-    const float RADIAL_MAX   = 8534.0f;  // sprinkler reach cap
+    // Reach cap for the raster. Was a hardcoded 8534mm (28ft), which silently
+    // truncated the covered/missed/overspray counts for any zone -- or supply
+    // pressure -- reaching past 28ft, skewing the coverage % and score that are
+    // published to HA. Derive it from what we're actually scoring: the polygon's
+    // own extent, the calibrated reach, and the run's actual throw, + a margin
+    // so overspray just beyond the boundary is still classified.
+    float RADIAL_MAX = cal_get_max_throw_mm();
+    float run_max = irrigoto_last_water_max_throw_mm();
+    if (run_max > RADIAL_MAX) RADIAL_MAX = run_max;
+    for (int i = 0; i < zc.n; i++) {
+        float pr = sqrtf(zc.x[i]*zc.x[i] + zc.y[i]*zc.y[i]);
+        if (pr > RADIAL_MAX) RADIAL_MAX = pr;
+    }
+    RADIAL_MAX += 2.0f * RADIAL_STEP;    // margin to catch overspray past the edge
     int covered = 0, missed = 0, overspray = 0;
 
     for (float bearing = 0.0f; bearing < 360.0f; bearing += BEARING_STEP) {

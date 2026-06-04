@@ -1170,8 +1170,18 @@ class IrrigotoHeatmapCard extends HTMLElement {
 
     // Range rings -- darker green like the device, subtler than grid
     ctx.save();
-    const ftValues = [5, 10, 15, 20, 25];
-    const maxFtScale = this._config.max_throw_mm / 304.8;
+    // Display domain (mm at rim): larger of the configured max throw and the
+    // zone's own farthest point, + 3ft (914mm) buffer. Auto-fits any zone at
+    // any supply pressure while respecting the configured reach as a floor.
+    const _zpts = (this._zone && this._zone.points) || [];
+    const _zmax = _zpts.length ? Math.max(..._zpts.map((p) => p.mm || 0)) : 0;
+    const displayMax = Math.max(this._config.max_throw_mm, _zmax) + 914;
+    const maxFtScale = displayMax / 304.8;
+    // Range-ring ticks derived from the domain so the grid adapts to pressure.
+    const _baseFt = Math.max(this._config.max_throw_mm, _zmax) / 304.8;
+    const _ringStep = _baseFt > 40 ? 10 : 5;
+    const ftValues = [];
+    for (let f = _ringStep; f <= _baseFt + 0.01; f += _ringStep) ftValues.push(f);
     ftValues.forEach((ft) => {
       const r = (ft / maxFtScale) * maxR;
       if (r > maxR) return;
@@ -1211,7 +1221,8 @@ class IrrigotoHeatmapCard extends HTMLElement {
     const targetDepth = (runTarget && runTarget > 0)
       ? runTarget
       : this._config.target_depth_mm;
-    const maxThrow = this._config.max_throw_mm;
+    // Display scale (mm at rim): the dynamic domain computed above.
+    const maxThrow = displayMax;
 
     // Build per-ring throw averages from CSV
     const ringThrowMap = {};
@@ -1238,7 +1249,7 @@ class IrrigotoHeatmapCard extends HTMLElement {
       ctx.save();
       ctx.beginPath();
       polyPts.forEach((p, i) => {
-        const r = (p.mm / 8534) * maxR;
+        const r = (p.mm / maxThrow) * maxR;
         const a = ((p.deg - 90) * Math.PI) / 180;
         const x = cx + Math.cos(a) * r;
         const y = cy + Math.sin(a) * r;
@@ -1336,8 +1347,8 @@ class IrrigotoHeatmapCard extends HTMLElement {
 
       const bearLo = actDeg - wedgeDeg / 2;
       const bearHi = actDeg + wedgeDeg / 2;
-      const rOPx = (rawO / 8534) * maxR;
-      const rIPx = Math.max(0, (rawI / 8534) * maxR);
+      const rOPx = (rawO / maxThrow) * maxR;
+      const rIPx = Math.max(0, (rawI / maxThrow) * maxR);
 
       const cRad = ((actDeg - 90) * Math.PI) / 180;
       const midRPx = (rOPx + rIPx) / 2;
@@ -1494,14 +1505,12 @@ class IrrigotoHeatmapCard extends HTMLElement {
     ctx.fillStyle = "rgba(150,170,190,0.55)";
     ctx.textBaseline = "middle";
     ctx.textAlign = "left";
-    const maxFt = maxThrow / 304.8; // 304.8 mm/ft
-    for (let i = 1; i <= 5; i++) {
-      const ringR = (maxR * i) / 5;
-      const labelFt = (maxFt * i) / 5;
-      const lx = cx + ringR + 4 * dpr;
-      const ly = cy;
-      ctx.fillText(`${labelFt.toFixed(0)}'`, lx, ly);
-    }
+    // Label each grid ring at its actual radius so labels and rings align.
+    ftValues.forEach((ft) => {
+      const ringR = (ft / maxFtScale) * maxR;
+      if (ringR > maxR) return;
+      ctx.fillText(`${ft}'`, cx + ringR + 4 * dpr, cy);
+    });
     ctx.restore();
 
     // Zone polygon outline + numbered vertex markers. Mirrors what the

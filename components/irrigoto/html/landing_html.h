@@ -279,12 +279,16 @@ function drawRadar(canvas, pts) {
                   .getPropertyValue('--radar-bg').trim() || '#0a1a12';
   ctx.beginPath(); ctx.arc(cx,cy,maxR,0,Math.PI*2);
   ctx.fillStyle = radarBg; ctx.fill();
-  // Grid rings
-  [5,10,15,20].forEach(ft=>{
-    const r=ft*304.8/8534*maxR;
+  // Display domain (mm at rim): this zone's own max throw + 3ft (914mm) buffer,
+  // so each thumbnail self-frames and stays correct at any water pressure.
+  const _zmax = (pts && pts.length ? Math.max(...pts.map(p=>p.mm)) : 8534);
+  const _dom  = _zmax + 914;
+  const _maxFt = _zmax/304.8, _step = _maxFt > 40 ? 10 : 5;
+  for(let f=_step; f<=_maxFt+0.01; f+=_step){
+    const r=f*304.8/_dom*maxR;
     ctx.beginPath();ctx.arc(cx,cy,r,0,Math.PI*2);
     ctx.strokeStyle='rgba(0,80,40,.35)';ctx.lineWidth=.5;ctx.stroke();
-  });
+  }
   if(!pts||pts.length<2){
     ctx.fillStyle='rgba(96,128,112,.4)';ctx.font='9px sans-serif';
     ctx.textAlign='center';ctx.textBaseline='middle';
@@ -294,7 +298,7 @@ function drawRadar(canvas, pts) {
   const wp=[...pts].sort((a,b)=>((a.widx??99)-(b.widx??99)));
   function pol(deg,mm){
     const r=(deg-90)*Math.PI/180;
-    return[cx+Math.cos(r)*(mm/8534*maxR), cy+Math.sin(r)*(mm/8534*maxR)];
+    return[cx+Math.cos(r)*(mm/_dom*maxR), cy+Math.sin(r)*(mm/_dom*maxR)];
   }
   // Zone fill
   ctx.beginPath();

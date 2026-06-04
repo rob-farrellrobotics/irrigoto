@@ -341,7 +341,10 @@ let ST = {bearing:0, throw_mm:4267, throw_ft:14, pressure_pct:50, water:false, p
 // b400: on-device point editor state. _cx/_cy/_maxR are captured each draw() so
 // the canvas pointer handlers can hit-test / invert the projection.
 let _editMode=false, _selPt=-1, _dragging=false, _cx=0, _cy=0, _maxR=1;
-const _EDSCALE=8534;  // mm at maxR (28 ft) -- matches draw()'s throw_mm/8534*maxR
+// Display scale (mm at canvas rim): device's reported max throw (calibrated
+// reach, or live throw if pressure exceeds the cal table) + 3ft (914mm) buffer.
+// Tracks calibration, so the radar stays correctly scaled at any water pressure.
+function _edScale(){ return (ST.act_max_throw||10058) + 914; }
 const TRAIL_MAX = 120;
 let waterTrail = [];
 let lastWaterBearing = null;
@@ -500,7 +503,7 @@ function drawHeatMap(W, H, cx, cy, maxR) {
     let rO,rI;
     if(rt<MIN_ELLIPSE){rO=rt+SPLASH_R;rI=Math.max(0,rt-SPLASH_R);}
     else{rO=ri===0?rt:(rings[ri-1]+rt)/2;rI=ri===rings.length-1?(ri>=innerRingStart?WATER_MIN_THROW_JS:actMin):(rt+rings[ri+1])/2;}
-    const rOPx=rO/8534*maxR, rIPx=Math.max(0,rI/8534*maxR);
+    const rOPx=rO/_edScale()*maxR, rIPx=Math.max(0,rI/_edScale()*maxR);
     if(rOPx<=rIPx+0.5)return;
 
     // Count active sectors (10-deg steps = WATER_SECTOR_DEG)
@@ -548,7 +551,7 @@ function drawHeatMap(W, H, cx, cy, maxR) {
     if(rOPx-rIPx>11){
       const mb=(arcStart+arcSpan*0.5)%360;
       if(pip(mb,(rO+rI)/2)){
-        const mr=(rO+rI)/2/8534*maxR, ma=(mb-90)*Math.PI/180;
+        const mr=(rO+rI)/2/_edScale()*maxR, ma=(mb-90)*Math.PI/180;
         ctx.font='8px sans-serif';ctx.textAlign='center';ctx.textBaseline='middle';
         ctx.fillStyle='rgba(255,255,255,0.80)';
         ctx.fillText(depth.toFixed(1),cx+Math.cos(ma)*mr,cy+Math.sin(ma)*mr);
@@ -630,7 +633,7 @@ function drawHeatMap(W, H, cx, cy, maxR) {
       // Sector bearing span
       const bearLo = actDeg - patchDeg/2;
       const bearHi = actDeg + patchDeg/2;
-      const rOPx = rawO/8534*maxR, rIPx = Math.max(0, rawI/8534*maxR);
+      const rOPx = rawO/_edScale()*maxR, rIPx = Math.max(0, rawI/_edScale()*maxR);
 
       // Tight bounding box around this sector
       const cRad = (actDeg-90)*Math.PI/180;
@@ -691,7 +694,7 @@ function drawHeatMap(W, H, cx, cy, maxR) {
       ctx.save();
       ctx.beginPath();
       pts.forEach((p,i)=>{
-        const r=p.throw_mm/8534*maxR;
+        const r=p.throw_mm/_edScale()*maxR;
         const a=(p.deg-90)*Math.PI/180;
         i?ctx.lineTo(cx+Math.cos(a)*r,cy+Math.sin(a)*r)
           :ctx.moveTo(cx+Math.cos(a)*r,cy+Math.sin(a)*r);
@@ -747,7 +750,7 @@ function drawPath(W, H, cx, cy, maxR) {
   }
   const STEP=0.5;
   for(let ri=0;ri<rings.length;ri++){
-    const thr=rings[ri],r=(thr/8534)*maxR;
+    const thr=rings[ri],r=(thr/_edScale())*maxR;
     const cw=(ri%2===0),al=0.70-0.30*(ri/(rings.length-1||1));
     const spans=[];let spanStart=null;
     for(let o=0;o<=arcSpan+STEP;o+=STEP){
@@ -797,16 +800,22 @@ function draw(){
   const labelColor = css.getPropertyValue('--text-mid').trim() || '#608070';
   ctx.strokeStyle = ringColor;
   ctx.lineWidth   = 0.7;
-  [5,10,15,20,25,28].forEach(ft => {
-    const r = (ft/28) * maxR;
+  // Range rings + labels — tick list derived from the domain so the grid
+  // adapts to any calibrated max throw (and thus any supply pressure).
+  const _maxFt = (ST.act_max_throw||10058)/304.8;
+  const _step  = _maxFt > 40 ? 10 : 5;
+  const _ft = [];
+  for(let f=_step; f<=_maxFt+0.01; f+=_step) _ft.push(f);
+  _ft.forEach(ft => {
+    const r = (ft*304.8/_edScale()) * maxR;
     ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2); ctx.stroke();
   });
   ctx.fillStyle  = labelColor;
   ctx.font       = '9px "Courier New",monospace';
   ctx.textAlign  = 'left';
   ctx.textBaseline = 'middle';
-  [5,10,15,20,25,28].forEach(ft => {
-    const r = (ft/28) * maxR;
+  _ft.forEach(ft => {
+    const r = (ft*304.8/_edScale()) * maxR;
     ctx.fillText(ft + "'", cx + r + 3, cy - 5);
   });
 
@@ -814,7 +823,7 @@ function draw(){
   if(ST.points.length >= 2){
     ctx.beginPath();
     ST.points.forEach((p,i)=>{
-      const rr=(p.throw_mm/8534)*maxR;
+      const rr=(p.throw_mm/_edScale())*maxR;
       const rad=(p.deg-90)*Math.PI/180;
       i===0 ? ctx.moveTo(cx+Math.cos(rad)*rr, cy+Math.sin(rad)*rr)
             : ctx.lineTo(cx+Math.cos(rad)*rr, cy+Math.sin(rad)*rr);
@@ -825,7 +834,7 @@ function draw(){
   }
 
   // Current throw ring (dashed)
-  const throwR=(ST.throw_mm/8534)*maxR;
+  const throwR=(ST.throw_mm/_edScale())*maxR;
   ctx.beginPath(); ctx.arc(cx,cy,throwR,0,Math.PI*2);
   ctx.strokeStyle='rgba(0,232,122,.12)'; ctx.lineWidth=1;
   ctx.setLineDash([3,5]); ctx.stroke(); ctx.setLineDash([]);
@@ -839,7 +848,7 @@ function draw(){
   if (waterTrail.length > 1) {
     for (let i = 0; i < waterTrail.length; i++) {
       const age = i / waterTrail.length;
-      const tr = (waterTrail[i].r/8534)*maxR;
+      const tr = (waterTrail[i].r/_edScale())*maxR;
       const tbrad = (waterTrail[i].b - 90)*Math.PI/180;
       ctx.beginPath(); ctx.arc(cx+Math.cos(tbrad)*tr, cy+Math.sin(tbrad)*tr, 2.5, 0, Math.PI*2);
       ctx.fillStyle=`rgba(0,232,122,${(age*0.55).toFixed(2)})`; ctx.fill();
@@ -854,7 +863,7 @@ function draw(){
   ctx.shadowBlur=14; ctx.shadowColor='#00e87a'; ctx.stroke(); ctx.shadowBlur=0;
 
   // Throw indicator dot — at actual throw when valve open, else slider position
-  const actualThrowR = actualThrowMm > 100 ? (actualThrowMm/8534)*maxR : throwR;
+  const actualThrowR = actualThrowMm > 100 ? (actualThrowMm/_edScale())*maxR : throwR;
   const dotIsActual = actualThrowMm > 100;
   const tx=cx+Math.cos(brad)*actualThrowR, ty=cy+Math.sin(brad)*actualThrowR;
   ctx.beginPath(); ctx.arc(tx,ty,5.5,0,Math.PI*2);
@@ -868,7 +877,7 @@ function draw(){
 
   // Perimeter points
   ST.points.forEach((p,i)=>{
-    const rr=(p.throw_mm/8534)*maxR;
+    const rr=(p.throw_mm/_edScale())*maxR;
     const rad=(p.deg-90)*Math.PI/180;
     const x=cx+Math.cos(rad)*rr, y=cy+Math.sin(rad)*rr;
     const sel=(_editMode && i===_selPt);           // b400: highlight selected pt
@@ -1057,7 +1066,7 @@ function _cxy(e){
 function _hitPoint(x,y){
   let best=-1, bd=1e9; const thr=Math.max(16,_maxR*0.06);
   ST.points.forEach((p,i)=>{
-    const rr=(p.throw_mm/_EDSCALE)*_maxR, a=(p.deg-90)*Math.PI/180;
+    const rr=(p.throw_mm/_edScale())*_maxR, a=(p.deg-90)*Math.PI/180;
     const d=Math.hypot(_cx+Math.cos(a)*rr-x, _cy+Math.sin(a)*rr-y);
     if(d<bd){ bd=d; best=i; }
   });
@@ -1073,7 +1082,7 @@ CV.addEventListener('pointerdown',e=>{
 CV.addEventListener('pointermove',e=>{
   if(!_editMode||!_dragging||_selPt<0) return;
   const {x,y}=_cxy(e); const dx=x-_cx, dy=y-_cy;
-  let r=Math.hypot(dx,dy)/_maxR*_EDSCALE; if(r>_EDSCALE) r=_EDSCALE; if(r<0) r=0;
+  let r=Math.hypot(dx,dy)/_maxR*_edScale(); if(r>_edScale()) r=_edScale(); if(r<0) r=0;
   let deg=Math.atan2(dy,dx)*180/Math.PI+90; deg=((deg%360)+360)%360;
   ST.points[_selPt].throw_mm=r; ST.points[_selPt].deg=deg; draw();
 });
