@@ -10873,7 +10873,12 @@ static float              s_web_meas_psi      = 0.0f;   // last measured PSI (0 
 static float              s_web_meas_throw_mm = 0.0f;   // last measured throw (0 when water off)
 static httpd_handle_t     s_zone_server     = NULL;
 static SemaphoreHandle_t  s_zone_mutex      = NULL;
-static char               s_zone_json_buf[1800];
+// b406: sized to hold the full state JSON for a max-size zone. The points
+// array alone is up to ZONE_MAX_PERIM_POINTS(36) * ~56 bytes ≈ 2 KB; the
+// old 1800 truncated at 32 points (Patio), yielding invalid JSON that made
+// the zone-setup page show "offline" + 0/36. 36 is a hard cap, so this is a
+// provable upper bound (unlike /api/all, which scales with zone count).
+static char               s_zone_json_buf[3072];
 
 #define ZONE_WEB_PORT            80
 #define ZONE_WEB_CTRL_PORT    32770
@@ -10979,7 +10984,9 @@ static int zone_build_json(char *buf, int maxlen)
                    s_web_valve_deg <= VALVE_CAL_START_DEG + ZONE_WEB_VALVE_STEP_DEG);
     bool at_max = (s_web_valve_deg >= VALVE_OPEN_DEG - ZONE_WEB_VALVE_STEP_DEG);
 
-    static char pts[1536];
+    // b406: up to ZONE_MAX_PERIM_POINTS(36) points * ~56 bytes + brackets.
+    // The old 1536 truncated Patio's 32 points mid-object (invalid JSON).
+    static char pts[2304];
     pts[0] = '['; pts[1] = '\0';
     for (int i = 0; i < s_web_zone.num_points; i++) {
         char pt[96];
@@ -11660,8 +11667,23 @@ static esp_err_t api_all_handler(httpd_req_t *req)
     // Status fields
     size_t used=0, total=0;
     if (storage_ready()) storage_usage(&used, &total);
-    // Zones
-    char buf[3072]; int n=0;
+
+    httpd_resp_set_type(req, "application/json");
+    // b306: cross-origin GETs from HA dashboards (e.g. the heatmap
+    // Lovelace card) need an explicit Allow-Origin header. The other
+    // /api/* and /zone/* endpoints already set this; /api/all was the
+    // odd one out, blocking the card's first request and short-
+    // circuiting the rest.
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+    // b405: emit the response as HTTP chunks instead of building it in one
+    // fixed buffer. The old char buf[3072] silently truncated once the
+    // zones array filled it: at 6 zones on ba1f88, Patio (id=5, 32 pts)
+    // pushed past the buffer and the loop's `n<sizeof(buf)-400` guard
+    // dropped it entirely, so it never appeared in the web UI. Chunking
+    // means zone count/size can no longer truncate the JSON. A small
+    // scratch buffer is reused per snprintf; nothing here exceeds it.
+    char buf[512]; int n;
     uint32_t bat_mv = (uint32_t)(adc_mv(ADC_CH_VBATT) * VBATT_DIVIDER_RATIO);
     // mDNS / WiFi-station hostname (ESPHome owns this in component mode;
     // standalone sets it in wifi_init). Distinct from the user-editable
@@ -11669,7 +11691,7 @@ static esp_err_t api_all_handler(httpd_req_t *req)
     const char *hostname = "";
     esp_netif_t *_nif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     if (_nif) esp_netif_get_hostname(_nif, &hostname);
-    n += snprintf(buf+n, sizeof(buf)-n,
+    n = snprintf(buf, sizeof(buf),
         "{\"fw_build\":%u,\"wifi_rssi\":%d,\"wifi_ip\":\"%s\","
         "\"hostname\":\"%s\","
         "\"bat_mv\":%lu,"
@@ -11686,11 +11708,13 @@ static esp_err_t api_all_handler(httpd_req_t *req)
         (unsigned)s_water_zone_id, s_water_cleanup_pass,
         s_water_detail_log?"true":"false",
         s_device_name);
+    httpd_resp_send_chunk(req, buf, n);
+
     int count=0;
     if (storage_ready()) {
         uint16_t ids[STORAGE_MAX_ZONES]; int nc=0;
         storage_zone_list(ids, STORAGE_MAX_ZONES, &nc);
-        for (int i=0; i<nc && n<(int)sizeof(buf)-400; i++) {
+        for (int i=0; i<nc; i++) {
             zone_perimeter_t zp={0};
             char _zn[32]={0};
             if (storage_zone_load(ids[i],_zn,sizeof(_zn),&zp)!=ESP_OK) continue;
@@ -11704,17 +11728,19 @@ static esp_err_t api_all_handler(httpd_req_t *req)
             char zrname[32], _zdef[16];
             snprintf(_zdef, sizeof(_zdef), "Zone %u", ids[i]+1);
             zone_name_resolve(ids[i], _zn, _zdef, zrname, sizeof(zrname));
-            n+=snprintf(buf+n,sizeof(buf)-n,
+            n=snprintf(buf,sizeof(buf),
                 "%s{\"id\":%u,\"name\":\"%s\",\"num_points\":%u,"
                 "\"min_ft\":%.1f,\"max_ft\":%.1f,\"arc_deg\":%.1f,\"points\":[",
                 count?",":"",ids[i],zrname,
                 zp.num_points,mn/304.8f,mx/304.8f,ahi-alo);
-            for(int j=0;j<zp.num_points && n<(int)sizeof(buf)-100;j++){
-                n+=snprintf(buf+n,sizeof(buf)-n,"%s{\"deg\":%.1f,\"mm\":%.0f,\"widx\":%d}",
+            httpd_resp_send_chunk(req, buf, n);
+            for(int j=0;j<zp.num_points;j++){
+                n=snprintf(buf,sizeof(buf),"%s{\"deg\":%.1f,\"mm\":%.0f,\"widx\":%d}",
                     j?",":"",zp.points[j].nozzle_deg,zp.points[j].throw_mm,
                     zp.points[j].walk_idx);
+                httpd_resp_send_chunk(req, buf, n);
             }
-            n+=snprintf(buf+n,sizeof(buf)-n,"]}");
+            httpd_resp_send_chunk(req, "]}", 2);
             count++;
         }
     }
@@ -11730,21 +11756,15 @@ static esp_err_t api_all_handler(httpd_req_t *req)
             }
             char zname[32]="Zone 1";
             zone_name_load_nvs(0, zname, sizeof(zname));
-            n+=snprintf(buf+n,sizeof(buf)-n,
+            n=snprintf(buf,sizeof(buf),
                 "{\"id\":0,\"name\":\"%s\",\"num_points\":%u,"
                 "\"min_ft\":%.1f,\"max_ft\":%.1f,\"arc_deg\":%.1f}",
                 zname,zp.num_points,mn/304.8f,mx/304.8f,ahi-alo);
+            httpd_resp_send_chunk(req, buf, n);
         }
     }
-    n += snprintf(buf+n, sizeof(buf)-n, "]}");
-    httpd_resp_set_type(req, "application/json");
-    // b306: cross-origin GETs from HA dashboards (e.g. the heatmap
-    // Lovelace card) need an explicit Allow-Origin header. The other
-    // /api/* and /zone/* endpoints already set this; /api/all was the
-    // odd one out, blocking the card's first request and short-
-    // circuiting the rest.
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    httpd_resp_send(req, buf, n);
+    httpd_resp_send_chunk(req, "]}", 2);
+    httpd_resp_send_chunk(req, NULL, 0);
     return ESP_OK;
 }
 
@@ -11760,7 +11780,11 @@ static esp_err_t api_boot_diag_handler(httpd_req_t *req)
     boot_diag_blob_t blob;
     boot_diag_load_all(&blob);
 
-    static char buf[1536]; int n = 0;
+    // b407: each entry's JSON is ~400 bytes and the ring holds up to
+    // BOOT_DIAG_RING_N(5), so a full ring is ~2 KB — the old 1536 truncated
+    // it to ~3 entries (invalid JSON). 5 is a hard cap, so this is a provable
+    // upper bound (same reasoning as the b406 /zone/state buffer).
+    static char buf[2560]; int n = 0;
     n += snprintf(buf+n, sizeof(buf)-n,
         "{\"count\":%u,\"latest_idx\":%u,\"fw_build\":%u,\"entries\":[",
         blob.count, blob.next_idx, (unsigned)FW_BUILD);
@@ -12979,6 +13003,15 @@ static esp_err_t api_schedule_handler(httpd_req_t *req)
 
     // Build response JSON.
     int n = 0;
+    // b407: emit the response as HTTP chunks. The zones+entries arrays scale
+    // with zone count (up to STORAGE_MAX_ZONES) and SCHEDULE_MAX_ENTRIES, so
+    // the old fixed buf[3072] silently truncated once both grew. buf is now a
+    // reusable accumulator: flush it whenever it nears full (each zone/entry
+    // is < 256 B, so one always fits after a flush), then a final flush +
+    // terminator closes the stream. Header snprintfs stay bounded < buf.
+    #define SCHED_FLUSH_IF_FULL() do { \
+        if (n > (int)sizeof(buf) - 256) { httpd_resp_send_chunk(req, buf, n); n = 0; } \
+    } while (0)
 
     time_t now = time(NULL);
     // tz offset: difference between local and UTC at "now" in minutes.
@@ -13079,7 +13112,13 @@ static esp_err_t api_schedule_handler(httpd_req_t *req)
     if (storage_ready()) {
         uint16_t ids[STORAGE_MAX_ZONES]; int nc = 0;
         storage_zone_list(ids, STORAGE_MAX_ZONES, &nc);
-        for (int i = 0; i < nc && n < (int)sizeof(buf)-200; i++) {
+        for (int i = 0; i < nc; i++) {
+            // b407: flush before each zone so the response can't truncate.
+            // This handler scales with BOTH zone count (up to STORAGE_MAX_
+            // ZONES=100) and entry count, so its worst case far exceeds buf;
+            // chunking it (like /api/all) removes the cap. One zone is < 256 B,
+            // so flushing whenever n nears the top keeps every append in-bounds.
+            SCHED_FLUSH_IF_FULL();
             zone_perimeter_t zp = {0};
             char zn[32] = {0};
             if (storage_zone_load(ids[i], zn, sizeof(zn), &zp) != ESP_OK) continue;
@@ -13106,7 +13145,9 @@ static esp_err_t api_schedule_handler(httpd_req_t *req)
     // rest of the web handlers.
     schedule_t snap = {0};
     schedule_snapshot(&snap);
-    for (uint8_t i = 0; i < snap.count && n < (int)sizeof(buf)-160; i++) {
+    for (uint8_t i = 0; i < snap.count; i++) {
+        // b407: flush before each entry (each is < 256 B). See zone loop above.
+        SCHED_FLUSH_IF_FULL();
         const schedule_entry_t *e = &snap.entries[i];
         // b355: include id + last_modified + source so HA / web UI can
         // round-trip through sync_schedule without re-keying entries.
@@ -13122,6 +13163,10 @@ static esp_err_t api_schedule_handler(httpd_req_t *req)
             e->hour, e->minute, e->days_mask, e->enabled, e->source);
     }
     n += snprintf(buf+n, sizeof(buf)-n, "],");
+    // b407: flush before the tail (schedule_version + ok + escaped status,
+    // up to ~400 B) so a near-full buffer from the entries loop can't truncate
+    // it. The escaped status string is the only remaining unbounded-ish field.
+    SCHED_FLUSH_IF_FULL();
     // b355: schedule_version on the response so the editor can show
     // "behind by N revisions" if HA changed it mid-edit. Same number
     // surfaced by the schedule_version text_sensor to HA.
@@ -13149,7 +13194,9 @@ static esp_err_t api_schedule_handler(httpd_req_t *req)
     }
     n += snprintf(buf+n, sizeof(buf)-n, "\"}");
 
-    httpd_resp_send(req, buf, n);
+    if (n > 0) httpd_resp_send_chunk(req, buf, n);
+    httpd_resp_send_chunk(req, NULL, 0);  // terminator
+    #undef SCHED_FLUSH_IF_FULL
     return ESP_OK;
 }
 
