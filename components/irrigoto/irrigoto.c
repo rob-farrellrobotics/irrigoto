@@ -7070,18 +7070,27 @@ static bool zone_contains_point(const zone_perimeter_t *z,
     return (crossings % 2) == 1;
 }
 
-// Tighten an arc [lo, hi] so both endpoints (and presumably the
-// span between them, for simply-connected polygons) lie inside
-// the polygon at ring_throw. Walks lo CW (forward) and hi CCW
-// (backward) at step_deg increments. If no bearing in the range
-// satisfies PIP, returns *lo == *hi (zero-width) so the caller
-// can skip the segment.
+// Tighten an arc [lo, hi] to the LONGEST contiguous run of bearings
+// whose (bearing, ring_throw) point lies inside the polygon. Scans
+// [lo, hi] at step_deg increments. If no bearing satisfies PIP,
+// returns *lo == *hi (zero-width) so the caller can skip the segment.
 //
-// Fixes the N3-style spillover where the previous arc-refinement
-// (linear interp in polar coords) AND/OR snap-to-zone-arc-end
-// produced lo/hi at bearings where the polygon's radial extent
-// at ring_throw doesn't include ring_throw -- water lands meters
-// past the polygon's actual outer boundary.
+// Returning a fully-inside contiguous sub-arc -- rather than only
+// tightening the two endpoints -- is what guarantees the swept span
+// never crosses outside the polygon. The previous endpoint-walk
+// assumed the span between two inside endpoints was itself inside
+// ("simply-connected"). That fails when the polygon touches ring_throw
+// only at isolated vertices: e.g. a flat band of equal-throw perimeter
+// points produced by a perimeter walked above the throw-calibration
+// range. There the straight edges between the equal-throw vertices sag
+// just inside ring_throw, PIP is true only in sub-degree vertex slivers,
+// and the endpoint-walk leapfrogs between two different slivers and
+// bridges them the long way around -- commanding a near-360deg
+// wrap-around sweep almost entirely outside the polygon.
+//
+// Also fixes the original N3-style spillover (b309): polar-interp
+// refinement / snap-to-zone-arc-end producing lo/hi at bearings whose
+// radial extent at ring_throw is outside the polygon.
 static void zone_clip_arc_to_polygon(const zone_perimeter_t *z,
                                       float ring_throw,
                                       float *lo, float *hi,
@@ -7091,31 +7100,33 @@ static void zone_clip_arc_to_polygon(const zone_perimeter_t *z,
     float span = fmodf(*hi - *lo + 360.0f, 360.0f);
     if (span < 0.01f) return;
     if (step_deg <= 0.0f) step_deg = 0.5f;
-
-    // Walk lo forward (CW) until polygon contains (bearing, ring_throw)
     int n_steps = (int)(span / step_deg);
-    bool found_lo = false;
+
+    float best_lo = 0.0f, best_hi = 0.0f, best_len = -1.0f;
+    bool  in_run  = false;
+    float run_lo  = 0.0f, run_prev = 0.0f;
     for (int i = 0; i <= n_steps; i++) {
         float b = fmodf(*lo + (float)i * step_deg + 360.0f, 360.0f);
-        if (zone_contains_point(z, b, ring_throw)) {
-            *lo = b;
-            found_lo = true;
-            break;
+        bool  inside = zone_contains_point(z, b, ring_throw);
+        if (inside) {
+            if (!in_run) { in_run = true; run_lo = b; }
+            run_prev = b;
+        }
+        if ((!inside || i == n_steps) && in_run) {
+            float run_len = fmodf(run_prev - run_lo + 360.0f, 360.0f);
+            if (run_len > best_len) {
+                best_len = run_len; best_lo = run_lo; best_hi = run_prev;
+            }
+            in_run = false;
         }
     }
-    if (!found_lo) {
-        // No polygon containment in this arc at ring_throw. Collapse.
+    if (best_len < 0.0f) {
+        // No bearing in the arc contains ring_throw. Collapse.
         *hi = *lo;
         return;
     }
-    // Walk hi backward (CCW) until polygon contains (bearing, ring_throw)
-    for (int i = 0; i <= n_steps; i++) {
-        float b = fmodf(*hi - (float)i * step_deg + 720.0f, 360.0f);
-        if (zone_contains_point(z, b, ring_throw)) {
-            *hi = b;
-            break;
-        }
-    }
+    *lo = best_lo;
+    *hi = best_hi;
 }
 
 // b312: Chase mode -- entertainment watering, continuous PWM control.
@@ -9502,18 +9513,20 @@ static void phase_water_zone(void)
                     zone_clip_arc_to_polygon(&zone, ring_throw, &lo, &hi, 0.5f);
 
                 seg_deg = fmodf(hi - lo + 360.0f, 360.0f);
-                // If clipping collapsed the arc (no polygon containment
-                // anywhere in the original [lo,hi]) skip this segment.
-                // The old code clamped seg_deg up to WATER_SECTOR_DEG
-                // which would re-expand the arc back into the bad
-                // region -- defeat the clip.
+                // The polygon clip returns a fully-inside contiguous sub-arc.
+                // If that real inside span is below the minimum sweepable arc,
+                // skip the segment. Do NOT floor it up to WATER_SECTOR_DEG:
+                // that re-expands the sweep past the inside region and spills
+                // water outside the polygon -- the failure mode on a flat
+                // equal-throw vertex band (perimeter walked above the throw-
+                // cal range). Sweeping the true sub-sector inside span is
+                // safe; expanding it is not.
                 if (seg_deg < 0.5f * WATER_SECTOR_DEG) {
-                    INFO("Ring %2d arc %d: clipped to zero width by polygon, skipping segment.",
-                         ring+1, ai);
+                    INFO("Ring %2d arc %d: inside span %.1fdeg < min, skipping segment.",
+                         ring+1, ai, seg_deg);
                     continue;
                 }
                 arcs_swept_this_ring++;   // b364: past the polygon-clip gate
-                if (seg_deg < WATER_SECTOR_DEG) seg_deg = WATER_SECTOR_DEG;
                 if (seg_deg > zone_arc_deg + 1.0f) seg_deg = zone_arc_deg;
                 // CW rings consistently overshoot arc end by ~7 deg due to
                 // nozzle inertia. Pre-compensate so water stays inside zone.

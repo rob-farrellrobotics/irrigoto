@@ -207,8 +207,10 @@ correct ratio before trusting voltage readings.
 
 ## Contributing
 
-Contributions are welcome! Please fork the repository and submit a pull
-request with your improvements.
+Contributions are welcome, but note this repo uses an unusual snapshot-release
+model — `main` is published as flattened per-build snapshots, and accepted
+changes are re-applied on a private development branch rather than merged
+directly. See [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening a PR.
 
 ## License
 
