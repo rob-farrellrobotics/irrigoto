@@ -193,6 +193,10 @@ static volatile int  s_water_cleanup_pass = 0; // 0=not in cleanup, N=cleanup pa
 #define CHASE_MIN_MINUTES      1
 #define CHASE_MAX_MINUTES      10
 static int           s_chase_duration_min = 0; // 1..10; only valid when s_web_water_mode == WATER_MODE_CHASE
+// EXP (2026-06-06): lash experiment (reversal dead-time / hysteresis). Runs in
+// its own PRO_CPU task like watering; mutually exclusive with watering + cal.
+static volatile bool s_exp_running = false;
+static volatile int  s_exp_section = 0;        // 1 = A (dry dead-time), 2 = B (wet hysteresis)
 // Depth target for the current web/schedule run, in eighths of an inch
 // (1..8 = 1/8".. 1"). 0 = use the legacy digit-encoded depth. Set on each
 // start path; consumed (reset to 0) by the water task.
@@ -381,7 +385,12 @@ static int dual_vprintf(const char *fmt, va_list ap)
 #define ZONE_ROTATE_STEP_DEG   5.0f   // nozzle step per rotate command
 #define ZONE_PRESSURE_STEP_DEG 5.0f   // valve angle fallback step (no cal data)
 #define ZONE_PRESSURE_STEP_PSI 0.5f   // pressure step per +/- command (PSI)
-#define VALVE_BACKLASH_DEG  15.0f
+// b413: 15 -> 5. The /exp/lash hysteresis run (2026-06-06) measured the actual
+// direction-dependent stopping bias at ~2.8 deg (from-above stops ~2.8 deg more
+// open than from-below); raw lash takeup is ~67ms (Section A), only a few deg
+// motor-side. 15 deg was ~5x oversized. 5 deg covers the 2.8 deg bias with
+// headroom while shaving the reversing-approach excursion.
+#define VALVE_BACKLASH_DEG  5.0f
 // b389: per-unit valve frame. There is NO mechanical hard stop on the valve;
 // the AS5600L position magnet is mounted at a slightly different rotation on
 // each unit, so these absolute angles differ per unit by a CONSTANT offset.
@@ -1775,6 +1784,7 @@ static float water_hold_pressure(float target_psi, float psi_min, float psi_max)
 static float water_seat_valve_from_closed(float target_psi, float *out_psi);
 static void zone_web_start(void);
 static void phase_valve_jog_explore(void);
+static void phase_valve_hysteresis(void);   // EXP: reversal dead-time + hysteresis
 static void phase_encoder_health(void);
 static float zone_get_psi_max(void);
 static float cal_throw_to_valve_deg(float throw_mm);
@@ -4479,8 +4489,32 @@ static bool valve_goto_direct(float target_deg, float tolerance_deg,
 // -----------------------------------------------------------------------
 #define VALVE_FRICTION_LO  (270.0f + g_valve_offset_deg)  // hydrodynamic zone start (deg, frame-relative)
 #define VALVE_FRICTION_HI  (286.0f + g_valve_offset_deg)  // hydrodynamic zone end (deg, frame-relative)
+// ---------------------------------------------------------------------------
+// Pressure-control experiments (draft 2026-06-06). Each flag defaults to 0 ==
+// today's behavior; flip exactly ONE, recompile, A/B against baseline, revert.
+//
+// KEY FACT that shapes these: the AS5600L sits on the valve OUTPUT shaft, so
+// the position loop already closes on the ball -- gear lash is INVISIBLE to
+// encoder counting and does NOT cost final position. Lash instead costs us
+// (a) TIME on direction reversal and (b) pressure HYSTERESIS. Menu 'd' measures
+// both directly. These two toggles tune the spots where that cost shows up.
+//   EXP_SNAP_JOG_TUNE     -- snap zone (270-286 deg): not torque-limited, it's
+//                            deliberately under-driven; try slowing the creep so
+//                            the hydraulic lurch can't outrun the encoder loop.
+//   EXP_TRIM_NO_OVERSHOOT -- stop a sub-degree REVERSING pressure-trim nudge from
+//                            triggering the full 15 deg consistent-approach swing.
+// ---------------------------------------------------------------------------
+#define EXP_SNAP_JOG_TUNE        0     // softer/shorter jog pulses in the snap zone
+#define EXP_TRIM_NO_OVERSHOOT    0     // skip 15deg approach-comp for tiny trim nudges
+#define EXP_TRIM_SMALL_CORR_DEG  1.0f  // "tiny" threshold for EXP_TRIM_NO_OVERSHOOT
+
+#if EXP_SNAP_JOG_TUNE
+#define VALVE_JOG_PULSE_MS   15     // EXP: slower creep -- lurch can't outrun the loop
+#define VALVE_JOG_DUTY      180     // EXP: ~36% -- softer break-through
+#else
 #define VALVE_JOG_PULSE_MS   25     // ms per jog pulse
 #define VALVE_JOG_DUTY      220     // ~44% -- enough to move but not blast past
+#endif
 #define VALVE_JOG_MAX_PULSES 60     // safety cap
 
 static bool valve_goto_jog(float target_deg, float tolerance_deg,
@@ -4646,7 +4680,12 @@ static bool valve_goto_direct(float target_deg, float tolerance_deg,
     const float MIN_MA         = 32.0f;  // just above idle baseline of ~28mA
     const float STALL_MA       = 500.0f;
     const uint32_t POLL_MS     = 10;    // 100 Hz
-    const float COAST_S        = 0.04f; // valve stops quickly; 0.08 overshot braking
+    // b416: 0.04 -> 0.02. /exp/lash Section C measured effective coast time at
+    // ~0.013-0.022s (opening tight ~0.013), so 0.04 over-predicted stopping
+    // distance ~3x -> predictive brake cut too early -> systematic stop-short
+    // (the from-above ~2.8 deg bias in Section B). 0.02 stays just above the
+    // measured coast (errs toward stop-short, never overshoot).
+    const float COAST_S        = 0.02f;
 
     uint16_t raw = 0;
     if (!as5600_read(ADDR_AS5600L, &raw, NULL, NULL)) {
@@ -5281,6 +5320,7 @@ static void print_menu(void)
     tprintf("  9  Kill/brake signal test\n");
     tprintf("  j  Jog valve motor (f=fwd r=rev q=quit)\n");
     tprintf("  B  Valve jog resolution explorer (CSV)\n");
+    tprintf("  d  Valve reversal dead-time + hysteresis (EXP, CSV)\n");
     tprintf("  h  Encoder health scan (AGC/field vs valve angle)\n");
     tprintf("  p  Move valve to position (degrees)\n");
     tprintf("  n  Move nozzle to position (degrees)\n");
@@ -6217,7 +6257,19 @@ static bool nozzle_sweep_pulse(
                     if (fabsf(nv - valve_live) > 0.2f) {
                         TickType_t tc = xTaskGetTickCount();
                         int ndir = (nv > valve_live) ? 1 : -1;
+#if EXP_TRIM_NO_OVERSHOOT
+                        // A sub-degree reversing nudge doesn't need the 15deg
+                        // consistent-approach excursion -- the continuous trim
+                        // re-corrects next pulse. Skipping it keeps the move inside
+                        // the VCORR_MS budget and avoids a self-inflicted pressure
+                        // transient. Larger corrections still get the full comp.
+                        if (fabsf(corr) < EXP_TRIM_SMALL_CORR_DEG)
+                            valve_goto_direct(nv, 0.4f, VCORR_MS, false);
+                        else
+                            valve_goto_ex(nv, 0.4f, VCORR_MS, false, valve_dir);
+#else
                         valve_goto_ex(nv, 0.4f, VCORR_MS, false, valve_dir);
+#endif
                         valve_live = nv;
                         valve_dir  = ndir;
                         uint32_t spent=(xTaskGetTickCount()-tc)*portTICK_PERIOD_MS;
@@ -10685,6 +10737,272 @@ abort:
 //              delta_deg, psi_before, psi_after to terminal.
 // Useful for tuning valve open-loop step resolution.
 // -----------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// EXP (2026-06-06): raw constant-duty valve drive (no position loop), used by
+// phase_valve_hysteresis to time first-motion on reversal. MCPWM group 1 so it
+// never clashes with valve_goto_direct (group 0).
+// ---------------------------------------------------------------------------
+typedef struct {
+    mcpwm_timer_handle_t t; mcpwm_oper_handle_t o;
+    mcpwm_cmpr_handle_t  c; mcpwm_gen_handle_t  g;
+    gpio_num_t drive, dir;
+} exp_drv_t;
+
+static void exp_drv_start(exp_drv_t *d, bool closing, uint16_t duty)
+{
+    // Ground truth (valve_goto_direct): VFWD decreases angle, VREV increases it.
+    // CLOSED=231 (low) .. OPEN=308 (high), so closing = decreasing angle = VFWD,
+    // opening = increasing angle = VREV. (b414 had these swapped, which inverted
+    // Sections A and C; fixed b415.)
+    d->drive = closing ? GPIO_VFWD : GPIO_VREV;
+    d->dir   = closing ? GPIO_VREV : GPIO_VFWD;
+    gpio_set_direction(d->dir, GPIO_MODE_OUTPUT);
+    gpio_set_level(d->dir, 0);
+    gpio_set_level(GPIO_K, 0);              // release brake (coast-capable)
+    mcpwm_timer_config_t tc = { .group_id=1, .clk_src=MCPWM_TIMER_CLK_SRC_DEFAULT,
+        .resolution_hz=10000000, .period_ticks=500, .count_mode=MCPWM_TIMER_COUNT_MODE_UP };
+    mcpwm_new_timer(&tc, &d->t);
+    mcpwm_operator_config_t oc = { .group_id=1 };
+    mcpwm_new_operator(&oc, &d->o);
+    mcpwm_operator_connect_timer(d->o, d->t);
+    mcpwm_comparator_config_t cc = { .flags.update_cmp_on_tez=true };
+    mcpwm_new_comparator(d->o, &cc, &d->c);
+    mcpwm_generator_config_t gc = { .gen_gpio_num=d->drive };
+    mcpwm_new_generator(d->o, &gc, &d->g);
+    mcpwm_generator_set_action_on_timer_event(d->g,
+        MCPWM_GEN_TIMER_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP,
+                                     MCPWM_TIMER_EVENT_EMPTY, MCPWM_GEN_ACTION_HIGH));
+    mcpwm_generator_set_action_on_compare_event(d->g,
+        MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP,
+                                       d->c, MCPWM_GEN_ACTION_LOW));
+    mcpwm_comparator_set_compare_value(d->c, duty);
+    mcpwm_timer_enable(d->t);
+    mcpwm_timer_start_stop(d->t, MCPWM_TIMER_START_NO_STOP);
+}
+
+static void exp_drv_stop(exp_drv_t *d)
+{
+    mcpwm_timer_start_stop(d->t, MCPWM_TIMER_STOP_EMPTY);
+    mcpwm_timer_disable(d->t);
+    mcpwm_del_generator(d->g);
+    mcpwm_del_comparator(d->c);
+    mcpwm_del_operator(d->o);
+    mcpwm_del_timer(d->t);
+    gpio_set_level(d->drive, 0);
+    gpio_set_level(d->dir, 0);
+}
+
+// EXP: quantify the two real costs of gear lash given an output-shaft encoder.
+//   Section 1/A (DRY): reversal dead-time -- how long the motor spins after a
+//     direction flip before the ball (encoder) actually moves. This is the
+//     penalty that eats the 600ms per-pulse trim budget on reversals. Multiply
+//     by motor deg/s (speed cal) to get motor-side lost motion.
+//   Section 2/B (WET): pressure hysteresis -- settled PSI at the SAME commanded
+//     angle approached from below vs from above. This is exactly what the 15deg
+//     consistent-approach overshoot exists to suppress; if it's small, that
+//     overshoot is overkill and can shrink (faster, smoother trim).
+//
+// Non-interactive: emits each row via INFO("LASHCSV,..") so results land in BOTH
+// the UART console AND the RAM log buffer -- fetch over the network with
+// `GET /zone/last_log` and filter for lines containing "LASHCSV,". Honors
+// s_water_abort for an emergency stop. Caller owns the busy interlock.
+static void exp_lash_run(int section)
+{
+    adc_setup();
+    sensor_rail_on();
+    motor_rail_on();
+
+    const float    DPC       = 360.0f / 4096.0f;
+    const uint16_t LOW_DUTY  = 160;   // gentle: reveal first motion, not a lurch
+    const float    start_deg = VALVE_CAL_START_DEG;  // geared region, below snap
+    uint16_t raw = 0;
+
+    if (section == 1) {
+        // ---- Section A: reversal dead-time (DRY) ----
+        INFO("LASH Section A: reversal dead-time (water should be OFF)");
+        INFO("LASHCSV,section,trial,deadtime_ms,start_deg");
+        for (int trial = 0; trial < 5 && !s_water_abort; trial++) {
+            TOUCH_ACTIVITY();
+            // Seat the slack on the OPENING side, then settle.
+            valve_goto_direct(start_deg + 4.0f, 0.5f, 8000, false);
+            vTaskDelay(pdMS_TO_TICKS(600));
+            as5600_read(ADDR_AS5600L, &raw, NULL, NULL);
+            float p0 = raw * DPC;
+
+            // Reverse (closing) at low duty; time until output moves >= 0.5 deg.
+            exp_drv_t d;
+            exp_drv_start(&d, true /*closing*/, LOW_DUTY);
+            TickType_t t0 = xTaskGetTickCount();
+            uint32_t dead_ms = 9999;
+            while (((xTaskGetTickCount() - t0) * portTICK_PERIOD_MS) < 1500) {
+                vTaskDelay(pdMS_TO_TICKS(3));
+                as5600_read(ADDR_AS5600L, &raw, NULL, NULL);
+                float dm = raw * DPC - p0;
+                if (dm >  180.0f) dm -= 360.0f;
+                if (dm < -180.0f) dm += 360.0f;
+                if (fabsf(dm) >= 0.5f) {
+                    dead_ms = (xTaskGetTickCount() - t0) * portTICK_PERIOD_MS;
+                    break;
+                }
+            }
+            exp_drv_stop(&d);
+            vTaskDelay(pdMS_TO_TICKS(400));
+            INFO("LASHCSV,A,%d,%lu,%.2f", trial + 1, (unsigned long)dead_ms, p0);
+        }
+        INFO("LASH A done. dead_ms x motor deg/s ~= motor-side lost motion.");
+    } else if (section == 2) {
+        // ---- Section B: pressure hysteresis (WET) ----
+        INFO("LASH Section B: pressure hysteresis (water should be ON)");
+        INFO("LASHCSV,section,target_deg,pos_up,psi_up,pos_down,psi_down,psi_hyst");
+        const float lo = VALVE_CAL_START_DEG + 3.0f;
+        const float hi = VALVE_OPEN_DEG - 3.0f;
+        const int   N  = 6;
+        for (int i = 0; i < N && !s_water_abort; i++) {
+            TOUCH_ACTIVITY();
+            float tgt = lo + (hi - lo) * i / (float)(N - 1);
+            // Skip the hydrodynamic snap zone -- its hysteresis is a separate beast.
+            if (tgt >= VALVE_FRICTION_LO && tgt <= VALVE_FRICTION_HI) continue;
+
+            float below = tgt - 8.0f; if (below < VALVE_CAL_START_DEG) below = VALVE_CAL_START_DEG;
+            float above = tgt + 8.0f; if (above > VALVE_OPEN_DEG)      above = VALVE_OPEN_DEG;
+
+            // Approach from BELOW (final motion = opening).
+            valve_goto_direct(below, 0.5f, 8000, false);
+            vTaskDelay(pdMS_TO_TICKS(300));
+            valve_goto_direct(tgt, 0.3f, 8000, false);
+            vTaskDelay(pdMS_TO_TICKS(900));
+            as5600_read(ADDR_AS5600L, &raw, NULL, NULL);
+            float pos_up = raw * DPC, psi_up = -1.0f;
+            mprls_read_quiet(&psi_up);
+
+            // Approach from ABOVE (final motion = closing).
+            valve_goto_direct(above, 0.5f, 8000, false);
+            vTaskDelay(pdMS_TO_TICKS(300));
+            valve_goto_direct(tgt, 0.3f, 8000, false);
+            vTaskDelay(pdMS_TO_TICKS(900));
+            as5600_read(ADDR_AS5600L, &raw, NULL, NULL);
+            float pos_dn = raw * DPC, psi_dn = -1.0f;
+            mprls_read_quiet(&psi_dn);
+
+            INFO("LASHCSV,B,%.1f,%.2f,%.3f,%.2f,%.3f,%.3f",
+                 tgt, pos_up, psi_up, pos_dn, psi_dn,
+                 (psi_up >= 0 && psi_dn >= 0) ? (psi_up - psi_dn) : -99.0f);
+        }
+        INFO("LASH B done. psi_hyst large => 15deg approach earns keep; small => shrink it.");
+    } else if (section == 3) {
+        // ---- Section C: coast distance per direction (predictive-braking check) ----
+        // valve_goto_direct cuts the motor when |vel|*COAST_S >= remaining error
+        // (COAST_S=0.04). If the real coast differs by direction, the stop lands
+        // short (closing) or long. Measure coast_deg vs pre-cut velocity to get an
+        // effective COAST_S per direction. Run in the clean upper region (above the
+        // 286 friction HI) so the snap zone doesn't contaminate the coast.
+        // Best run DRY; water load changes coast (label the run accordingly).
+        INFO("LASH Section C: coast per direction (clean region 288-308 deg)");
+        INFO("LASHCSV,section,dir,duty,v_before_dps,coast_deg,coast_s_eff");
+        const uint16_t duties[] = {200, 300, 400};
+        for (int di = 0; di < 3 && !s_water_abort; di++) {
+            for (int dir = 0; dir < 2 && !s_water_abort; dir++) {
+                bool closing = (dir == 1);               // closing = decreasing deg
+                TOUCH_ACTIVITY();
+                // Home with room to drive+coast without hitting a limit.
+                float home = closing ? (VALVE_OPEN_DEG - 2.0f)
+                                     : (VALVE_FRICTION_HI + 2.0f);
+                valve_goto(home, 0.5f, 10000, false);
+                vTaskDelay(pdMS_TO_TICKS(500));
+
+                // Kick to break stiction, then drop to the run duty and settle.
+                exp_drv_t d;
+                exp_drv_start(&d, closing, 480);
+                vTaskDelay(pdMS_TO_TICKS(30));
+                mcpwm_comparator_set_compare_value(d.c, duties[di]);
+                vTaskDelay(pdMS_TO_TICKS(160));
+
+                // Velocity over a 30ms window just before the cut.
+                as5600_read(ADDR_AS5600L, &raw, NULL, NULL);
+                float p_prev = raw * DPC;
+                vTaskDelay(pdMS_TO_TICKS(30));
+                as5600_read(ADDR_AS5600L, &raw, NULL, NULL);
+                float p_cut = raw * DPC;
+                float dv = p_cut - p_prev;
+                if (dv >  180.0f) dv -= 360.0f;
+                if (dv < -180.0f) dv += 360.0f;
+                float v_before = dv / 0.030f;            // deg/s (signed)
+
+                // CUT to coast (exp_drv_stop leaves the brake released).
+                exp_drv_stop(&d);
+
+                // Track until motion stops (4 consecutive <0.03 deg reads).
+                float p_last = p_cut; int still = 0;
+                TickType_t t0 = xTaskGetTickCount();
+                while (((xTaskGetTickCount() - t0) * portTICK_PERIOD_MS) < 800) {
+                    vTaskDelay(pdMS_TO_TICKS(5));
+                    as5600_read(ADDR_AS5600L, &raw, NULL, NULL);
+                    float pp = raw * DPC;
+                    float dd = pp - p_last;
+                    if (dd >  180.0f) dd -= 360.0f;
+                    if (dd < -180.0f) dd += 360.0f;
+                    p_last = pp;
+                    if (fabsf(dd) < 0.03f) { if (++still >= 4) break; } else still = 0;
+                }
+                float coast = p_last - p_cut;
+                if (coast >  180.0f) coast -= 360.0f;
+                if (coast < -180.0f) coast += 360.0f;
+                float seff = (fabsf(v_before) > 1.0f) ? fabsf(coast) / fabsf(v_before) : 0.0f;
+                INFO("LASHCSV,C,%s,%u,%.1f,%.2f,%.4f",
+                     closing ? "close" : "open", (unsigned)duties[di],
+                     v_before, coast, seff);
+                vTaskDelay(pdMS_TO_TICKS(300));
+            }
+        }
+        INFO("LASH C done. Compare coast_s_eff open vs close vs COAST_S=0.04.");
+    }
+
+    valve_goto(VALVE_CLOSED_DEG, 2.0f, 15000, false);
+    INFO("LASH valve closed; section %d complete.", section);
+}
+
+// EXP background task -- mirrors water_task's proven shape: raise priority to
+// reduce timing jitter, arm the RAM log capture (NO log streaming, WiFi stays
+// up -- see b295), run, then tear down. Triggered by POST /exp/lash.
+static void exp_task(void *arg)
+{
+    (void)arg;
+    s_water_abort = false;
+    UBaseType_t old_prio = uxTaskPriorityGet(NULL);
+    vTaskPrioritySet(NULL, 15);
+    watering_log_capture_start();
+    INFO("LASH experiment start: section %d", s_exp_section);
+    exp_lash_run(s_exp_section);
+    INFO("LASH experiment end: section %d", s_exp_section);
+    watering_log_capture_stop();
+    vTaskPrioritySet(NULL, old_prio);
+    s_exp_section = 0;
+    s_exp_running = false;
+    vTaskDelete(NULL);
+}
+
+// Terminal-menu wrapper (still works over the USB-UART adapter). Network users
+// should POST /exp/lash?section=A|B instead.
+static void phase_valve_hysteresis(void)
+{
+    STEP("Valve Reversal Dead-Time + Hysteresis (EXP)");
+    INFO("Rows tagged LASHCSV. Section A=dead-time (DRY), B=hysteresis (WET).");
+    INFO("Ensure water OFF. Enter to run Section A, q to abort.");
+    while (true) {
+        int c = uart_getchar(30000);
+        if (c == 'q' || c == 'Q') { INFO("Aborted."); return; }
+        if (c == '\r' || c == '\n') break;
+    }
+    exp_lash_run(1);
+    INFO("Turn water ON. Enter to run Section B, q to skip.");
+    while (true) {
+        int c = uart_getchar(30000);
+        if (c == 'q' || c == 'Q') { INFO("Skipped Section B."); return; }
+        if (c == '\r' || c == '\n') break;
+    }
+    exp_lash_run(2);
+}
+
 static void phase_valve_jog_explore(void)
 {
     STEP("Valve Jog Resolution Explorer");
@@ -11525,7 +11843,7 @@ static esp_err_t zone_water_handler(httpd_req_t *req)
             return ESP_OK;
         }
     }
-    if(s_web_water_mode!=0){
+    if(s_web_water_mode!=0 || s_exp_running){
         httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"already running");
         return ESP_OK;
     }
@@ -11566,6 +11884,42 @@ static esp_err_t zone_water_handler(httpd_req_t *req)
     httpd_resp_set_type(req,"application/json");
     HTTP_CONN_CLOSE(req);
     httpd_resp_sendstr(req,"{\"ok\":true,\"started\":true}");
+    return ESP_OK;
+}
+
+// EXP: POST /exp/lash?section=A|B  -- spawn the lash experiment task.
+// A = dry reversal dead-time, B = wet pressure hysteresis. Mutually exclusive
+// with watering and calibration. Results: GET /zone/last_log, filter "LASHCSV,".
+static esp_err_t exp_lash_handler(httpd_req_t *req)
+{
+    char qs[64] = {0};
+    httpd_req_get_url_query_str(req, qs, sizeof(qs));
+    char sec[4] = {0};
+    httpd_query_key_value(qs, "section", sec, sizeof(sec));
+    int section = (sec[0]=='A'||sec[0]=='a'||sec[0]=='1') ? 1 :
+                  (sec[0]=='B'||sec[0]=='b'||sec[0]=='2') ? 2 :
+                  (sec[0]=='C'||sec[0]=='c'||sec[0]=='3') ? 3 : 0;
+    if (section == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "section must be A (dead-time), B (hysteresis), or C (coast)");
+        return ESP_OK;
+    }
+    bool busy = (s_web_water_mode != 0) || s_exp_running ||
+                (s_wcal.state != WCAL_IDLE && s_wcal.state != WCAL_DONE);
+    if (busy) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "device busy (watering / calibration / experiment)");
+        return ESP_OK;
+    }
+    s_water_abort = false;
+    s_exp_section = section;
+    s_exp_running = true;
+    // PRO_CPU + 16KB stack, same as water_task (b294/b285 rationale applies).
+    xTaskCreatePinnedToCore(exp_task, "exp_lash", 16384, NULL, 10, NULL, PRO_CPU_NUM);
+    httpd_resp_set_type(req, "application/json");
+    HTTP_CONN_CLOSE(req);
+    httpd_resp_sendstr(req,
+        "{\"ok\":true,\"started\":true,\"results\":\"GET /zone/last_log, filter LASHCSV\"}");
     return ESP_OK;
 }
 
@@ -13478,6 +13832,8 @@ static void zone_web_start(void)
         {.uri="/zone",       .method=HTTP_GET,  .handler=zone_page_handler},
         {.uri="/zone/state", .method=HTTP_GET,  .handler=zone_state_handler},
         {.uri="/zone/act",        .method=HTTP_POST, .handler=zone_act_handler},
+        {.uri="/exp/lash",        .method=HTTP_POST, .handler=exp_lash_handler},   // EXP
+
         {.uri="/zone/last_water", .method=HTTP_GET,  .handler=zone_last_water_handler},
         {.uri="/zone/water_csv",   .method=HTTP_GET,  .handler=zone_water_csv_handler},
         {.uri="/zone/water_trace", .method=HTTP_GET,  .handler=zone_water_trace_handler}, // b283
@@ -13647,6 +14003,7 @@ void app_main(void)
             case 'v': phase_toggle_9v();       break;
             case 'j': phase_jog_valve();     break;
             case 'b': phase_valve_jog_explore(); break;
+            case 'd': phase_valve_hysteresis(); break;
             case 'h': phase_encoder_health(); break;
             case 'l': phase_led_test();      break;
             case 'p': phase_valve_goto();   break;
@@ -14311,6 +14668,10 @@ static void start_watering_web_mode(int zone, int web_mode, int depth8)
 {
     if (s_web_water_mode != 0) {
         ESP_LOGW(TAG, "start_watering: already running");
+        return;
+    }
+    if (s_exp_running) {
+        ESP_LOGW(TAG, "start_watering: lash experiment running -- refusing");
         return;
     }
     if (zone < 1) zone = 1;
