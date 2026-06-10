@@ -2390,104 +2390,217 @@ automation:
           entries: >-
             {{ state_attr('sensor.<<DEV_USC>>_schedule_rest', 'entries')
                | default([], true) }}
-      # Per-device slots: write THIS device's entries into ITS OWN slots 1..8
-      # by position. No cross-device collision or ownership checks needed.
+      # ── IDENTITY-KEYED mirror (2026-06-04, HA-only): match HA slots to device entries by
+      #    id / client_tag, NOT by list position. The old position-based mirror
+      #    could not represent a device-side DELETE that reshuffles the
+      #    remaining entries: deleting a recently-edited, non-last entry left the
+      #    survivor shifting up under a slot whose stored lm was newer, so the
+      #    lm guard refused to overwrite -> the deleted entry LINGERED in HA, and
+      #    the upsert-only PUSH then re-added (resurrected) it on the device,
+      #    while the real survivor vanished from HA. Keying on identity makes a
+      #    vanished id an authoritative delete and never crosses the survivor
+      #    with the deleted slot. (See the webui-delete-reshuffle finding;
+      #    sandbox repro test_bidir_roundtrip.py R4.)
+      #
+      # PHASE 1 — reconcile each EXISTING slot against the device by identity:
+      #   * slot matches a device entry (by id, or by tag for an id==0 pending
+      #     entry the device has stored): UPSERT with the lm guard — write the
+      #     device's values unless the slot is newer (user mid-edit), in which
+      #     case keep HA's fields and adopt the device id into an id==0 slot.
+      #   * slot has a real id>0 that the device NO LONGER reports: the device
+      #     DELETED it -> clear the slot (authoritative; matched by id, so it is
+      #     definitely the same entry, and a device-side delete wins regardless
+      #     of slot lm). This is the delete path the position mirror lacked.
+      #   * slot is id==0 AND tagless (legacy pending add): fall back to the old
+      #     POSITION adoption against the device entry at this index (preserves
+      #     pre-b403 behavior). A TAGGED pending add with no device match yet is
+      #     simply preserved until the device stores it and the tag matches.
       - repeat:
           for_each: [1,2,3,4,5,6,7,8]
           sequence:
             - variables:
                 slot_n: "{{ repeat.item | int(0) }}"
-                dev_idx: "{{ slot_n - 1 }}"
-                dev_e: >-
-                  {{ entries[dev_idx] if dev_idx < (entries | count) else none }}
                 slot_raw: >-
                   {{ states('input_text.<<DEV_USC>>_sched_' ~ slot_n) | default('', true) | trim }}
-                slot_lm: >-
-                  {# slot_raw arrives as a HA TupleWrapper across the variables
-                     block; force | string before .split (see compose load). #}
-                  {%- set f = (slot_raw | string).split(',') -%}
-                  {%- if f | length >= 2 -%}{{ f[1] | int(0) }}{%- else -%}0{%- endif -%}
+                slot_f: >-
+                  {# force | string: slot_raw is a HA TupleWrapper here. #}
+                  {{ (slot_raw | string).split(',') }}
+                slot_id: "{{ (slot_f[0] | int(0)) if (slot_f | length) >= 1 else 0 }}"
+                slot_lm: "{{ (slot_f[1] | int(0)) if (slot_f | length) >= 2 else 0 }}"
+                slot_tag: "{{ (slot_f[9] | int(0)) if (slot_f | length) >= 10 else 0 }}"
+                # Index of the device entry that matches this slot by IDENTITY:
+                # by id first (real id), then by client_tag (id==0 pending that
+                # the device has stored under a tag). -1 = no identity match.
+                m_idx: >-
+                  {%- set ns = namespace(i=-1) -%}
+                  {%- for e in entries -%}
+                    {%- if ns.i < 0 and slot_id > 0 and (e.id | int(0)) == (slot_id | int(0)) -%}
+                      {%- set ns.i = loop.index0 -%}
+                    {%- endif -%}
+                  {%- endfor -%}
+                  {%- if ns.i < 0 and slot_tag > 0 -%}
+                    {%- for e in entries -%}
+                      {%- if ns.i < 0 and (e.client_tag | default(0) | int(0)) == (slot_tag | int(0)) -%}
+                        {%- set ns.i = loop.index0 -%}
+                      {%- endif -%}
+                    {%- endfor -%}
+                  {%- endif -%}
+                  {{ ns.i }}
+                dev_e: "{{ entries[m_idx | int(-1)] if (m_idx | int(-1)) >= 0 else none }}"
+                # Device entry at THIS slot's index (legacy position fallback).
+                pos_e: >-
+                  {{ entries[slot_n - 1] if (slot_n - 1) < (entries | count) else none }}
+                # True if the device entry this slot maps to is ALREADY bound to
+                # an EARLIER slot (1..slot_n-1) by its real id. Happens when an
+                # id==0 edit position-adopts an id a later slot still holds, so
+                # two slots end up on the same device id -> two identical HA rows.
+                # Reads current (possibly just-written) earlier-slot states.
+                earlier_dup: >-
+                  {%- set want = (dev_e.id | int(0)) if dev_e is not none else 0 -%}
+                  {%- set ns = namespace(d=false) -%}
+                  {%- if want > 0 -%}
+                    {%- for i in range(1, slot_n) -%}
+                      {%- set raw = states('input_text.<<DEV_USC>>_sched_' ~ i) | default('', true) | trim -%}
+                      {%- set fid = ((raw | string).split(',')[0] | int(0)) if raw != '' else 0 -%}
+                      {%- if fid > 0 and fid == want -%}{%- set ns.d = true -%}{%- endif -%}
+                    {%- endfor -%}
+                  {%- endif -%}
+                  {{ ns.d }}
             - choose:
-                # Device has an entry at this position: write it unless the HA
-                # slot's lm is newer (user mid-edit — the PUSH will sync it).
-                - conditions: "{{ dev_e is not none }}"
-                  sequence:
-                    - if:
-                        - condition: template
-                          value_template: >-
-                            {{ (slot_lm | int(0)) <= ((dev_e.last_modified | int(0)) if dev_e else 0) }}
-                      then:
-                        - action: input_text.set_value
-                          target:
-                            entity_id: "input_text.<<DEV_USC>>_sched_{{ slot_n }}"
-                          data:
-                            # Flat CSV id,lm,zone,mode,depth,hour,minute,days_mask,enabled,tag.
-                            # Zone: device schedule is 1-based; HA stores 0-based id
-                            # (matches the "(#id)" dropdown + the push side's +1).
-                            # b403: carry the device's client_tag (10th field) so the
-                            # slot keeps it across mirrors and re-pushes stay dedup-able.
-                            value: >-
-                              {{ dev_e.id }},{{ dev_e.last_modified }},{{
-                              [ (dev_e.zone | int(1)) - 1, 0 ] | max }},{{ dev_e.mode
-                              }},{{ dev_e.depth }},{{ dev_e.hour }},{{ dev_e.minute
-                              }},{{ dev_e.days_mask }},{{ dev_e.enabled }},{{ dev_e.client_tag | default(0) | int(0) }}
-                      else:
-                        # HA's slot is NEWER than the device's copy at this
-                        # position — the user just edited it, so we KEEP HA's
-                        # field values. BUT if the slot is still id==0 while the
-                        # device holds a real id for the entry at this position,
-                        # ADOPT that id (keeping HA's lm + edited fields, swapping
-                        # only the id field). Without this, an id==0 slot the user
-                        # edits before the device-assigned id propagates back stays
-                        # id==0 forever (this very lm guard blocks the id from
-                        # flowing back), so every push re-sends id==0 and the
-                        # device ALLOCATES A NEW ENTRY each time — a duplicate at
-                        # the edited time that OVERLAPS the original and gets the
-                        # whole sync rejected ("sync rejected: ... overlaps ...").
-                        # Adopting the id turns the next push into an in-place
-                        # UPDATE. (Same position-correspondence assumption the rest
-                        # of this mirror already relies on; only fires when the
-                        # device actually has an entry here, i.e. one it stored
-                        # from an earlier push of this same slot.)
-                        - if:
-                            - condition: template
-                              value_template: >-
-                                {{ ((slot_raw | string).split(',')[0] | int(0)) == 0
-                                   and (dev_e.id | int(0)) > 0 }}
-                          then:
-                            - action: input_text.set_value
-                              target:
-                                entity_id: "input_text.<<DEV_USC>>_sched_{{ slot_n }}"
-                              data:
-                                # Swap field 0 (id) -> device id; keep lm + all
-                                # edited fields verbatim.
-                                value: >-
-                                  {{ dev_e.id }},{{ (slot_raw | string).split(',')[1:] | join(',') }}
-                # No device entry at this position. Only clear a slot the
-                # device has actually SEEN and then dropped — i.e. one bound to
-                # a real (>0) device-assigned id. A slot with id==0 is a PENDING
-                # HA-side ADD the device has never seen (the user composed it
-                # while the device was asleep / disconnected from HA). The old
-                # unconditional clear here wiped that new entry the instant the
-                # device woke — before the reconciler PUSH (3s debounce) could
-                # deliver it — so it vanished from BOTH sides. (This clear is
-                # effectively an HA-side tombstone; like every destructive op in
-                # the sync path it needs a "the device had a chance to learn the
-                # truth" precondition — see the b357/b359 tombstone-wipe saga.)
-                # Preserve id==0 slots so the PUSH can sync them; the next mirror
-                # poll then rewrites the slot with the device-assigned id.
-                # Device-side deletes always carry a real id, so this guard never
-                # blocks a legitimate delete; HA-side edits to EXISTING entries
-                # are protected separately by the upsert branch's lm guard above.
-                - conditions: >-
-                    {{ slot_raw != ''
-                       and ((slot_raw | string).split(',')[0] | int(0)) > 0 }}
+                # (0) Duplicate slot: this slot's device entry is ALREADY held by
+                #     an earlier slot -> clear it so HA shows the entry once. The
+                #     device de-dups by id on push, but two HA rows look like the
+                #     duplicate bug; collapse them here. (Sandbox repro R11.)
+                - conditions: "{{ dev_e is not none and earlier_dup }}"
                   sequence:
                     - action: input_text.set_value
                       target:
                         entity_id: "input_text.<<DEV_USC>>_sched_{{ slot_n }}"
                       data:
                         value: ""
+                # (1) Slot maps to a real device entry by identity -> upsert.
+                - conditions: "{{ dev_e is not none }}"
+                  sequence:
+                    - if:
+                        - condition: template
+                          value_template: "{{ (slot_lm | int(0)) <= (dev_e.last_modified | int(0)) }}"
+                      then:
+                        - action: input_text.set_value
+                          target:
+                            entity_id: "input_text.<<DEV_USC>>_sched_{{ slot_n }}"
+                          data:
+                            # Flat CSV id,lm,zone(0-based),mode,depth,hour,minute,
+                            # days_mask,enabled,tag. Zone: device 1-based -> 0-based.
+                            value: >-
+                              {{ dev_e.id }},{{ dev_e.last_modified }},{{
+                              [ (dev_e.zone | int(1)) - 1, 0 ] | max }},{{ dev_e.mode
+                              }},{{ dev_e.depth }},{{ dev_e.hour }},{{ dev_e.minute
+                              }},{{ dev_e.days_mask }},{{ dev_e.enabled }},{{ dev_e.client_tag | default(0) | int(0) }}
+                      else:
+                        # HA slot is NEWER (user mid-edit): keep HA's fields. If
+                        # the slot is still id==0 (matched by tag), adopt the
+                        # device id so the next push is an in-place UPDATE, not a
+                        # duplicate ADD.
+                        - if:
+                            - condition: template
+                              value_template: "{{ slot_id == 0 and (dev_e.id | int(0)) > 0 }}"
+                          then:
+                            - action: input_text.set_value
+                              target:
+                                entity_id: "input_text.<<DEV_USC>>_sched_{{ slot_n }}"
+                              data:
+                                value: >-
+                                  {{ dev_e.id }},{{ (slot_raw | string).split(',')[1:] | join(',') }}
+                # (2) Slot holds a real id the device no longer has -> DELETED.
+                #     Clear authoritatively (the R4 fix). id==0 slots are never
+                #     cleared here — they are pending HA adds the device has not
+                #     seen, handled by the PUSH (see the b357/b359 tombstone saga).
+                - conditions: "{{ dev_e is none and slot_id > 0 }}"
+                  sequence:
+                    - action: input_text.set_value
+                      target:
+                        entity_id: "input_text.<<DEV_USC>>_sched_{{ slot_n }}"
+                      data:
+                        value: ""
+                # (3) Legacy pending: id==0 AND no tag, with a device entry at
+                #     this index -> POSITION adoption (pre-b403 behavior). A
+                #     tagged pending add (slot_tag>0) skips this and is preserved.
+                - conditions: >-
+                    {{ dev_e is none and slot_id == 0 and slot_tag == 0
+                       and pos_e is not none }}
+                  sequence:
+                    - if:
+                        - condition: template
+                          value_template: "{{ (slot_lm | int(0)) <= (pos_e.last_modified | int(0)) }}"
+                      then:
+                        - action: input_text.set_value
+                          target:
+                            entity_id: "input_text.<<DEV_USC>>_sched_{{ slot_n }}"
+                          data:
+                            value: >-
+                              {{ pos_e.id }},{{ pos_e.last_modified }},{{
+                              [ (pos_e.zone | int(1)) - 1, 0 ] | max }},{{ pos_e.mode
+                              }},{{ pos_e.depth }},{{ pos_e.hour }},{{ pos_e.minute
+                              }},{{ pos_e.days_mask }},{{ pos_e.enabled }},{{ pos_e.client_tag | default(0) | int(0) }}
+                      else:
+                        - if:
+                            - condition: template
+                              value_template: "{{ (pos_e.id | int(0)) > 0 }}"
+                          then:
+                            - action: input_text.set_value
+                              target:
+                                entity_id: "input_text.<<DEV_USC>>_sched_{{ slot_n }}"
+                              data:
+                                value: >-
+                                  {{ pos_e.id }},{{ (slot_raw | string).split(',')[1:] | join(',') }}
+                # (else) id==0 with a tag but no device match yet, or id==0
+                #        tagless with no device entry at this index: PRESERVE.
+
+      # PHASE 2 — place device entries that no slot references (by id or tag)
+      # into the first empty slot, in device-report order. This is how a
+      # brand-new device-side add lands in HA. Recomputes the first empty slot
+      # each iteration so successive new entries fill 1,2,3...
+      - repeat:
+          for_each: "{{ entries }}"
+          sequence:
+            - variables:
+                dev_e: "{{ repeat.item }}"
+                de_id: "{{ dev_e.id | int(0) }}"
+                de_tag: "{{ dev_e.client_tag | default(0) | int(0) }}"
+                bound: >-
+                  {%- set ns = namespace(b=false) -%}
+                  {%- for i in range(1, 9) -%}
+                    {%- set raw = states('input_text.<<DEV_USC>>_sched_' ~ i) | default('', true) | trim -%}
+                    {%- if raw != '' -%}
+                      {%- set f = (raw | string).split(',') -%}
+                      {%- set sid = (f[0] | int(0)) if (f | length) >= 1 else 0 -%}
+                      {%- set stag = (f[9] | int(0)) if (f | length) >= 10 else 0 -%}
+                      {%- if (de_id > 0 and sid == de_id) or (de_tag > 0 and stag == de_tag) -%}
+                        {%- set ns.b = true -%}
+                      {%- endif -%}
+                    {%- endif -%}
+                  {%- endfor -%}
+                  {{ ns.b }}
+                first_empty: >-
+                  {%- set ns = namespace(s=0) -%}
+                  {%- for i in range(1, 9) -%}
+                    {%- set raw = states('input_text.<<DEV_USC>>_sched_' ~ i) | default('', true) | trim -%}
+                    {%- if raw == '' and ns.s == 0 -%}{%- set ns.s = i -%}{%- endif -%}
+                  {%- endfor -%}
+                  {{ ns.s }}
+            - if:
+                - condition: template
+                  value_template: "{{ (not bound) and (first_empty | int(0)) > 0 }}"
+              then:
+                - action: input_text.set_value
+                  target:
+                    entity_id: "input_text.<<DEV_USC>>_sched_{{ first_empty }}"
+                  data:
+                    value: >-
+                      {{ dev_e.id }},{{ dev_e.last_modified }},{{
+                      [ (dev_e.zone | int(1)) - 1, 0 ] | max }},{{ dev_e.mode
+                      }},{{ dev_e.depth }},{{ dev_e.hour }},{{ dev_e.minute
+                      }},{{ dev_e.days_mask }},{{ dev_e.enabled }},{{ dev_e.client_tag | default(0) | int(0) }}
       - action: logbook.log
         data:
           name: irrigoto

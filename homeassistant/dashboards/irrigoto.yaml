@@ -220,7 +220,7 @@ views:
                 state: 'on'
             card:
               type: entities
-              title: Zone 1 — last run
+              title: 'Zone #0 — last run'
               show_header_toggle: false
               entities:
                 - entity: sensor.<<DEV_USC>>_zone_1_last_finished
@@ -242,7 +242,7 @@ views:
                 state: 'on'
             card:
               type: entities
-              title: Zone 2 — last run
+              title: 'Zone #1 — last run'
               show_header_toggle: false
               entities:
                 - entity: sensor.<<DEV_USC>>_zone_2_last_finished
@@ -264,7 +264,7 @@ views:
                 state: 'on'
             card:
               type: entities
-              title: Zone 3 — last run
+              title: 'Zone #2 — last run'
               show_header_toggle: false
               entities:
                 - entity: sensor.<<DEV_USC>>_zone_3_last_finished
@@ -286,7 +286,7 @@ views:
                 state: 'on'
             card:
               type: entities
-              title: Zone 4 — last run
+              title: 'Zone #3 — last run'
               show_header_toggle: false
               entities:
                 - entity: sensor.<<DEV_USC>>_zone_4_last_finished
@@ -308,7 +308,7 @@ views:
                 state: 'on'
             card:
               type: entities
-              title: Zone 5 — last run
+              title: 'Zone #4 — last run'
               show_header_toggle: false
               entities:
                 - entity: sensor.<<DEV_USC>>_zone_5_last_finished
@@ -330,7 +330,7 @@ views:
                 state: 'on'
             card:
               type: entities
-              title: Zone 6 — last run
+              title: 'Zone #5 — last run'
               show_header_toggle: false
               entities:
                 - entity: sensor.<<DEV_USC>>_zone_6_last_finished
@@ -352,7 +352,7 @@ views:
                 state: 'on'
             card:
               type: entities
-              title: Zone 7 — last run
+              title: 'Zone #6 — last run'
               show_header_toggle: false
               entities:
                 - entity: sensor.<<DEV_USC>>_zone_7_last_finished
@@ -374,7 +374,7 @@ views:
                 state: 'on'
             card:
               type: entities
-              title: Zone 8 — last run
+              title: 'Zone #7 — last run'
               show_header_toggle: false
               entities:
                 - entity: sensor.<<DEV_USC>>_zone_8_last_finished
@@ -435,7 +435,7 @@ views:
               device: <<DEV_DASH>>
               mirror_slug: <<DEV_DASH>>
               zone_id: 0
-              title: Zone 1 heatmap
+              title: 'Zone #0 heatmap'
       - type: grid
         cards:
           - type: conditional
@@ -448,7 +448,7 @@ views:
               device: <<DEV_DASH>>
               mirror_slug: <<DEV_DASH>>
               zone_id: 1
-              title: Zone 2 heatmap
+              title: 'Zone #1 heatmap'
       - type: grid
         cards:
           - type: conditional
@@ -461,7 +461,7 @@ views:
               device: <<DEV_DASH>>
               mirror_slug: <<DEV_DASH>>
               zone_id: 2
-              title: Zone 3 heatmap
+              title: 'Zone #2 heatmap'
       - type: grid
         cards:
           - type: conditional
@@ -474,7 +474,7 @@ views:
               device: <<DEV_DASH>>
               mirror_slug: <<DEV_DASH>>
               zone_id: 3
-              title: Zone 4 heatmap
+              title: 'Zone #3 heatmap'
       - type: grid
         cards:
           - type: conditional
@@ -487,7 +487,7 @@ views:
               device: <<DEV_DASH>>
               mirror_slug: <<DEV_DASH>>
               zone_id: 4
-              title: Zone 5 heatmap
+              title: 'Zone #4 heatmap'
       - type: grid
         cards:
           - type: conditional
@@ -500,7 +500,7 @@ views:
               device: <<DEV_DASH>>
               mirror_slug: <<DEV_DASH>>
               zone_id: 5
-              title: Zone 6 heatmap
+              title: 'Zone #5 heatmap'
       - type: grid
         cards:
           - type: conditional
@@ -513,7 +513,7 @@ views:
               device: <<DEV_DASH>>
               mirror_slug: <<DEV_DASH>>
               zone_id: 6
-              title: Zone 7 heatmap
+              title: 'Zone #6 heatmap'
       - type: grid
         cards:
           - type: conditional
@@ -526,7 +526,7 @@ views:
               device: <<DEV_DASH>>
               mirror_slug: <<DEV_DASH>>
               zone_id: 7
-              title: Zone 8 heatmap
+              title: 'Zone #7 heatmap'
   - title: Chase
     path: chase
     icon: mdi:dog-side
@@ -556,7 +556,7 @@ views:
                 state: 'on'
             card:
               type: button
-              name: Chase Zone 1
+              name: 'Chase Zone #0'
               icon: mdi:dog
               tap_action:
                 action: call-service
@@ -568,7 +568,7 @@ views:
                 state: 'on'
             card:
               type: button
-              name: Chase Zone 2
+              name: 'Chase Zone #1'
               icon: mdi:dog
               tap_action:
                 action: call-service
@@ -580,7 +580,7 @@ views:
                 state: 'on'
             card:
               type: button
-              name: Chase Zone 3
+              name: 'Chase Zone #2'
               icon: mdi:dog
               tap_action:
                 action: call-service
@@ -592,7 +592,7 @@ views:
                 state: 'on'
             card:
               type: button
-              name: Chase Zone 4
+              name: 'Chase Zone #3'
               icon: mdi:dog
               tap_action:
                 action: call-service
@@ -604,7 +604,7 @@ views:
                 state: 'on'
             card:
               type: button
-              name: Chase Zone 5
+              name: 'Chase Zone #4'
               icon: mdi:dog
               tap_action:
                 action: call-service
@@ -616,7 +616,7 @@ views:
                 state: 'on'
             card:
               type: button
-              name: Chase Zone 6
+              name: 'Chase Zone #5'
               icon: mdi:dog
               tap_action:
                 action: call-service
@@ -628,7 +628,7 @@ views:
                 state: 'on'
             card:
               type: button
-              name: Chase Zone 7
+              name: 'Chase Zone #6'
               icon: mdi:dog
               tap_action:
                 action: call-service
@@ -640,7 +640,7 @@ views:
                 state: 'on'
             card:
               type: button
-              name: Chase Zone 8
+              name: 'Chase Zone #7'
               icon: mdi:dog
               tap_action:
                 action: call-service

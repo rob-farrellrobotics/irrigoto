@@ -210,3 +210,210 @@ automation:
               entity_id: input_select.irrigoto_compose_zone
             data:
               options: ["(wake device to load zones)"]
+
+# ── Perimeter-trace helper ───────────────────────────────────────────
+# rest_command used by script.irrigoto_trace_perimeter to pull a zone's
+# stored perimeter points straight off the device. /zone/export?id=N
+# returns application/json, so HA parses it and the response_variable's
+# .content is a dict: {"id":N,"name":"...","num_points":K,"points":[
+#   {"nozzle_deg":..,"valve_deg":..,"pressure":..,"throw_mm":..,"walk_idx":..}, ...]}.
+# Caller passes ip + zone_id.
+rest_command:
+  irrigoto_zone_export:
+    url: "http://{{ ip }}/zone/export?id={{ zone_id }}"
+    method: GET
+    timeout: 10
+  # b417: start a firmware-side perimeter glide (see
+  # script.irrigoto_glide_perimeter below). wrap: 1 = close the loop.
+  # POST http://<ip>/zone/trace?stop=1 aborts an active glide.
+  irrigoto_zone_trace:
+    url: "http://{{ ip }}/zone/trace?id={{ zone_id }}&speed={{ speed }}&loop={{ wrap }}"
+    method: POST
+    timeout: 10
+
+# ── Trace a zone's perimeter ─────────────────────────────────────────
+# Drives the stream around the selected zone's stored perimeter points
+# with aim_throw (bearing + throw per vertex), pausing `dwell` seconds at
+# each, then CLOSES the valve. Targets the dashboard's active device by
+# default (the name->slug map mirrors the schedule-compose automation);
+# override with the device_slug / zone_id / dwell fields when calling.
+#
+# aim_throw positions the valve to the point's throw distance (so water
+# flows during the trace) and the nozzle to the point's bearing. Water is
+# running for the whole sweep — the final valve_close stops it. Use
+# nozzle_goto instead of aim_throw if you want a bearing-only sweep that
+# holds a single throw (set it once up front with one aim_throw).
+script:
+  irrigoto_trace_perimeter:
+    alias: "irrigoto: trace zone perimeter (aim_throw)"
+    icon: mdi:vector-polyline
+    mode: single
+    fields:
+      device_slug:
+        description: >-
+          Dash-form device slug (e.g. irrigoto-ba1f88). Omit to use the
+          dashboard's active device.
+        example: irrigoto-ba1f88
+      zone_id:
+        description: >-
+          0-based zone id. Omit to use the active device's selected
+          water-zone picker.
+        example: 0
+      dwell:
+        description: Seconds to pause at each perimeter point.
+        example: 2
+    sequence:
+      # Resolve the target device. An explicit device_slug field wins;
+      # otherwise map the active-device picker's friendly name -> slug.
+      - variables:
+          name_to_slug: <<DEVICE_NAME_SLUG_MAP>>
+          active_name: "{{ states('input_select.irrigoto_active_device') }}"
+          slug: >-
+            {{ device_slug | default(name_to_slug.get(active_name, ''), true) }}
+      - condition: template
+        value_template: "{{ slug | length > 0 }}"
+      - variables:
+          usc: "{{ slug | replace('-', '_') }}"
+          ip: "{{ states('sensor.' ~ usc ~ '_irrigoto_ip_address') }}"
+          settle: "{{ dwell | default(2) | float(2) }}"
+          # zone_id field wins; else parse "Name (#id)" from the device's
+          # water-zone picker.
+          zid: >-
+            {%- if zone_id is defined and zone_id is not none -%}
+              {{ zone_id | int(0) }}
+            {%- else -%}
+              {%- set sel = states('input_select.' ~ usc ~ '_water_zone') -%}
+              {%- if '(#' in sel and ')' in sel -%}
+                {{ sel.split('(#')[1].split(')')[0] | int(0) }}
+              {%- else -%}0{%- endif -%}
+            {%- endif -%}
+      - condition: template
+        value_template: "{{ ip not in ['unknown', 'unavailable', ''] }}"
+      # Pull the zone's perimeter points off the device.
+      - action: rest_command.irrigoto_zone_export
+        data:
+          ip: "{{ ip }}"
+          zone_id: "{{ zid }}"
+        response_variable: zexp
+      - variables:
+          pts: >-
+            {{ (zexp.content.points | default([], true))
+               | sort(attribute='walk_idx') }}
+      - if:
+          - condition: template
+            value_template: "{{ pts | count > 0 }}"
+        then:
+          - action: logbook.log
+            data:
+              name: irrigoto
+              message: >-
+                {{ slug }}: tracing zone {{ zid }} perimeter
+                ({{ pts | count }} points, {{ settle }}s dwell)
+              domain: sensor
+              entity_id: sensor.irrigoto_activity_log
+          - repeat:
+              for_each: "{{ pts }}"
+              sequence:
+                - action: "esphome.{{ usc }}_aim_throw"
+                  data:
+                    bearing_deg: "{{ repeat.item.nozzle_deg | float(0) }}"
+                    throw_mm: "{{ repeat.item.throw_mm | float(0) }}"
+                - delay: "{{ settle }}"
+        else:
+          - action: logbook.log
+            data:
+              name: irrigoto
+              message: >-
+                {{ slug }}: perimeter trace aborted — zone {{ zid }}
+                returned no points (asleep, or no such zone?)
+              domain: sensor
+              entity_id: sensor.irrigoto_activity_log
+      # Always close the valve when done (or on the no-points path).
+      - action: shell_command.irrigoto_valve_close
+        data:
+          ip: "{{ ip }}"
+
+# ── Glide a zone's perimeter (smooth, firmware-driven) ──────────────
+# v2: the b417 firmware does the whole glide in ONE continuous motion
+# (POST /zone/trace) — the nozzle sweeps the perimeter walk at constant
+# angular speed while the valve tracks a throw target interpolated along
+# the actual sweep progress, braking only where the walk physically
+# reverses or goes radial. (v1 chained water_arc calls from HA and was
+# jerky: HA can't see arc completion, so every sub-arc needed a timing
+# margin that read as a pause.)
+#
+# The firmware closes the valve and powers the rails down when the glide
+# finishes. Stop early with the dashboard valve toggle (closing during a
+# glide aborts it) or POST /zone/trace?stop=1.
+  irrigoto_glide_perimeter:
+    alias: "irrigoto: glide zone perimeter (smooth, /zone/trace)"
+    icon: mdi:vector-curve
+    mode: single
+    fields:
+      device_slug:
+        description: >-
+          Dash-form device slug (e.g. irrigoto-ba1f88). Omit to use the
+          dashboard's active device.
+        example: irrigoto-ba1f88
+      zone_id:
+        description: >-
+          0-based zone id. Omit to use the active device's selected
+          water-zone picker.
+        example: 0
+      speed_dps:
+        description: >-
+          Nozzle sweep speed in deg/s (firmware clamps to 1-25; its duty
+          floor makes anything below ~5 run at ~5).
+        example: 6
+      close_loop:
+        description: Sweep from the last point back to the first (default true).
+        example: true
+    sequence:
+      # Resolve the target device. An explicit device_slug field wins;
+      # otherwise map the active-device picker's friendly name -> slug.
+      - variables:
+          name_to_slug: <<DEVICE_NAME_SLUG_MAP>>
+          active_name: "{{ states('input_select.irrigoto_active_device') }}"
+          slug: >-
+            {{ device_slug | default(name_to_slug.get(active_name, ''), true) }}
+      - condition: template
+        value_template: "{{ slug | length > 0 }}"
+      - variables:
+          usc: "{{ slug | replace('-', '_') }}"
+          ip: "{{ states('sensor.' ~ usc ~ '_irrigoto_ip_address') }}"
+          spd: "{{ [([(speed_dps | default(6) | float(6)), 1.0] | max), 25.0] | min }}"
+          wrap: "{{ 1 if (close_loop | default(true) | bool(true)) else 0 }}"
+          # zone_id field wins; else parse "Name (#id)" from the device's
+          # water-zone picker.
+          zid: >-
+            {%- if zone_id is defined and zone_id is not none -%}
+              {{ zone_id | int(0) }}
+            {%- else -%}
+              {%- set sel = states('input_select.' ~ usc ~ '_water_zone') -%}
+              {%- if '(#' in sel and ')' in sel -%}
+                {{ sel.split('(#')[1].split(')')[0] | int(0) }}
+              {%- else -%}0{%- endif -%}
+            {%- endif -%}
+      - condition: template
+        value_template: "{{ ip not in ['unknown', 'unavailable', ''] }}"
+      - action: rest_command.irrigoto_zone_trace
+        data:
+          ip: "{{ ip }}"
+          zone_id: "{{ zid }}"
+          speed: "{{ spd }}"
+          wrap: "{{ wrap }}"
+        response_variable: tresp
+      - action: logbook.log
+        data:
+          name: irrigoto
+          message: >-
+            {%- if tresp.content.ok | default(false) -%}
+              {{ slug }}: perimeter glide started — zone {{ zid }},
+              {{ spd }} dps{{ ', closed loop' if wrap == 1 else '' }}
+              (firmware closes the valve when done)
+            {%- else -%}
+              {{ slug }}: perimeter glide REFUSED — {{
+                tresp.content.error | default('device busy or asleep?') }}
+            {%- endif -%}
+          domain: sensor
+          entity_id: sensor.irrigoto_activity_log

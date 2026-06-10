@@ -230,6 +230,30 @@ bool irrigoto_water_arc(float throw_mm, float arc_start_deg,
                         const char *direction);
 
 /**
+ * b417: glide the stream around a stored zone's perimeter in ONE
+ * continuous motion. Walks the zone's points in walk_idx order: the
+ * nozzle sweeps each leg at constant angular speed while the valve
+ * chases a throw target interpolated along the leg's ACTUAL sweep
+ * progress, so the landing point tracks the polygon edge instead of
+ * stepping radius at each vertex. Same-direction vertices are carried
+ * through without stopping; the sweep only brakes where the walk
+ * physically reverses (or goes radial).
+ *
+ * Spawns a task and returns immediately (same pattern as water_arc).
+ * Dry-positions to the first point (valve held), opens to the first
+ * point's throw, glides, then closes the valve and powers the rails
+ * down when finished or stopped. speed_dps clamped to [1, 25]; the
+ * motor duty floor makes the real minimum ~5 dps.
+ *
+ * Refused while watering / calibrating / another trace or arc runs.
+ */
+bool irrigoto_zone_trace_start(uint16_t zone_id, float speed_dps,
+                               bool close_loop);
+
+/** Abort an active perimeter glide; the trace task closes the valve. */
+void irrigoto_zone_trace_stop(void);
+
+/**
  * Emergency stop: abort any active watering, wait for the watering
  * loop to release the motors, then drive the valve to the closed
  * position. Safe to call at any time.

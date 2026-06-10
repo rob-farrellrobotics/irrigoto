@@ -302,10 +302,18 @@ void IrrigotoComponent::loop() {
             for (const auto &s : zone_option_storage_) fv.push_back(s.c_str());
             zone_select_->traits.set_options(fv);
         }
-        // Publish the active zone's name as the current selection.
+        // Publish the active zone's name as the current selection -- but
+        // only if it's actually one of the options. A dangling selection
+        // (zone deleted out from under it, or storage not yet ready) would
+        // otherwise trip ESPHome's "Invalid option" error every loop (b420;
+        // the firmware also self-heals the id in irrigoto_get_zone_name).
         char active_nm[32] = {0};
         irrigoto_get_zone_name(active_nm, sizeof(active_nm));
-        if (active_nm[0]) zone_select_->publish_state(active_nm);
+        if (active_nm[0]) {
+            for (const auto &o : zone_option_storage_) {
+                if (o == active_nm) { zone_select_->publish_state(active_nm); break; }
+            }
+        }
     }
     if (mode_select_ != nullptr) {
         int m = irrigoto_get_mode();  // 0=Pulse, 1=Gentle, 2=Smooth

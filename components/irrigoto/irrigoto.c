@@ -400,6 +400,27 @@ static int dual_vprintf(const char *fmt, va_list ap)
 // Every call site reads these macros, so the offset applies everywhere with no
 // per-site edits. (Verified: no use requires a compile-time constant.)
 static float g_valve_offset_deg = 0.0f;
+// b418: per-unit valve motor polarity. +1 = reference wiring (driving the
+// physical VFWD pin DECREASES encoder angle / closes), -1 = motor leads
+// swapped. Probed open-loop at the start of POST /cal/valve (before any
+// closed-loop move) and persisted in NVS ("vframe"/"dir"), loaded before the
+// boot valve-close. VALVE_PIN_FWD always means "the pin that drives encoder
+// angle DOWN" regardless of wiring, so every direction convention downstream
+// (forward-decreases in valve_goto_direct, VALVE_OPEN_DIR = -1 in the chase
+// loops, exp_drv_start's closing map) holds on both wirings. Bring-up console
+// diagnostics keep the raw GPIOs on purpose: they exercise physical pins.
+static int8_t g_valve_motor_dir = +1;
+#define VALVE_PIN_FWD ((g_valve_motor_dir >= 0) ? GPIO_VFWD : GPIO_VREV)
+#define VALVE_PIN_REV ((g_valve_motor_dir >= 0) ? GPIO_VREV : GPIO_VFWD)
+// b419: same for the nozzle motor. Reference wiring: driving the physical
+// NFWD pin INCREASES encoder angle (CW). Probed at the start of the nozzle
+// speed cal (wcal_nozzle_task), persisted as "vframe"/"ndir". NOZZLE_PIN_FWD
+// always means "the pin that drives encoder angle UP / CW", so nozzle_goto's
+// forward-increases convention, the CW/CCW speed maps, the sweep cw pin
+// selection, and the chase loops' n_dir=+1=CW all hold on both wirings.
+static int8_t g_nozzle_motor_dir = +1;
+#define NOZZLE_PIN_FWD ((g_nozzle_motor_dir >= 0) ? GPIO_NFWD : GPIO_NREV)
+#define NOZZLE_PIN_REV ((g_nozzle_motor_dir >= 0) ? GPIO_NREV : GPIO_NFWD)
 #define VALVE_CLOSED_DEG   (231.0f + g_valve_offset_deg)  // valve closed (new side)
 #define VALVE_OPEN_DEG     (308.0f + g_valve_offset_deg)  // valve fully open (peak at 306.7)
 #define VALVE_PEAK_DEG     (306.7f + g_valve_offset_deg)  // angle of maximum nozzle pressure
@@ -1177,10 +1198,11 @@ static bool nozzle_goto_direct(float target_deg, float tolerance_deg,
         return true;
     }
 
-    // Forward increases angle, reverse decreases
+    // Forward increases angle, reverse decreases (NOZZLE_PIN_* resolves the
+    // physical GPIO per stored motor polarity, b419)
     bool forward = (error > 0);
-    gpio_num_t drive_pin = forward ? GPIO_NFWD : GPIO_NREV;
-    gpio_num_t dir_pin   = forward ? GPIO_NREV : GPIO_NFWD;
+    gpio_num_t drive_pin = forward ? NOZZLE_PIN_FWD : NOZZLE_PIN_REV;
+    gpio_num_t dir_pin   = forward ? NOZZLE_PIN_REV : NOZZLE_PIN_FWD;
 
     gpio_set_direction(dir_pin, GPIO_MODE_OUTPUT);
     gpio_set_level(dir_pin, 0);
@@ -1708,6 +1730,17 @@ static void valve_offset_nvs_save(float off)
     nvs_close(h);
 }
 
+// b418/b419: per-unit motor polarity, same namespace (see g_valve_motor_dir /
+// g_nozzle_motor_dir). key = "dir" (valve) or "ndir" (nozzle).
+static void motor_dir_nvs_save(const char *key, int8_t dir)
+{
+    nvs_handle_t h;
+    if (nvs_open("vframe", NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_i8(h, key, dir);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
 static void valve_offset_nvs_load(void)
 {
     nvs_handle_t h;
@@ -1721,6 +1754,18 @@ static void valve_offset_nvs_load(void)
         } else {
             ESP_LOGW(TAG, "Valve frame offset %.2f out of range -- ignoring", off);
         }
+    }
+    int8_t dir = 0;
+    if (nvs_get_i8(h, "dir", &dir) == ESP_OK && (dir == 1 || dir == -1)) {
+        g_valve_motor_dir = dir;
+        if (dir < 0)
+            ESP_LOGW(TAG, "Valve motor polarity: INVERTED (leads swapped; from /cal/valve probe)");
+    }
+    int8_t ndir = 0;
+    if (nvs_get_i8(h, "ndir", &ndir) == ESP_OK && (ndir == 1 || ndir == -1)) {
+        g_nozzle_motor_dir = ndir;
+        if (ndir < 0)
+            ESP_LOGW(TAG, "Nozzle motor polarity: INVERTED (leads swapped; from nozzle cal probe)");
     }
     nvs_close(h);
 }
@@ -3369,9 +3414,9 @@ static float spd_measure_rotation(uint16_t duty)
     float travelled = 0.0f;
     float prev_deg  = start_deg;
 
-    // Start nozzle motor at given duty (CW direction)
-    gpio_set_direction(GPIO_NREV, GPIO_MODE_OUTPUT);
-    gpio_set_level(GPIO_NREV, 0);
+    // Start nozzle motor at given duty (CW direction; polarity-resolved b419)
+    gpio_set_direction(NOZZLE_PIN_REV, GPIO_MODE_OUTPUT);
+    gpio_set_level(NOZZLE_PIN_REV, 0);
 
     mcpwm_timer_handle_t timer = NULL;
     mcpwm_timer_config_t tcfg = {
@@ -3389,7 +3434,7 @@ static float spd_measure_rotation(uint16_t duty)
     mcpwm_new_comparator(oper, &ccfg, &cmpr);
     mcpwm_comparator_set_compare_value(cmpr, duty);
     mcpwm_gen_handle_t gen = NULL;
-    mcpwm_generator_config_t gcfg = { .gen_gpio_num = GPIO_NFWD };
+    mcpwm_generator_config_t gcfg = { .gen_gpio_num = NOZZLE_PIN_FWD };
     mcpwm_new_generator(oper, &gcfg, &gen);
     mcpwm_generator_set_action_on_timer_event(gen,
         MCPWM_GEN_TIMER_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP,
@@ -3456,9 +3501,9 @@ static float spd_measure_rotation_ccw(uint16_t duty)
     float travelled = 0.0f;
     float prev_deg  = start_deg;
 
-    // Drive NREV (CCW), hold NFWD low
-    gpio_set_direction(GPIO_NFWD, GPIO_MODE_OUTPUT);
-    gpio_set_level(GPIO_NFWD, 0);
+    // Drive NREV (CCW), hold NFWD low (polarity-resolved b419)
+    gpio_set_direction(NOZZLE_PIN_FWD, GPIO_MODE_OUTPUT);
+    gpio_set_level(NOZZLE_PIN_FWD, 0);
 
     mcpwm_timer_handle_t timer = NULL;
     mcpwm_timer_config_t tcfg = {
@@ -3476,7 +3521,7 @@ static float spd_measure_rotation_ccw(uint16_t duty)
     mcpwm_new_comparator(oper, &ccfg, &cmpr);
     mcpwm_comparator_set_compare_value(cmpr, duty);
     mcpwm_gen_handle_t gen = NULL;
-    mcpwm_generator_config_t gcfg = { .gen_gpio_num = GPIO_NREV };
+    mcpwm_generator_config_t gcfg = { .gen_gpio_num = NOZZLE_PIN_REV };
     mcpwm_new_generator(oper, &gcfg, &gen);
     mcpwm_generator_set_action_on_timer_event(gen,
         MCPWM_GEN_TIMER_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP,
@@ -4553,8 +4598,8 @@ static bool valve_goto_jog(float target_deg, float tolerance_deg,
 
     // Jog direction: closing = increase deg = VREV drives positive
     bool closing = (error > 0);
-    gpio_num_t drive_pin = closing ? GPIO_VREV : GPIO_VFWD;
-    gpio_num_t dir_pin   = closing ? GPIO_VFWD : GPIO_VREV;
+    gpio_num_t drive_pin = closing ? VALVE_PIN_REV : VALVE_PIN_FWD;
+    gpio_num_t dir_pin   = closing ? VALVE_PIN_FWD : VALVE_PIN_REV;
 
     // Build MCPWM for jog pulses
     mcpwm_timer_handle_t timer = NULL;
@@ -4708,10 +4753,11 @@ static bool valve_goto_direct(float target_deg, float tolerance_deg,
         return true;
     }
 
-    // Reverse increases angle, forward decreases angle (confirmed empirically)
+    // Reverse increases angle, forward decreases angle (confirmed empirically;
+    // VALVE_PIN_* resolves the physical GPIO per stored motor polarity, b418)
     bool forward = (error < 0);
-    gpio_num_t drive_pin = forward ? GPIO_VFWD : GPIO_VREV;
-    gpio_num_t dir_pin   = forward ? GPIO_VREV : GPIO_VFWD;
+    gpio_num_t drive_pin = forward ? VALVE_PIN_FWD : VALVE_PIN_REV;
+    gpio_num_t dir_pin   = forward ? VALVE_PIN_REV : VALVE_PIN_FWD;
 
     // Start motor
     gpio_set_direction(dir_pin, GPIO_MODE_OUTPUT);
@@ -6110,8 +6156,8 @@ static bool nozzle_sweep_pulse(
         }
     }
 
-    gpio_num_t drv_pin = cw ? GPIO_NFWD : GPIO_NREV;
-    gpio_num_t off_pin = cw ? GPIO_NREV : GPIO_NFWD;
+    gpio_num_t drv_pin = cw ? NOZZLE_PIN_FWD : NOZZLE_PIN_REV;
+    gpio_num_t off_pin = cw ? NOZZLE_PIN_REV : NOZZLE_PIN_FWD;
     gpio_set_level(off_pin, 0);
     gpio_set_level(GPIO_K, 0);
 
@@ -6408,8 +6454,8 @@ static bool nozzle_sweep_continuous(
     uint32_t arc_ms     = (uint32_t)(arc_deg / nozzle_dps * 1000.0f);
     uint32_t arc_ms_max = arc_ms * 2;
 
-    gpio_num_t drv_pin = cw ? GPIO_NFWD : GPIO_NREV;
-    gpio_num_t off_pin = cw ? GPIO_NREV : GPIO_NFWD;
+    gpio_num_t drv_pin = cw ? NOZZLE_PIN_FWD : NOZZLE_PIN_REV;
+    gpio_num_t off_pin = cw ? NOZZLE_PIN_REV : NOZZLE_PIN_FWD;
     gpio_set_level(off_pin, 0);
     gpio_set_level(GPIO_K, 0);
 
@@ -6586,8 +6632,8 @@ static bool nozzle_sweep_encoder_gentle(
     const float COAST_DEG = 1.5f;
     uint32_t arc_ms_max = (uint32_t)(arc_deg / nozzle_dps * 1000.0f) * 3 + 500;
 
-    gpio_num_t drv_pin = cw ? GPIO_NFWD : GPIO_NREV;
-    gpio_num_t off_pin = cw ? GPIO_NREV : GPIO_NFWD;
+    gpio_num_t drv_pin = cw ? NOZZLE_PIN_FWD : NOZZLE_PIN_REV;
+    gpio_num_t off_pin = cw ? NOZZLE_PIN_REV : NOZZLE_PIN_FWD;
     gpio_set_level(off_pin, 0);
     gpio_set_level(GPIO_K, 0);
 
@@ -7497,11 +7543,11 @@ static void phase_chase_water_zone(void)
 
     // --- Set up persistent PWM for both motors ---
     chase_motor_t nm = {0}, vm = {0};
-    if (!chase_motor_setup(&nm, GPIO_NFWD, GPIO_NREV)) {
+    if (!chase_motor_setup(&nm, NOZZLE_PIN_FWD, NOZZLE_PIN_REV)) {
         INFO("Chase: nozzle PWM setup failed");
         return;
     }
-    if (!chase_motor_setup(&vm, GPIO_VFWD, GPIO_VREV)) {
+    if (!chase_motor_setup(&vm, VALVE_PIN_FWD, VALVE_PIN_REV)) {
         INFO("Chase: valve PWM setup failed");
         chase_motor_teardown(&nm);
         return;
@@ -8784,7 +8830,7 @@ static void phase_water_zone(void)
         int        waggle_dir    = +1;
         TickType_t waggle_last_reverse_tick = xTaskGetTickCount();
         if (aim_deg >= 0.0f && waggle_half_swing > 0.5f) {
-            if (chase_motor_setup(&waggle_m, GPIO_NFWD, GPIO_NREV)) {
+            if (chase_motor_setup(&waggle_m, NOZZLE_PIN_FWD, NOZZLE_PIN_REV)) {
                 chase_motor_apply(&waggle_m, waggle_dir, WAGGLE_DUTY);
                 waggle_active = true;
                 INFO("Waggle ON: %.1f deg +/-%.1f, duty %u",
@@ -10754,8 +10800,8 @@ static void exp_drv_start(exp_drv_t *d, bool closing, uint16_t duty)
     // CLOSED=231 (low) .. OPEN=308 (high), so closing = decreasing angle = VFWD,
     // opening = increasing angle = VREV. (b414 had these swapped, which inverted
     // Sections A and C; fixed b415.)
-    d->drive = closing ? GPIO_VFWD : GPIO_VREV;
-    d->dir   = closing ? GPIO_VREV : GPIO_VFWD;
+    d->drive = closing ? VALVE_PIN_FWD : VALVE_PIN_REV;
+    d->dir   = closing ? VALVE_PIN_REV : VALVE_PIN_FWD;
     gpio_set_direction(d->dir, GPIO_MODE_OUTPUT);
     gpio_set_level(d->dir, 0);
     gpio_set_level(GPIO_K, 0);              // release brake (coast-capable)
@@ -11961,6 +12007,64 @@ static void wcal_pressure_task(void *arg)
     vTaskDelete(NULL);
 }
 
+// b418/b419: open-loop motor-polarity probe, shared by the valve and nozzle
+// cals. Pulses the PHYSICAL fwd-labelled pin and returns the SIGN of the
+// resulting encoder delta: +1 (angle increased), -1 (decreased), 0 (never
+// moved -- inconclusive, store nothing). The caller maps the sign onto its
+// reference convention (VFWD decreases / NFWD increases). Runs BEFORE any
+// closed-loop move so a motor with swapped +/- leads can't servo away from
+// target -- the goto loops' wrap guards would fire half a revolution out
+// and falsely report "reached". Pulse widths grow past the lash takeup
+// (~67 ms on the valve, /exp/lash Section A) in case the first pulse is
+// eaten by a reversal. Jogs back open-loop (opposite pin, same total drive
+// time) so the cal starts roughly where the motor was.
+static int motor_dir_probe(gpio_num_t pulse_pin, gpio_num_t other_pin,
+                           uint8_t enc_addr, float *delta_out)
+{
+    uint16_t raw = 0;
+    if (!as5600_read(enc_addr, &raw, NULL, NULL)) return 0;
+    float start = raw * (360.0f / 4096.0f);
+
+    float delta = 0.0f;
+    uint32_t driven_ms = 0;
+    static const uint32_t PULSE_MS[3] = {100, 250, 500};
+    // A prior goto may have left a pin bound to an MCPWM generator --
+    // reclaim both for plain GPIO (same defense as exp_drv_start).
+    gpio_set_direction(pulse_pin, GPIO_MODE_OUTPUT);
+    gpio_set_direction(other_pin, GPIO_MODE_OUTPUT);
+    gpio_set_level(other_pin, 0);
+    gpio_set_level(GPIO_K, 0);
+    for (int i = 0; i < 3; i++) {
+        gpio_set_level(pulse_pin, 1);
+        vTaskDelay(pdMS_TO_TICKS(PULSE_MS[i]));
+        gpio_set_level(pulse_pin, 0);
+        driven_ms += PULSE_MS[i];
+        vTaskDelay(pdMS_TO_TICKS(200));  // coast + settle
+        if (!as5600_read(enc_addr, &raw, NULL, NULL)) break;
+        delta = raw * (360.0f / 4096.0f) - start;
+        if (delta >  180.0f) delta -= 360.0f;
+        if (delta < -180.0f) delta += 360.0f;
+        if (fabsf(delta) >= 0.5f) break;
+    }
+
+    int sense = 0;
+    if      (delta >=  0.5f) sense = +1;
+    else if (delta <= -0.5f) sense = -1;
+
+    if (sense != 0) {
+        // Return jog: opposite physical pin, same total drive time. Lash
+        // makes this slightly short -- fine, the cal starts from "current".
+        gpio_set_level(other_pin, 1);
+        vTaskDelay(pdMS_TO_TICKS(driven_ms));
+        gpio_set_level(other_pin, 0);
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    if (delta_out) *delta_out = delta;
+    ESP_LOGI(TAG, "Motor polarity probe (pin %d, enc 0x%02x): pulse moved %.2f deg -> sense %+d",
+             (int)pulse_pin, enc_addr, delta, sense);
+    return sense;
+}
+
 static void wcal_nozzle_task(void *arg)
 {
     s_wcal.state    = WCAL_NOZZLE_RUNNING;
@@ -11971,6 +12075,23 @@ static void wcal_nozzle_task(void *arg)
     motor_rail_on();
     adc_setup();
     vTaskDelay(pdMS_TO_TICKS(300));
+
+    // b419: polarity probe FIRST (dry, before the valve opens) -- the speed
+    // maps below are direction-labelled (CW vs CCW) and the valve open
+    // itself servos closed-loop.
+    int nsense = motor_dir_probe(GPIO_NFWD, GPIO_NREV, ADDR_AS5600, NULL);
+    if (nsense == 0) {
+        motor_rail_off(); sensor_rail_off();
+        snprintf(s_wcal.msg, sizeof(s_wcal.msg),
+                 "Polarity probe: nozzle never moved -- check motor power/wiring.");
+        s_wcal.state = WCAL_ERROR;
+        vTaskDelete(NULL);
+    }
+    if (nsense != g_nozzle_motor_dir)
+        ESP_LOGW(TAG, "Nozzle motor polarity changed: %+d -> %+d",
+                 g_nozzle_motor_dir, nsense);
+    g_nozzle_motor_dir = (int8_t)nsense;  // reference wiring: NFWD INCREASES angle (CW)
+    motor_dir_nvs_save("ndir", (int8_t)nsense);
 
     // Open valve to ~30% pressure for wet measurement
     pressure_map_t _pcal = {0};
@@ -12698,6 +12819,20 @@ static esp_err_t cal_valve_handler(httpd_req_t *req)
     motor_rail_on();
     vTaskDelay(pdMS_TO_TICKS(150));
 
+    // b418: polarity probe FIRST -- everything below servos closed-loop.
+    int sense = motor_dir_probe(GPIO_VFWD, GPIO_VREV, ADDR_AS5600L, NULL);
+    if (sense == 0) {
+        motor_rail_off();
+        httpd_resp_sendstr(req,
+            "{\"error\":\"polarity probe: valve never moved -- check motor power/wiring, then retry\"}");
+        return ESP_OK;
+    }
+    int mdir = -sense;   // reference wiring: VFWD DECREASES angle (closes)
+    if (mdir != g_valve_motor_dir)
+        ESP_LOGW(TAG, "Valve motor polarity changed: %+d -> %+d", g_valve_motor_dir, mdir);
+    g_valve_motor_dir = (int8_t)mdir;
+    motor_dir_nvs_save("dir", (int8_t)mdir);
+
     // Phase 1 -- coarse sweep from the current angle. Settle, then read a
     // SETTLED MEDIAN (not an in-motion mean) so transient pressure spikes can't
     // latch the argmax. No upfront flow gate: from closed, pressure is ~0 even
@@ -12767,8 +12902,9 @@ static esp_err_t cal_valve_handler(httpd_req_t *req)
 
     char buf[200];
     int n = snprintf(buf, sizeof(buf),
-        "{\"ok\":true,\"peak_deg\":%.2f,\"offset\":%.2f,\"closed_deg\":%.2f,\"max_psi\":%.3f}",
-        peak, offset, closed, best_psi);
+        "{\"ok\":true,\"peak_deg\":%.2f,\"offset\":%.2f,\"closed_deg\":%.2f,"
+        "\"max_psi\":%.3f,\"motor_dir\":%d}",
+        peak, offset, closed, best_psi, (int)g_valve_motor_dir);
     httpd_resp_send(req, buf, n);
     return ESP_OK;
 }
@@ -12960,6 +13096,46 @@ static esp_err_t zone_import_handler(httpd_req_t *req)
         "{\"ok\":true,\"id\":%u,\"num_points\":%d}", zone_id, np);
     ESP_LOGI(TAG, "Zone %u imported: %s (%d pts)", zone_id, name, np);
     httpd_resp_sendstr(req, ob);
+    return ESP_OK;
+}
+
+// b417: POST /zone/trace?id=N[&speed=D][&loop=0|1] -- glide the stream
+// around zone N's perimeter in one continuous motion (zone_trace_run;
+// spawns a task and returns immediately). POST /zone/trace?stop=1 aborts
+// an active glide -- the trace task closes the valve on its way out.
+static esp_err_t zone_trace_handler(httpd_req_t *req)
+{
+    char qs[64] = {0};
+    httpd_req_get_url_query_str(req, qs, sizeof(qs));
+    httpd_resp_set_type(req, "application/json");
+    HTTP_CONN_CLOSE(req);
+
+    char stop_s[4] = {0};
+    if (httpd_query_key_value(qs, "stop", stop_s, sizeof(stop_s)) == ESP_OK &&
+        stop_s[0] == '1') {
+        irrigoto_zone_trace_stop();
+        httpd_resp_sendstr(req, "{\"ok\":true,\"stopping\":true}");
+        return ESP_OK;
+    }
+
+    char id_s[8] = {0};
+    if (httpd_query_key_value(qs, "id", id_s, sizeof(id_s)) != ESP_OK || !id_s[0]) {
+        httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"missing id\"}");
+        return ESP_OK;
+    }
+    float speed = 6.0f;
+    char sp_s[8] = {0};
+    if (httpd_query_key_value(qs, "speed", sp_s, sizeof(sp_s)) == ESP_OK && sp_s[0])
+        speed = strtof(sp_s, NULL);
+    bool loop = true;
+    char lp_s[4] = {0};
+    if (httpd_query_key_value(qs, "loop", lp_s, sizeof(lp_s)) == ESP_OK &&
+        lp_s[0] == '0')
+        loop = false;
+
+    bool ok = irrigoto_zone_trace_start((uint16_t)atoi(id_s), speed, loop);
+    httpd_resp_sendstr(req, ok ? "{\"ok\":true,\"started\":true}"
+                               : "{\"ok\":false,\"error\":\"busy or no such zone\"}");
     return ESP_OK;
 }
 
@@ -13876,6 +14052,7 @@ static void zone_web_start(void)
         {.uri="/wifi/reconnect",        .method=HTTP_POST, .handler=wifi_reconnect_handler}, // b396
         {.uri="/zone/export",           .method=HTTP_GET,  .handler=zone_export_handler},    // b398
         {.uri="/zone/import",           .method=HTTP_POST, .handler=zone_import_handler},     // b398
+        {.uri="/zone/trace",            .method=HTTP_POST, .handler=zone_trace_handler},      // b417
         {.uri="/cal/valve",             .method=HTTP_POST, .handler=cal_valve_handler},   // b389
         {.uri="/cal/valve/set",         .method=HTTP_POST, .handler=cal_valve_set_handler}, // b390
         {.uri="/fs",                    .method=HTTP_GET,  .handler=fs_page_handler},
@@ -14248,6 +14425,25 @@ void irrigoto_get_status(char *buf, size_t len)
 
 void irrigoto_get_zone_name(char *buf, size_t len)
 {
+    // b420: self-heal a dangling selection. s_water_zone_id boots as 0 and
+    // can be left pointing at a deleted zone; on units whose zone ids are
+    // sparse (no zone 0 -- e.g. ba1f88 has 1/3/5) the resolved fallback
+    // "Zone 1" is not a real zone, so the HA select rejects it on every
+    // publish ("Invalid option"). When idle, snap to the first configured
+    // zone instead. Never touched while watering.
+    if (s_web_water_mode == 0 && storage_ready()) {
+        uint16_t ids[STORAGE_MAX_ZONES]; int nc = 0;
+        if (storage_zone_list(ids, STORAGE_MAX_ZONES, &nc) == ESP_OK && nc > 0) {
+            bool exists = false;
+            for (int i = 0; i < nc; i++)
+                if (ids[i] == s_water_zone_id) { exists = true; break; }
+            if (!exists) {
+                ESP_LOGW(TAG, "Active zone id %u not configured -- snapping to %u",
+                         (unsigned)s_water_zone_id, (unsigned)ids[0]);
+                s_water_zone_id = ids[0];
+            }
+        }
+    }
     // Web UI writes zone names to LittleFS; NVS is a migration fallback.
     // zone_name_resolve() handles the precedence (LittleFS -> NVS ->
     // default "Zone N"). Just reading NVS missed names set via the web UI.
@@ -15892,6 +16088,14 @@ bool irrigoto_nozzle_goto(float target_deg)
     return nozzle_goto(target_deg, 2.0f, 10000, true);
 }
 
+// ── Zone-trace glide state (b417) ────────────────────────────────────────────
+// Shared with the aim_to / water_arc / valve open-close guards below;
+// the implementation lives after water_arc.
+static volatile bool s_zone_trace_busy  = false;
+// 0 = run, 1 = stop (trace task closes the valve), 2 = stop only
+// (stop_and_close owns the valve -- don't fight its valve_goto).
+static volatile int  s_zone_trace_abort = 0;
+
 // b325: aim_to -- drive nozzle and valve to their respective targets
 // simultaneously, as quickly as the hardware allows.
 //
@@ -15920,6 +16124,10 @@ static bool aim_to(float target_bearing, float target_valve_deg)
              s_web_water_mode);
         return false;
     }
+    if (s_zone_trace_busy) {
+        INFO("aim: refusing -- zone trace in progress");
+        return false;
+    }
 
     // Clamp targets into valid ranges.
     if (target_valve_deg < VALVE_CAL_START_DEG) target_valve_deg = VALVE_CAL_START_DEG;
@@ -15934,11 +16142,11 @@ static bool aim_to(float target_bearing, float target_valve_deg)
     vTaskDelay(pdMS_TO_TICKS(150));
 
     chase_motor_t nm = {0}, vm = {0};
-    if (!chase_motor_setup(&nm, GPIO_NFWD, GPIO_NREV)) {
+    if (!chase_motor_setup(&nm, NOZZLE_PIN_FWD, NOZZLE_PIN_REV)) {
         INFO("aim: nozzle PWM setup failed");
         return false;
     }
-    if (!chase_motor_setup(&vm, GPIO_VFWD, GPIO_VREV)) {
+    if (!chase_motor_setup(&vm, VALVE_PIN_FWD, VALVE_PIN_REV)) {
         INFO("aim: valve PWM setup failed");
         chase_motor_teardown(&nm);
         return false;
@@ -16203,7 +16411,7 @@ static bool water_arc_run(float throw_mm, float arc_start_deg,
     if (run_duty > 450)      run_duty = 450;
 
     chase_motor_t nm = {0};
-    if (!chase_motor_setup(&nm, GPIO_NFWD, GPIO_NREV)) {
+    if (!chase_motor_setup(&nm, NOZZLE_PIN_FWD, NOZZLE_PIN_REV)) {
         INFO("water_arc: nozzle PWM setup failed");
         return false;
     }
@@ -16314,6 +16522,10 @@ bool irrigoto_water_arc(float throw_mm, float arc_start_deg,
              s_web_water_mode);
         return false;
     }
+    if (s_zone_trace_busy) {
+        INFO("water_arc: refusing -- zone trace in progress");
+        return false;
+    }
     s_water_arc_args.throw_mm      = throw_mm;
     s_water_arc_args.arc_start_deg = arc_start_deg;
     s_water_arc_args.arc_end_deg   = arc_end_deg;
@@ -16339,12 +16551,346 @@ bool irrigoto_water_arc(float throw_mm, float arc_start_deg,
     return true;
 }
 
+// b417: zone_trace -- glide the stream around a zone's stored perimeter in
+// ONE continuous motion. Built after the HA-side water_arc-chaining attempt
+// (script.irrigoto_glide_perimeter v1) proved jerky: HA can't see arc
+// completion, so every sub-arc needed a timing margin that read as a pause,
+// and the valve only re-aimed between arcs.
+//
+// Motion model:
+//   - Waypoints are the zone's points in walk_idx order; close_loop appends
+//     waypoint 0 again so the glide ends where it started.
+//   - Each leg is derived from the ACTUAL current bearing (positioning error
+//     never accumulates) and swept at constant duty, water_arc style.
+//   - The valve chases a target interpolated along the leg's measured sweep
+//     progress -- throw tracks the polygon edge, not a per-leg constant.
+//   - Same-direction vertices carry straight through at full duty; the sweep
+//     only brakes (cosine ease) where the walk reverses direction, goes
+//     radial (bearing-change < 1 deg, valve-only leg), or ends.
+//   - If the valve lags its target by > V_LAG_DEG the nozzle drops to its
+//     floor duty until the valve catches up (keeps the landing point on the
+//     edge through fast throw swings like Edge's 8 m -> 0.5 m corner run).
+//   - Leg 0 is a dry reposition: full aim-speed duty to the first point with
+//     the valve HELD (sentinel target < 0), then a radial "open to first
+//     throw" leg. Water starts at the perimeter, not smeared across the yard.
+//
+// Ends (or aborts with s_zone_trace_abort == 1) by closing the valve and
+// powering the rails down -- a self-contained show, unlike water_arc's
+// chain-friendly valve-left-open. abort == 2 means stop_and_close is doing
+// the teardown; release the motors and DON'T touch the valve.
+typedef struct {
+    uint16_t zone_id;
+    float    speed_dps;
+    bool     close_loop;
+} zone_trace_args_t;
+static zone_trace_args_t s_zone_trace_args;
+static zone_perimeter_t  s_zone_trace_zp;   // static: keep the task stack lean
+
+static void zone_trace_run(uint16_t zone_id, float speed_dps, bool close_loop)
+{
+    if (speed_dps <  1.0f) speed_dps =  1.0f;
+    if (speed_dps > 25.0f) speed_dps = 25.0f;
+
+    // Load the zone (same sources as /zone/export: LittleFS, NVS fallback
+    // for zone 0).
+    zone_perimeter_t *zp = &s_zone_trace_zp;
+    memset(zp, 0, sizeof(*zp));
+    bool ok = false;
+    if (storage_ready()) {
+        char lfsname[32] = {0};
+        ok = (storage_zone_load(zone_id, lfsname, sizeof(lfsname), zp) == ESP_OK);
+    }
+    if (!ok && zone_id == 0) {
+        zone_load_nvs(zp);
+        ok = zp->num_points > 0;
+    }
+    if (!ok || zp->num_points < 2) {
+        INFO("zone_trace: zone %u unavailable or has < 2 points", zone_id);
+        return;
+    }
+
+    // Waypoint arrays in walk order. +2 slots: the "open valve at the first
+    // point" radial leg and the optional close-the-loop repeat of point 0.
+    // tv < 0 is the "hold valve" sentinel (leg 0 dry reposition).
+    static float tb[ZONE_MAX_PERIM_POINTS + 2];
+    static float tv[ZONE_MAX_PERIM_POINTS + 2];
+    int n = 0;
+    for (int want = 0; want < zp->num_points; want++) {   // O(n^2), n <= 36
+        for (int i = 0; i < zp->num_points; i++) {
+            if (zp->points[i].walk_idx == want) {
+                tb[n] = zp->points[i].nozzle_deg;
+                tv[n] = cal_throw_to_valve_deg(zp->points[i].throw_mm);
+                n++;
+                break;
+            }
+        }
+    }
+    if (n != zp->num_points) {   // walk_idx isn't a clean 0..n-1 permutation
+        n = 0;
+        for (int i = 0; i < zp->num_points; i++) {
+            tb[n] = zp->points[i].nozzle_deg;
+            tv[n] = cal_throw_to_valve_deg(zp->points[i].throw_mm);
+            n++;
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        if (tv[i] < VALVE_CAL_START_DEG) tv[i] = VALVE_CAL_START_DEG;
+        if (tv[i] > VALVE_OPEN_DEG)      tv[i] = VALVE_OPEN_DEG;
+    }
+    if (close_loop) { tb[n] = tb[0]; tv[n] = tv[0]; n++; }
+    // Prepend the dry reposition: waypoint 0 twice, first with valve held.
+    for (int i = n; i > 0; i--) { tb[i] = tb[i - 1]; tv[i] = tv[i - 1]; }
+    tv[0] = -1.0f;   // hold valve while flying to tb[0]
+    n++;
+
+    INFO("zone_trace: zone %u, %d waypoints (%s), speed %.1f dps",
+         zone_id, n - 1, close_loop ? "closed loop" : "open path", speed_dps);
+
+    // Tuning. Nozzle constants match water_arc (b318 K, b346 floor); valve
+    // chase is gentler than aim_to's 320 -- it follows a slow-moving target,
+    // not a step.
+    const float    K_DUTY_PER_DPS = 15.0f;
+    const uint16_t N_MIN_DUTY     = 70;
+    const uint16_t N_ALIGN_DUTY   = 380;   // leg-0 dry reposition (aim_to speed)
+    const float    N_TOL_DEG      = 1.0f;
+    const float    MIN_SWEEP_DEG  = 1.0f;  // below this a leg is radial
+    const uint16_t V_CHASE_DUTY   = 220;
+    const uint16_t V_MIN_DUTY     = 70;
+    const float    V_TOL_DEG      = 0.8f;
+    const float    V_DECEL_DEG    = 4.0f;
+    const float    V_LAG_DEG      = 5.0f;
+    const float    V_NOM_DPS      = 8.0f;  // timeout estimates only
+    const uint32_t TICK_MS        = 30;
+    const int      VALVE_OPEN_DIR = -1;    // FWD pin closes valve (b318)
+
+    uint16_t run_duty = (uint16_t)(K_DUTY_PER_DPS * speed_dps);
+    if (run_duty < N_MIN_DUTY) run_duty = N_MIN_DUTY;
+    if (run_duty > 450)        run_duty = 450;
+    float eff_dps = (float)run_duty / K_DUTY_PER_DPS;
+
+    sensor_rail_on();
+    motor_rail_on();
+    vTaskDelay(pdMS_TO_TICKS(150));
+
+    chase_motor_t nm = {0}, vm = {0};
+    if (!chase_motor_setup(&nm, NOZZLE_PIN_FWD, NOZZLE_PIN_REV)) {
+        INFO("zone_trace: nozzle PWM setup failed");
+        goto closeout;
+    }
+    if (!chase_motor_setup(&vm, VALVE_PIN_FWD, VALVE_PIN_REV)) {
+        INFO("zone_trace: valve PWM setup failed");
+        chase_motor_teardown(&nm);
+        goto closeout;
+    }
+
+    {
+        bool aborted = false;
+        int  v_dir   = 0;   // current valve drive dir, 0 = stopped
+        TickType_t t_trace = xTaskGetTickCount();
+
+        for (int leg = 0; leg + 1 < n && !aborted; leg++) {
+            uint16_t n_raw = 0, v_raw = 0;
+            as5600_read(ADDR_AS5600,  &n_raw, NULL, NULL);
+            as5600_read(ADDR_AS5600L, &v_raw, NULL, NULL);
+            float cur_b = n_raw * (360.0f / 4096.0f);
+            float v0    = v_raw * (360.0f / 4096.0f);
+
+            // Leg geometry from the actual current position.
+            float d = tb[leg + 1] - cur_b;
+            while (d >  180.0f) d -= 360.0f;
+            while (d < -180.0f) d += 360.0f;
+            float span   = fabsf(d);
+            int   dirn   = (d >= 0.0f) ? +1 : -1;
+            float v1     = (tv[leg + 1] < 0.0f) ? v0 : tv[leg + 1];
+            bool  radial = (span < MIN_SWEEP_DEG);
+            bool  dry    = (tv[leg + 1] < 0.0f);
+            uint16_t leg_duty = dry ? N_ALIGN_DUTY : run_duty;
+            float decel_band  = (leg_duty > 200) ? 12.0f : 5.0f;
+
+            // Brake into this leg's end unless the sweep carries straight
+            // into the next leg (same direction, non-radial).
+            bool brake_end = true;
+            if (!radial && leg + 2 < n) {
+                float dn = tb[leg + 2] - tb[leg + 1];
+                while (dn >  180.0f) dn -= 360.0f;
+                while (dn < -180.0f) dn += 360.0f;
+                brake_end = (fabsf(dn) < MIN_SWEEP_DEG) ||
+                            (((dn >= 0.0f) ? +1 : -1) != dirn);
+            }
+
+            float exp_s = radial ? 0.0f : span / (dry ? (N_ALIGN_DUTY / K_DUTY_PER_DPS)
+                                                      : eff_dps);
+            float vexp  = fabsf(v1 - v0) / V_NOM_DPS;
+            if (vexp > exp_s) exp_s = vexp;
+            uint32_t leg_timeout = (uint32_t)(exp_s * 2000.0f) + 4000;
+
+            if (radial) chase_motor_apply(&nm, 0, 0);
+
+            float prev_b = cur_b, traveled = 0.0f;
+            TickType_t t_leg = xTaskGetTickCount();
+
+            for (;;) {
+                if (s_zone_trace_abort) { aborted = true; break; }
+                if (s_web_water_mode != 0) {
+                    // A watering run started under us -- it owns the motors
+                    // and the valve now. Release everything and vanish.
+                    INFO("zone_trace: watering started -- yielding");
+                    s_zone_trace_abort = 2;
+                    aborted = true;
+                    break;
+                }
+                if ((uint32_t)pdTICKS_TO_MS(xTaskGetTickCount() - t_leg) >= leg_timeout) {
+                    INFO("zone_trace: leg %d timeout (%.1f / %.1f deg) -- continuing",
+                         leg, fabsf(traveled), span);
+                    break;   // next leg re-derives from the actual position
+                }
+                vTaskDelay(pdMS_TO_TICKS(TICK_MS));
+                TOUCH_ACTIVITY();
+
+                as5600_read(ADDR_AS5600,  &n_raw, NULL, NULL);
+                as5600_read(ADDR_AS5600L, &v_raw, NULL, NULL);
+                cur_b = n_raw * (360.0f / 4096.0f);
+                float cur_v = v_raw * (360.0f / 4096.0f);
+
+                float db = cur_b - prev_b;
+                while (db >  180.0f) db -= 360.0f;
+                while (db < -180.0f) db += 360.0f;
+                traveled += db;
+                prev_b    = cur_b;
+
+                float progress = radial ? span : traveled * (float)dirn;
+                if (progress < 0.0f)  progress = 0.0f;
+                if (progress > span)  progress = span;
+                float frac = (radial || span < 0.01f) ? 1.0f : progress / span;
+
+                // Valve: chase the along-leg interpolated target.
+                float v_tgt = v0 + (v1 - v0) * frac;
+                float v_err = v_tgt - cur_v;
+                float v_abs = fabsf(v_err);
+                if (v_abs < V_TOL_DEG) {
+                    if (v_dir) { chase_motor_apply(&vm, 0, 0); v_dir = 0; }
+                } else {
+                    int want = (v_err >= 0.0f) ? VALVE_OPEN_DIR : -VALVE_OPEN_DIR;
+                    uint16_t vd;
+                    if (v_abs < V_DECEL_DEG) {
+                        float t    = v_abs / V_DECEL_DEG;
+                        float ease = 0.5f * (1.0f - cosf((float)M_PI * t));
+                        vd = (uint16_t)((float)V_MIN_DUTY
+                                + ease * (float)(V_CHASE_DUTY - V_MIN_DUTY));
+                    } else {
+                        vd = V_CHASE_DUTY;
+                    }
+                    if (v_dir && want != v_dir) {
+                        chase_motor_reverse_fast(&vm, vd);
+                        v_dir = vm.dir;
+                    } else {
+                        chase_motor_apply(&vm, want, vd);
+                        v_dir = want;
+                    }
+                    s_valve_last_dir = v_dir;
+                }
+
+                if (radial) {
+                    if (v_abs < V_TOL_DEG) break;   // valve settled -> leg done
+                    continue;
+                }
+
+                // Nozzle: constant duty, eased only into braking ends.
+                float to_go = span - progress;
+                if (to_go <= N_TOL_DEG) {
+                    if (brake_end) chase_motor_apply(&nm, 0, 0);
+                    break;
+                }
+                uint16_t nd = leg_duty;
+                if (brake_end && to_go < decel_band) {
+                    float t    = to_go / decel_band;
+                    float ease = 0.5f * (1.0f - cosf((float)M_PI * t));
+                    nd = (uint16_t)((float)N_MIN_DUTY
+                            + ease * (float)(leg_duty - N_MIN_DUTY));
+                }
+                if (v_abs > V_LAG_DEG) nd = N_MIN_DUTY;   // let the valve catch up
+                chase_motor_apply(&nm, dirn, nd);
+                s_nozzle_last_dir = dirn;
+            }
+        }
+
+        chase_motor_apply(&nm, 0, 0);
+        chase_motor_apply(&vm, 0, 0);
+        chase_motor_teardown(&nm);
+        chase_motor_teardown(&vm);
+
+        INFO("zone_trace: %s after %u ms",
+             aborted ? "aborted" : "complete",
+             (unsigned)pdTICKS_TO_MS(xTaskGetTickCount() - t_trace));
+    }
+
+closeout:
+    if (s_zone_trace_abort != 2) {
+        valve_goto(VALVE_CLOSED_DEG, 2.0f, 10000, true);
+        motor_rail_off();
+        sensor_rail_off();
+    }
+}
+
+static void zone_trace_task(void *arg)
+{
+    (void)arg;   // args are in s_zone_trace_args
+    zone_trace_args_t a = s_zone_trace_args;
+    zone_trace_run(a.zone_id, a.speed_dps, a.close_loop);
+    s_zone_trace_busy = false;
+    vTaskDelete(NULL);
+}
+
+bool irrigoto_zone_trace_start(uint16_t zone_id, float speed_dps, bool close_loop)
+{
+    if (s_zone_trace_busy) {
+        INFO("zone_trace: refusing -- trace already in progress");
+        return false;
+    }
+    if (s_water_arc_busy) {
+        INFO("zone_trace: refusing -- water_arc in progress");
+        return false;
+    }
+    if (s_web_water_mode != 0) {
+        INFO("zone_trace: refusing -- watering in progress (mode %d)",
+             s_web_water_mode);
+        return false;
+    }
+    if (s_exp_running || (s_wcal.state != WCAL_IDLE && s_wcal.state != WCAL_DONE)) {
+        INFO("zone_trace: refusing -- calibration/experiment in progress");
+        return false;
+    }
+    s_zone_trace_args.zone_id    = zone_id;
+    s_zone_trace_args.speed_dps  = speed_dps;
+    s_zone_trace_args.close_loop = close_loop;
+    s_zone_trace_abort = 0;
+    s_zone_trace_busy  = true;
+    // Stack + core per water_arc (b330 depth lesson, b294 PRO_CPU rule).
+    BaseType_t r = xTaskCreatePinnedToCore(
+        zone_trace_task, "zone_trace", 16384, NULL, 9, NULL, PRO_CPU_NUM);
+    if (r != pdPASS) {
+        ESP_LOGE(TAG, "zone_trace: xTaskCreate failed");
+        s_zone_trace_busy = false;
+        return false;
+    }
+    return true;
+}
+
+void irrigoto_zone_trace_stop(void)
+{
+    if (s_zone_trace_busy) s_zone_trace_abort = 1;
+}
+
 void irrigoto_stop_and_close(void)
 {
     INFO("HA stop_all: aborting all activity and closing valve");
 
     // Watering loop — sets the abort flag the water_task checks.
     irrigoto_stop_watering();
+
+    // b417: zone-trace glide — stop-only (2): we drive the valve below,
+    // the trace task must release the motors and stay off it.
+    if (s_zone_trace_busy) s_zone_trace_abort = 2;
 
     // Calibration / jog tasks — set state to IDLE. The jog task polls
     // state and exits. Pressure-scan and nozzle-cal tasks don't poll
@@ -16370,6 +16916,14 @@ void irrigoto_stop_and_close(void)
 
 void irrigoto_valve_close(void)
 {
+    if (s_zone_trace_busy) {
+        // b417: closing the valve during a glide means "stop the show" --
+        // signal the trace task; IT closes the valve (two concurrent
+        // valve_goto calls would fight on the PWM pins).
+        INFO("HA close_valve: zone trace active -- stopping it instead");
+        irrigoto_zone_trace_stop();
+        return;
+    }
     INFO("HA close_valve");
     sensor_rail_on();
     motor_rail_on();
@@ -16378,6 +16932,10 @@ void irrigoto_valve_close(void)
 
 void irrigoto_valve_open(void)
 {
+    if (s_zone_trace_busy) {
+        INFO("HA open_valve: refusing -- zone trace owns the valve");
+        return;
+    }
     INFO("HA open_valve");
     sensor_rail_on();
     motor_rail_on();
