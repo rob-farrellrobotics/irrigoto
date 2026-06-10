@@ -1985,6 +1985,18 @@ static void cal_apply_two_anchor_throw(pressure_map_t *pm,
     }
 }
 
+// Adam 6114-E / v420 local fix: after /cal/valve the calibrated valve frame can
+// put the active pressure range close to the encoder's 360->0 wrap. Keep scan
+// analysis in an *unwrapped* angle frame relative to the commanded sweep angle;
+// otherwise discovery can see det_start near 303deg and det_end near 28deg and
+// skip the fine scan, collapsing pressure calibration to one point.
+static float cal_unwrap_deg_near(float deg, float reference_deg)
+{
+    while (deg < reference_deg - 180.0f) deg += 360.0f;
+    while (deg > reference_deg + 180.0f) deg -= 360.0f;
+    return deg;
+}
+
 // Shared pressure calibration scan used by both terminal ('x') and web paths.
 // Runs discovery, coarse, fine, gap-fill, return sweep, and post-process.
 // When is_web=true, updates s_wcal.progress and s_wcal.msg for the web UI.
@@ -2004,13 +2016,13 @@ static int cal_do_pressure_scan(pressure_map_t *map, bool is_web)
     INFO("\n-- Phase 0: Discovery scan (%d steps at 10 deg from closed) --", CAL_DISC_STEPS);
     float disc_psi[CAL_DISC_STEPS], disc_act[CAL_DISC_STEPS];
     for (int di = 0; di < CAL_DISC_STEPS; di++) {
-        float angle = fmodf(VALVE_CLOSED_DEG + di * 10.0f, 360.0f);
+        float angle = VALVE_CLOSED_DEG + di * 10.0f;
         valve_goto(angle, 3.0f, 15000, false);
         valve_brake_hold();   // b376: brake-hold so the sample isn't taken while coasting/relaxing
         vTaskDelay(pdMS_TO_TICKS(CAL_SETTLE_MS / 2));
         uint16_t raw = 0;
         as5600_read(ADDR_AS5600L, &raw, NULL, NULL);
-        disc_act[di] = raw * (360.0f / 4096.0f);
+        disc_act[di] = cal_unwrap_deg_near(raw * (360.0f / 4096.0f), angle);
         disc_psi[di] = cal_read_pressure_avg();
         valve_brake_release();
         INFO("  %5.1f deg: %.4f PSI", disc_act[di], disc_psi[di]);
