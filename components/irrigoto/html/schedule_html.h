@@ -314,8 +314,9 @@ function renderStatus() {
 
 function lookupZoneName(zoneOneBased) {
   // schedule entries use 1-based zone numbers; zones[] uses 0-based ids.
+  // Fallback label shows the 0-based "#id" (display convention everywhere).
   const z = state.zones.find(z => z.id === (zoneOneBased - 1));
-  return z ? z.name : ('Zone ' + zoneOneBased);
+  return z ? z.name : ('Zone #' + (zoneOneBased - 1));
 }
 
 function formatLocal(epochSec) {
@@ -536,11 +537,13 @@ function buildZoneOptions(currentZone) {
   state.zones.forEach(z => {
     seen.add(z.id + 1);
     const sel = (z.id + 1 === currentZone) ? ' selected' : '';
+    // value = 1-based wire zone number (functional); label "(#id)" = 0-based
+    // storage id (display convention shared with HA's schedule tab).
     opts += '<option value="' + (z.id+1) + '"' + sel + '>' +
-            escapeHtml(z.name) + ' (#' + (z.id+1) + ')</option>';
+            escapeHtml(z.name) + ' (#' + z.id + ')</option>';
   });
   if (!seen.has(currentZone)) {
-    opts = '<option value="' + currentZone + '" selected>Zone ' + currentZone +
+    opts = '<option value="' + currentZone + '" selected>Zone #' + (currentZone-1) +
            ' (missing)</option>' + opts;
   }
   return opts;

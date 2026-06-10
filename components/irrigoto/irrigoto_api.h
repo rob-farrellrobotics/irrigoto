@@ -63,7 +63,7 @@ int irrigoto_get_zone(void);
 int irrigoto_get_mode(void);
 
 /**
- * Human-readable status string (e.g. "Idle", "Watering zone 2 smooth").
+ * Human-readable status string (e.g. "Idle", "Watering Combined (smooth)").
  * buf must be at least 64 bytes.
  */
 void irrigoto_get_status(char *buf, size_t len);
@@ -73,6 +73,12 @@ void irrigoto_get_status(char *buf, size_t len);
  * buf must be at least 32 bytes.
  */
 void irrigoto_get_zone_name(char *buf, size_t len);
+
+/**
+ * Display name for an arbitrary zone id (0-based storage id), with the
+ * "Zone #<id>" fallback when no name is configured. buf >= 32 bytes. (b422)
+ */
+void irrigoto_zone_name_by_id(int zone_id, char *buf, size_t len);
 
 // ── Last-watering-run summary (used by the HA completion event) ─────────────
 // All values reflect the most-recently-completed watering pass; cleared at

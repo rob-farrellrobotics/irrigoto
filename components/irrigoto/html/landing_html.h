@@ -358,7 +358,7 @@ function renderZones(zones){
               <span class="watering-label" id="wlabel-${z.id}">Watering&hellip;</span>
             </div>
             <div class="zone-name-wrap">
-              <input class="zone-name" type="text" value="${z.name||'Zone '+(z.id+1)}"
+              <input class="zone-name" type="text" value="${z.name||'Zone #'+z.id}"
                 onblur="saveName(${z.id},this.value)"
                 onkeydown="if(event.key==='Enter')this.blur()">
               <span class="edit-icon" title="Tap name to edit">&#9998;</span>
@@ -367,7 +367,7 @@ function renderZones(zones){
             <div class="zone-actions">
               <button class="btn btn-primary" id="wbtn-${z.id}" onclick="handleZoneBtn(${z.id})">&#127783; Water Zone</button>
               <a class="btn" href="/zone?id=${z.id}">&#9881; Setup</a>
-              <button class="btn" style="border-color:rgba(248,113,113,.3);color:#f87171;padding:8px 10px" onclick="deleteZone(${z.id},'${z.name||'Zone '+(z.id+1)}')">&#128465;</button>
+              <button class="btn" style="border-color:rgba(248,113,113,.3);color:#f87171;padding:8px 10px" onclick="deleteZone(${z.id},'${z.name||'Zone #'+z.id}')">&#128465;</button>
             </div>
           </div>
         </div>`;
@@ -707,7 +707,7 @@ async function refreshSchedule(){
     // entries — it's history, not schedule state.
     let lastHtml = '';
     if (d.last_run && d.last_run.epoch > 1700000000){
-      const zn = d.last_run.name || ('Zone '+d.last_run.zone);
+      const zn = d.last_run.name || ('Zone #'+(d.last_run.zone-1));
       const ago = now ? relTimeFromSec(now - d.last_run.epoch, false) : '';
       const stat = d.last_run.status || '';
       const statCol = stat === 'completed' ? 'var(--green)'
@@ -729,14 +729,14 @@ async function refreshSchedule(){
     (d.zones||[]).forEach(z => { zoneMap[z.id+1] = z.name; });
     let html = lastHtml;
     if (d.next_run && d.next_run.epoch > 1700000000){
-      const zn = zoneMap[d.next_run.zone] || ('Zone '+d.next_run.zone);
+      const zn = zoneMap[d.next_run.zone] || ('Zone #'+(d.next_run.zone-1));
       html += '<div style="font-size:12px;color:var(--text-mid);margin-bottom:6px;">'+
               'Next: <span style="color:var(--green)">'+zn+'</span> at '+
               fmtLocalEpoch(d.next_run.epoch, tz)+'</div>';
     }
     html += '<div style="display:flex;flex-direction:column;gap:4px;">';
     entries.forEach(e => {
-      const zn = zoneMap[e.zone] || ('Zone '+e.zone);
+      const zn = zoneMap[e.zone] || ('Zone #'+(e.zone-1));
       const t  = String(e.hour).padStart(2,'0')+':'+String(e.minute).padStart(2,'0');
       html += '<div class="sched-row" data-zone="'+e.zone+'" data-enabled="'+(e.enabled?1:0)+'" '+
               'style="display:flex;justify-content:space-between;align-items:center;'+

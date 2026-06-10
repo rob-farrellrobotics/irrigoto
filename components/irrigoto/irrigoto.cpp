@@ -176,13 +176,23 @@ void IrrigotoComponent::loop() {
         time_t now = ::time(nullptr);
         time_t next_t = 0;
         int    next_zone = 0;
-        char   buf[64];
+        char   buf[96];
         if (irrigoto_schedule_next_run(now, &next_t, &next_zone)) {
             struct tm lt;
             localtime_r(&next_t, &lt);
+            // b422: name-first ("Combined (#1) at ..."). Schedule entries
+            // carry 1-based zone numbers on the wire; the "(#id)" suffix is
+            // the 0-based display id matching HA's schedule tab and cards.
+            // An unnamed zone already resolves to "Zone #<id>" -- no suffix.
+            char zn[32], zlabel[44];
+            irrigoto_zone_name_by_id(next_zone - 1, zn, sizeof(zn));
+            if (strncmp(zn, "Zone #", 6) == 0)
+                snprintf(zlabel, sizeof(zlabel), "%s", zn);
+            else
+                snprintf(zlabel, sizeof(zlabel), "%s (#%d)", zn, next_zone - 1);
             snprintf(buf, sizeof(buf),
-                     "Zone %d at %04d-%02d-%02d %02d:%02d",
-                     next_zone, lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday,
+                     "%s at %04d-%02d-%02d %02d:%02d",
+                     zlabel, lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday,
                      lt.tm_hour, lt.tm_min);
         } else if (irrigoto_schedule_count() == 0) {
             snprintf(buf, sizeof(buf), "no schedule");
@@ -518,9 +528,15 @@ void IrrigotoZoneSelect::control(const std::string &value) {
         ESP_LOGI(TAG, "HA zone select -> %d (%s)", matched_zone, value.c_str());
         irrigoto_set_zone(matched_zone);
     } else {
-        // Legacy "Zone N" fallback in case HA still has a stale option set.
+        // Stale-option fallbacks in case HA still has an old option set.
+        // "Zone #N" (b421+, N = 0-based storage id) takes priority; the
+        // legacy 1-based "Zone N" form is kept for pre-b421 option sets.
+        // sscanf("Zone %d") can't match "Zone #N" ('#' isn't a digit), so
+        // the two parses are unambiguous.
         int z = 0;
-        if (sscanf(value.c_str(), "Zone %d", &z) == 1 && z >= 1)
+        if (sscanf(value.c_str(), "Zone #%d", &z) == 1 && z >= 0)
+            irrigoto_set_zone(z + 1);
+        else if (sscanf(value.c_str(), "Zone %d", &z) == 1 && z >= 1)
             irrigoto_set_zone(z);
     }
     publish_state(value);

@@ -678,6 +678,12 @@ views:
 
                   {% set DLET = ['S','M','T','W','T','F','S'] %}
 
+                  {% set zc = states('input_text.<<DEV_USC>>_zone_cache') |
+                  default('[]', true) %}
+
+                  {% set zcache = (zc | from_json) if zc.startswith('[') else
+                  [] %}
+
                   {% set rows = namespace(items=[]) %}
 
                   {%- for e in ha_entries if (e.id | int(0)) > 0 -%}
@@ -716,7 +722,10 @@ views:
                       {%- else -%}
                         {%- for i in range(7) -%}{%- if mask | bitwise_and(2**i) > 0 -%}{%- set ds.s = ds.s ~ DLET[i] -%}{%- endif -%}{%- endfor -%}
                       {%- endif -%}
-                      {%- set rows.items = rows.items + [{'slot': 0, 'zone': dev_e.zone, 'mode': MODES[dev_e.mode | int(0)], 'depth': DEPTHS[dev_e.depth | int(0)], 'time': '%02d:%02d' | format(dev_e.hour | int(0), dev_e.minute | int(0)), 'days': ds.s, 'enabled': (dev_e.enabled | int(0)) == 1, 'lm': dev_e.last_modified | int(0), 'status': 'pending pull'}] -%}
+                      {#- device entries carry 1-based wire zone numbers; the
+                      table's zone field is the 0-based display id like the
+                      HA-entry rows above -#}
+                      {%- set rows.items = rows.items + [{'slot': 0, 'zone': (dev_e.zone | int(0)) - 1, 'mode': MODES[dev_e.mode | int(0)], 'depth': DEPTHS[dev_e.depth | int(0)], 'time': '%02d:%02d' | format(dev_e.hour | int(0), dev_e.minute | int(0)), 'days': ds.s, 'enabled': (dev_e.enabled | int(0)) == 1, 'lm': dev_e.last_modified | int(0), 'status': 'pending pull'}] -%}
                     {%- endif -%}
                   {%- endfor -%}
 
@@ -735,7 +744,7 @@ views:
 
                   <th style="text-align:left; padding: 2px 6px;">Status</th>
 
-                  <th style="text-align:right; padding: 2px 6px;">Zone</th>
+                  <th style="text-align:left; padding: 2px 6px;">Zone</th>
 
                   <th style="text-align:left; padding: 2px 6px;">Mode</th>
 
@@ -772,8 +781,14 @@ views:
 
                   <td style="padding: 1px 6px;">{{ icon }} {{ r.status }}</td>
 
-                  <td style="text-align:right; padding: 1px 6px;">{{ r.zone
-                  }}</td>
+                  {%- set zn = namespace(s='') -%}
+
+                  {%- for o in zcache -%}{%- if o is string and
+                  o.endswith('(#' ~ r.zone ~ ')') -%}{%- set zn.s = o.rsplit('
+                  (#', 1)[0] -%}{%- endif -%}{%- endfor -%}
+
+                  <td style="text-align:left; padding: 1px 6px;">{{ zn.s if
+                  zn.s else '#' ~ r.zone }}</td>
 
                   <td style="padding: 1px 6px;">{{ r.mode }}</td>
 

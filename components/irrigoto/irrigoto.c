@@ -11430,7 +11430,7 @@ static esp_err_t zone_page_handler(httpd_req_t *req)
         s_web_zone_id = (uint16_t)nc;  // next id = count of existing zones
         s_web_zone_is_new = true;
         memset(&s_web_zone, 0, sizeof(s_web_zone));
-        snprintf(s_web_zone_name, sizeof(s_web_zone_name), "Zone %u", s_web_zone_id + 1);
+        snprintf(s_web_zone_name, sizeof(s_web_zone_name), "Zone #%u", s_web_zone_id);
     } else {
         s_web_zone_id = ids[0] ? (uint16_t)atoi(ids) : 0;
         s_web_zone_is_new = false;
@@ -12214,7 +12214,7 @@ static esp_err_t api_all_handler(httpd_req_t *req)
                 if(zp.points[j].nozzle_deg>ahi)ahi=zp.points[j].nozzle_deg;
             }
             char zrname[32], _zdef[16];
-            snprintf(_zdef, sizeof(_zdef), "Zone %u", ids[i]+1);
+            snprintf(_zdef, sizeof(_zdef), "Zone #%u", ids[i]);
             zone_name_resolve(ids[i], _zn, _zdef, zrname, sizeof(zrname));
             n=snprintf(buf,sizeof(buf),
                 "%s{\"id\":%u,\"name\":\"%s\",\"num_points\":%u,"
@@ -13665,7 +13665,7 @@ static esp_err_t api_schedule_handler(httpd_req_t *req)
             zone_perimeter_t zp = {0};
             char zn[32] = {0};
             if (storage_zone_load(ids[i], zn, sizeof(zn), &zp) != ESP_OK) continue;
-            char zdef[16]; snprintf(zdef, sizeof(zdef), "Zone %u", ids[i]+1);
+            char zdef[16]; snprintf(zdef, sizeof(zdef), "Zone #%u", ids[i]);
             char zname[32];
             zone_name_resolve(ids[i], zn, zdef, zname, sizeof(zname));
             // Escape name (commas and quotes are realistic — users can type anything).
@@ -14417,10 +14417,29 @@ void irrigoto_get_status(char *buf, size_t len)
         const char *mname =
             (s_web_water_mode == 7)                    ? "smooth" :
             (s_web_water_mode >= 5)                    ? "gentle" : "pulse";
-        snprintf(buf, len, "Watering zone %d (%s)", (int)s_water_zone_id + 1, mname);
+        // b422: name-first -- the zone number is only a correlation key for
+        // HA's static cards; the name is what the operator recognizes.
+        char zn[32];
+        irrigoto_zone_name_by_id((int)s_water_zone_id, zn, sizeof(zn));
+        snprintf(buf, len, "Watering %s (%s)", zn, mname);
     } else {
         snprintf(buf, len, "Idle");
     }
+}
+
+// b422: resolve any zone id (0-based storage id) to its display name.
+// Same precedence as everywhere else: LittleFS header -> NVS legacy slot ->
+// "Zone #<id>" fallback. Display-only helper; ids on the wire unchanged.
+void irrigoto_zone_name_by_id(int zone_id, char *buf, size_t len)
+{
+    char lfs_name[32] = {0};
+    if (storage_ready()) {
+        zone_perimeter_t _tmp;
+        storage_zone_load((uint16_t)zone_id, lfs_name, sizeof(lfs_name), &_tmp);
+    }
+    char fallback[16];
+    snprintf(fallback, sizeof(fallback), "Zone #%d", zone_id);
+    zone_name_resolve((uint16_t)zone_id, lfs_name, fallback, buf, len);
 }
 
 void irrigoto_get_zone_name(char *buf, size_t len)
@@ -14452,8 +14471,11 @@ void irrigoto_get_zone_name(char *buf, size_t len)
         zone_perimeter_t _tmp;
         storage_zone_load(s_water_zone_id, lfs_name, sizeof(lfs_name), &_tmp);
     }
+    // b421: display ids are 0-based "#<id>" everywhere (HA schedule tab,
+    // dashboard cards) -- fallback names follow suit. Wire encodings
+    // (schedule entries 1-based, /zone/water 0-based) are untouched.
     char fallback[16];
-    snprintf(fallback, sizeof(fallback), "Zone %d", (int)s_water_zone_id + 1);
+    snprintf(fallback, sizeof(fallback), "Zone #%d", (int)s_water_zone_id);
     zone_name_resolve(s_water_zone_id, lfs_name, fallback, buf, len);
 }
 
@@ -14497,7 +14519,7 @@ void irrigoto_last_water_zone_name(char *buf, size_t len)
         storage_zone_load(s_last_water_zone_id, lfs_name, sizeof(lfs_name), &_tmp);
     }
     char fallback[16];
-    snprintf(fallback, sizeof(fallback), "Zone %d", (int)s_last_water_zone_id + 1);
+    snprintf(fallback, sizeof(fallback), "Zone #%d", (int)s_last_water_zone_id);
     zone_name_resolve(s_last_water_zone_id, lfs_name, fallback, buf, len);
 }
 
@@ -14848,7 +14870,7 @@ int irrigoto_zone_at(int idx, char *name_buf, size_t name_len)
     zone_perimeter_t _tmp;
     storage_zone_load(zid, lfs_name, sizeof(lfs_name), &_tmp);
     char fallback[16];
-    snprintf(fallback, sizeof(fallback), "Zone %u", (unsigned)(zid + 1));
+    snprintf(fallback, sizeof(fallback), "Zone #%u", (unsigned)zid);
     zone_name_resolve(zid, lfs_name, fallback, name_buf, name_len);
     return (int)(zid + 1);
 }
@@ -15343,12 +15365,14 @@ static bool schedule_validate(const schedule_t *s, char *err_buf, size_t err_len
                         ov = (as < (be - 10080) && 0 < ae);
                     if (ov) {
                         if (err_buf && err_len) {
+                            // b421: zone shown as 0-based "#id" (entries'
+                            // wire value is 1-based; display-only shift)
                             snprintf(err_buf, err_len,
-                                "entry %u (zone %u, %s %02u:%02u, est %d min) overlaps "
-                                "entry %u (zone %u, %s %02u:%02u, est %d min)",
-                                (unsigned)i, a->zone, DOW_NAME[da],
+                                "entry %u (zone #%u, %s %02u:%02u, est %d min) overlaps "
+                                "entry %u (zone #%u, %s %02u:%02u, est %d min)",
+                                (unsigned)i, (unsigned)(a->zone - 1), DOW_NAME[da],
                                 a->hour, a->minute, dur[i],
-                                (unsigned)j, b->zone, DOW_NAME[db],
+                                (unsigned)j, (unsigned)(b->zone - 1), DOW_NAME[db],
                                 b->hour, b->minute, dur[j]);
                         }
                         return false;
