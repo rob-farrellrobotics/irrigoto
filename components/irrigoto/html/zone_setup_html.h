@@ -430,6 +430,30 @@ function drawHeatMap(W, H, cx, cy, maxR) {
   for(let i=0;i<sdegs.length;i++){const nxt=i<sdegs.length-1?sdegs[i+1]:sdegs[0]+360;if(nxt-sdegs[i]>mg){mg=nxt-sdegs[i];gi=i;}}
   let arcStart=sdegs[(gi+1)%sdegs.length];
   let arcSpan=((sdegs[gi]-arcStart+360)%360)||360;
+  // Max ray-polygon intersection distance at a bearing (firmware ray cast).
+  function rayMaxMm(bearing){
+    const bs=Math.sin(bearing*Math.PI/180),bc=Math.cos(bearing*Math.PI/180);
+    let best=0;
+    for(let i=0;i<wpts.length;i++){
+      const j=(i+1)%wpts.length,pi=wpts[i],pj=wpts[j];
+      const x1=pi.throw_mm*Math.sin(pi.deg*Math.PI/180),y1=pi.throw_mm*Math.cos(pi.deg*Math.PI/180);
+      const x2=pj.throw_mm*Math.sin(pj.deg*Math.PI/180),y2=pj.throw_mm*Math.cos(pj.deg*Math.PI/180);
+      const dx=x2-x1,dy=y2-y1,det=bc*dx-bs*dy;
+      if(Math.abs(det)<1e-6)continue;
+      const s=(dx*y1-dy*x1)/det,u=(bs*y1-bc*x1)/det;
+      if(s>0.5&&u>=0&&u<=1&&s>best)best=s;
+    }
+    return best;
+  }
+  // b435: only honor the bearing-gap window if the gap is genuinely empty
+  // space. One long straight boundary edge can span a wide vertex-bearing
+  // gap (real zone area, not a wedge back side) -- mirrors firmware
+  // zone_gap_is_empty: probe 3 bearings inside the gap for waterable extent.
+  if(arcSpan<360&&mg>0){
+    let spanned=false;
+    for(let k=1;k<=3;k++)if(rayMaxMm((sdegs[gi]+mg*k/4)%360)>=461)spanned=true;
+    if(spanned){arcStart=0;arcSpan=360;}
+  }
 
   // Ring generation (mirrors firmware)
   const actMax=ST.act_max_throw||10058;
@@ -455,41 +479,6 @@ function drawHeatMap(W, H, cx, cy, maxR) {
   }
 
   const MIN_ELLIPSE=1829, SPLASH_R=300, STEP=1.0;
-
-  // Per-ring arc bounds from zone polygon circle intersection.
-  // Returns {s, e} where s=CW arc start, e=CW arc end (e may exceed 360).
-  // Falls back to full zone arc if < 2 intersections found.
-  function ringArcBounds(r_mm) {
-    const bearings=[];
-    for(let i=0;i<wpts.length;i++){
-      const j=(i+1)%wpts.length,pi=wpts[i],pj=wpts[j];
-      const x1=pi.throw_mm*Math.sin(pi.deg*Math.PI/180);
-      const y1=pi.throw_mm*Math.cos(pi.deg*Math.PI/180);
-      const x2=pj.throw_mm*Math.sin(pj.deg*Math.PI/180);
-      const y2=pj.throw_mm*Math.cos(pj.deg*Math.PI/180);
-      const dx=x2-x1,dy=y2-y1;
-      const a=dx*dx+dy*dy;
-      if(a<1)continue;
-      const b2=2*(x1*dx+y1*dy);
-      const c=x1*x1+y1*y1-r_mm*r_mm;
-      const disc=b2*b2-4*a*c;
-      if(disc<0)continue;
-      const sq=Math.sqrt(disc);
-      for(const sg of[1,-1]){
-        const t=(-b2+sg*sq)/(2*a);
-        if(t<-0.001||t>1.001)continue;
-        const ix=x1+t*dx,iy=y1+t*dy;
-        const bear=(Math.atan2(ix,iy)*180/Math.PI+360)%360;
-        const cwDist=(bear-arcStart+360)%360;
-        if(cwDist<=arcSpan+0.5)bearings.push(bear);
-      }
-    }
-    if(bearings.length<2)return{s:arcStart,e:arcStart+arcSpan};
-    bearings.sort((a,b)=>((a-arcStart+360)%360)-((b-arcStart+360)%360));
-    let e=bearings[bearings.length-1];
-    if(e<bearings[0])e+=360;
-    return{s:bearings[0],e};
-  }
 
   function dcolor(ratio){
     if(ratio<0.6)  return 'rgba(60,140,255,0.55)';
@@ -741,6 +730,27 @@ function drawPath(W, H, cx, cy, maxR) {
   // Origin-inside-polygon: force 360 deg arc so polygon boundary clips coverage
   const pathOriginInside=pointInZone(0,1);
   if(!pathSIC&&pathOriginInside){arcStart=0;arcSpan=360;}
+  // b435: spanned-gap guard (see drawHeatMap) -- a long straight edge can
+  // span the largest vertex-bearing gap; don't window it out of the path.
+  if(arcSpan<360&&mg>0){
+    let spanned=false;
+    for(let k=1;k<=3;k++){
+      const gb=(sdegs[gi]+mg*k/4)%360;
+      const gbs=Math.sin(gb*Math.PI/180),gbc=Math.cos(gb*Math.PI/180);
+      let best=0;
+      for(let i=0;i<ST.points.length;i++){
+        const j=(i+1)%ST.points.length,pi=ST.points[i],pj=ST.points[j];
+        const x1=pi.throw_mm*Math.sin(pi.deg*Math.PI/180),y1=pi.throw_mm*Math.cos(pi.deg*Math.PI/180);
+        const x2=pj.throw_mm*Math.sin(pj.deg*Math.PI/180),y2=pj.throw_mm*Math.cos(pj.deg*Math.PI/180);
+        const dx=x2-x1,dy=y2-y1,det=gbc*dx-gbs*dy;
+        if(Math.abs(det)<1e-6)continue;
+        const s=(dx*y1-dy*x1)/det,u=(gbs*y1-gbc*x1)/det;
+        if(s>0.5&&u>=0&&u<=1&&s>best)best=s;
+      }
+      if(best>=461)spanned=true;
+    }
+    if(spanned){arcStart=0;arcSpan=360;}
+  }
   const rings=[];let t=zoneMax;
   while(t>=zoneMin&&rings.length<36){rings.push(t);t-=Math.max(700*(t/actMax),80);}
   if(!rings.length)return;

@@ -201,6 +201,10 @@ static volatile int  s_exp_section = 0;        // 1 = A (dry dead-time), 2 = B (
 // (1..8 = 1/8".. 1"). 0 = use the legacy digit-encoded depth. Set on each
 // start path; consumed (reset to 0) by the water task.
 static int           s_web_water_depth_eighths = 0;
+// b423: serpentine-mode web params, consumed once by phase_water_zone like
+// depth_eighths. dps 0 = default; dry runs the motion with the valve held.
+static float         s_web_serpentine_dps = 0.0f;
+static bool          s_web_serpentine_dry = false;
 // b317-b323: spiral watering mode (entertainment / fun spiral around zone
 // centroid). Removed in b324. Archived under milestone/esphome-phase2-b323-spiral.
 // b287: "Watering Quiet" mode flag. Set true at the start of a smooth/gentle
@@ -1985,6 +1989,18 @@ static void cal_apply_two_anchor_throw(pressure_map_t *pm,
     }
 }
 
+// Adam 6114-E / v420 local fix: after /cal/valve the calibrated valve frame can
+// put the active pressure range close to the encoder's 360->0 wrap. Keep scan
+// analysis in an *unwrapped* angle frame relative to the commanded sweep angle;
+// otherwise discovery can see det_start near 303deg and det_end near 28deg and
+// skip the fine scan, collapsing pressure calibration to one point.
+static float cal_unwrap_deg_near(float deg, float reference_deg)
+{
+    while (deg < reference_deg - 180.0f) deg += 360.0f;
+    while (deg > reference_deg + 180.0f) deg -= 360.0f;
+    return deg;
+}
+
 // Shared pressure calibration scan used by both terminal ('x') and web paths.
 // Runs discovery, coarse, fine, gap-fill, return sweep, and post-process.
 // When is_web=true, updates s_wcal.progress and s_wcal.msg for the web UI.
@@ -2004,13 +2020,13 @@ static int cal_do_pressure_scan(pressure_map_t *map, bool is_web)
     INFO("\n-- Phase 0: Discovery scan (%d steps at 10 deg from closed) --", CAL_DISC_STEPS);
     float disc_psi[CAL_DISC_STEPS], disc_act[CAL_DISC_STEPS];
     for (int di = 0; di < CAL_DISC_STEPS; di++) {
-        float angle = fmodf(VALVE_CLOSED_DEG + di * 10.0f, 360.0f);
+        float angle = VALVE_CLOSED_DEG + di * 10.0f;
         valve_goto(angle, 3.0f, 15000, false);
         valve_brake_hold();   // b376: brake-hold so the sample isn't taken while coasting/relaxing
         vTaskDelay(pdMS_TO_TICKS(CAL_SETTLE_MS / 2));
         uint16_t raw = 0;
         as5600_read(ADDR_AS5600L, &raw, NULL, NULL);
-        disc_act[di] = raw * (360.0f / 4096.0f);
+        disc_act[di] = cal_unwrap_deg_near(raw * (360.0f / 4096.0f), angle);
         disc_psi[di] = cal_read_pressure_avg();
         valve_brake_release();
         INFO("  %5.1f deg: %.4f PSI", disc_act[di], disc_psi[di]);
@@ -2033,7 +2049,10 @@ static int cal_do_pressure_scan(pressure_map_t *map, bool is_web)
         return -1;
     }
     float fine_start = fmaxf(0.0f,   det_start - 10.0f);
-    float fine_end   = fminf(359.0f, det_end   + 10.0f);
+    // b430: no 359 cap -- det_end lives in the unwrapped frame now and can
+    // legitimately exceed 360 (offset > ~+49 puts the active band across the
+    // encoder wrap). VALVE_OPEN_DEG + 2 below is the frame-correct bound.
+    float fine_end   = det_end + 10.0f;
     float fine_end_capped = fminf(fine_end, VALVE_OPEN_DEG + 2.0f);
     INFO("\nDetected: baseline=%.4f PSI  active=%.1f to %.1f deg  peak=%.4f PSI",
          baseline, det_start, det_end, det_peak);
@@ -2049,7 +2068,8 @@ static int cal_do_pressure_scan(pressure_map_t *map, bool is_web)
         vTaskDelay(pdMS_TO_TICKS(CAL_SETTLE_MS));
         uint16_t raw = 0;
         as5600_read(ADDR_AS5600L, &raw, NULL, NULL);
-        float actual_deg = raw * (360.0f / 4096.0f);
+        // b430: unwrap so the stored map stays monotonic across the 360 wrap
+        float actual_deg = cal_unwrap_deg_near(raw * (360.0f / 4096.0f), angle);
         float psi = cal_read_pressure_avg();
         valve_brake_release();
         map->valve_deg[n]    = actual_deg;
@@ -2083,7 +2103,7 @@ static int cal_do_pressure_scan(pressure_map_t *map, bool is_web)
         vTaskDelay(pdMS_TO_TICKS(CAL_SETTLE_MS));
         uint16_t raw = 0;
         as5600_read(ADDR_AS5600L, &raw, NULL, NULL);
-        float actual_deg = raw * (360.0f / 4096.0f);
+        float actual_deg = cal_unwrap_deg_near(raw * (360.0f / 4096.0f), angle);  // b430
         float psi = cal_read_pressure_avg();
         valve_brake_release();
         map->valve_deg[n]    = actual_deg;
@@ -2108,7 +2128,7 @@ static int cal_do_pressure_scan(pressure_map_t *map, bool is_web)
         vTaskDelay(pdMS_TO_TICKS(CAL_SETTLE_MS));
         uint16_t raw = 0;
         as5600_read(ADDR_AS5600L, &raw, NULL, NULL);
-        float actual_deg = raw * (360.0f / 4096.0f);
+        float actual_deg = cal_unwrap_deg_near(raw * (360.0f / 4096.0f), angle);  // b430
         float psi = cal_read_pressure_avg();
         valve_brake_release();
         // Skip saturated points: if PSI hasn't risen ≥0.05 from previous point
@@ -2154,7 +2174,7 @@ static int cal_do_pressure_scan(pressure_map_t *map, bool is_web)
                 vTaskDelay(pdMS_TO_TICKS(CAL_SETTLE_MS));
                 uint16_t raw = 0;
                 as5600_read(ADDR_AS5600L, &raw, NULL, NULL);
-                float actual_deg = raw * (360.0f / 4096.0f);
+                float actual_deg = cal_unwrap_deg_near(raw * (360.0f / 4096.0f), a);  // b430
                 float psi = cal_read_pressure_avg();
                 valve_brake_release();
                 map->valve_deg[n]    = actual_deg;
@@ -2212,7 +2232,7 @@ static int cal_do_pressure_scan(pressure_map_t *map, bool is_web)
         vTaskDelay(pdMS_TO_TICKS(CAL_SETTLE_MS));
         uint16_t raw = 0;
         as5600_read(ADDR_AS5600L, &raw, NULL, NULL);
-        float actual_deg = raw * (360.0f / 4096.0f);
+        float actual_deg = cal_unwrap_deg_near(raw * (360.0f / 4096.0f), map->valve_deg[i]);  // b430
         psi_ret[i] = cal_read_pressure_avg();
         INFO("  Return pt %2d: target=%.1f actual=%.1f deg  %.3f PSI",
              i+1, map->valve_deg[i], actual_deg, psi_ret[i]);
@@ -5854,12 +5874,18 @@ static float water_perimeter_throw(const zone_perimeter_t *z,
         float b1 = (i < n-1) ? sb[i+1] : sb[0] + 360.0f;
         if (b1 - b0 > max_gap) { max_gap=b1-b0; gap_lo=b0; gap_hi=b1; }
     }
+    bool in_gap = false;
     if (max_gap > 45.0f) {
-        bool in_gap;
         if (gap_hi <= 360.0f) in_gap = (bearing_deg > gap_lo && bearing_deg < gap_hi);
         else { float hw=gap_hi-360.0f; in_gap=(bearing_deg>gap_lo||bearing_deg<hw); }
-        if (in_gap) return 0.0f;
     }
+    // b435: an in-gap bearing is NOT automatically outside the zone. A single
+    // long straight edge (e.g. an 80-deg chord between two far corners) can
+    // legitimately span the largest vertex-bearing gap; zeroing that wedge
+    // outright dried out ~40% of such a zone. Fall through to the exact ray
+    // cast and zero only if the polygon has no waterable extent at this
+    // bearing (a true wedge back side: closing edges hug the head, so the
+    // ray cast lands below the nozzle's minimum throw).
 
     // --- Ray-polygon intersection ---
     // Cast a ray from the origin at bearing_deg and intersect every edge of the
@@ -5908,7 +5934,24 @@ static float water_perimeter_throw(const zone_perimeter_t *z,
             best = s;
     }
 
+    if (in_gap && best < WATER_MIN_THROW_MM) return 0.0f;
     return best;
+}
+
+// b435: companion to the gap logic above for callers that restrict the sweep
+// arc to the complement of the largest vertex-bearing gap. Returns true only
+// if the gap is genuinely empty space (a wedge zone's inactive back side).
+// Probes three bearings inside the gap; any waterable extent means the gap is
+// spanned by a real polygon edge and the arc must NOT be restricted.
+static bool zone_gap_is_empty(const zone_perimeter_t *z, float gap_lo,
+                              float gap_deg, float psi_min, float psi_max)
+{
+    for (int k = 1; k <= 3; k++) {
+        float b = fmodf(gap_lo + gap_deg * (float)k / 4.0f + 360.0f, 360.0f);
+        if (water_perimeter_throw(z, b, psi_min, psi_max) >= WATER_MIN_THROW_MM)
+            return false;
+    }
+    return true;
 }
 
 // Move valve to target_psi using feedforward + proportional correction.
@@ -7441,6 +7484,961 @@ static void chase_motor_teardown(chase_motor_t *m)
     memset(m, 0, sizeof(*m));
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// b423: Serpentine mode -- continuous serpentine coverage watering (mode 8 / 'n').
+//
+// The OEM firmware waters irregular zones in one continuous boustrophedon:
+// concentric arcs alternating direction, joined by smooth turns -- the
+// stream never stops. Smooth mode (mode 7) already PLANS exactly those
+// arcs (ring_throws + polygon clip) but executes them with brake +
+// nozzle_goto reposition + valve jog between rings, and the b296 scheduler
+// hops between non-adjacent rings. Serpentine = smooth's ring plan + the b417
+// zone_trace glide motion: outermost ring -> innermost, sweep direction
+// alternating per ring, the valve gliding to the next ring's throw during
+// each turn. Out->in ordering preserves the validated b297 supply insight
+// by construction (long-throw rings fire while supply is fresh).
+//
+// Phase A (this build): single pass at a fixed conservative speed
+// (default 8 dps, speed= param 3..20). Inner/direct-valve rings are
+// deferred (b367: gliding the valve down into the sub-cal band risks the
+// seat dead-band no-flow spot; a seated smooth-style tail is Phase B).
+// Depth IS credited per sweep leg into the cumulative tracker (gentle-
+// style: every pass, no throw correction) so the shared closeout's
+// heatmap / last_water plumbing works unchanged. dry=1 runs the full
+// motion with the valve held closed -- a polygon-containment rehearsal
+// before water flows.
+//
+// Runs INSIDE phase_water_zone's water task: branches just before the
+// smooth/gentle pass loop and rejoins at the shared abort:/closeout
+// (valve close, aggregate flush, depth compute, run summary).
+
+typedef enum {
+    SERPENTINE_LEG_REPOS = 0,   // dry full-speed aim to the path start, valve held
+    SERPENTINE_LEG_TURN,        // ring-to-ring turn / radial valve glide
+    SERPENTINE_LEG_SWEEP,       // watering sweep across one ring arc
+    SERPENTINE_LEG_TRANSIT,     // dry hop across an inactive gap (multi-arc rings)
+} serpentine_leg_kind_t;
+
+typedef struct {
+    float    b1_deg;       // leg end bearing (start = ACTUAL current bearing)
+    float    v1_deg;       // valve target at leg end; < 0 = hold (dry reposition)
+    uint16_t duty;         // nozzle PWM for SWEEP/TURN legs (speed-map solved)
+    float    dps;          // planned deg/s (timeout sizing + measured-dps fallback)
+    int8_t   ring;         // ring index for depth/CSV attribution; -1 = none
+    int8_t   dir;          // +1 CW, -1 CCW (sweep/transit); 0 = shortest path
+    uint8_t  kind;         // serpentine_leg_kind_t
+    float    ring_throw;   // mm, CSV target columns (SWEEP legs)
+} serpentine_leg_t;
+
+// 36 rings x (turn + sweep) + boundary-hug waypoint (b426) and multi-arc
+// slack. Static: the water task stack is 16 KB and has history of running
+// close (b285).
+#define SERPENTINE_MAX_LEGS 256
+// b426: boundary-hugging turns. Waypoint pitch along the connector, and how
+// far inside the polygon's radial extent the hug path rides. The hug radius
+// at each waypoint is min(linear glide, perimeter extent - margin); a turn
+// goes dry only when that falls below the waterable floor (true exclusion).
+#define SERPENTINE_TURN_STEP_DEG   4.0f
+#define SERPENTINE_TURN_MARGIN_MM  200.0f
+#define SERPENTINE_TURN_MAX_WPS    64
+static serpentine_leg_t s_serpentine_legs[SERPENTINE_MAX_LEGS];
+
+// b423: directional speed-map duty lookup, extracted verbatim from the
+// smooth-mode ring loop (CCW/NREV can run at a very different speed than
+// CW/NFWD at the same duty -- use the CCW-specific table when available).
+// Returns 250 when no usable map exists (smooth's historical default).
+static uint16_t spd_duty_for_dps(const speed_map_t *spd, bool have_spd,
+                                 float dps, bool cw)
+{
+    uint16_t run_duty = 250;
+    bool use_ccw = !cw && have_spd && (spd->num_points_ccw >= 2);
+    int             np = use_ccw ? spd->num_points_ccw  : spd->num_points;
+    const uint16_t *dt = use_ccw ? spd->duty_ccw        : spd->duty;
+    const float    *ds = use_ccw ? spd->deg_per_sec_ccw : spd->deg_per_sec;
+    if (have_spd && np >= 2) {
+        if (dps <= ds[0]) {
+            run_duty = dt[0];
+        } else if (dps >= ds[np-1]) {
+            run_duty = dt[np-1];
+        } else {
+            for (int k = 0; k < np-1; k++) {
+                if (dps >= ds[k] && dps <= ds[k+1]) {
+                    float fr = (dps - ds[k]) / (ds[k+1] - ds[k]);
+                    run_duty = (uint16_t)(dt[k] + fr*(dt[k+1]-dt[k]));
+                    break;
+                }
+            }
+        }
+    }
+    if (use_ccw)
+        INFO("  (CCW table: duty=%u for %.1fdps)", run_duty, dps);
+    return run_duty;
+}
+
+// b423: per-ring clipped arc bounds in CW order along the zone arc.
+// Mirrors the smooth ring loop's per-arc bound derivation (sector activity
+// bitmap -> water_find_arcs -> snap-to-zone-edge -> zone_refine_arc_bound
+// -> zone_clip_arc_to_polygon) but standalone -- the inline original is
+// interleaved with pass state. Drops arcs whose fully-inside span is below
+// half a sector (b309: never re-expand a clipped arc). Returns arc count.
+static int serpentine_arc_bounds(const zone_perimeter_t *zone, bool have_zone,
+                            float ring_throw, const float *sector_throw,
+                            float act_max_throw,
+                            float zone_arc_start, float zone_arc_end,
+                            float zone_arc_deg,
+                            float lo_out[WATER_MAX_ARCS_PER_RING],
+                            float hi_out[WATER_MAX_ARCS_PER_RING])
+{
+    bool active[WATER_SECTORS];
+    int  active_count = 0;
+    for (int s = 0; s < WATER_SECTORS; s++) {
+        float tol = WATER_RING_SPACING * (ring_throw / act_max_throw) * 0.5f;
+        active[s] = (ring_throw <= sector_throw[s] + tol);
+        if (active[s]) active_count++;
+    }
+    if (active_count == 0) return 0;
+
+    water_arc_t arcs[WATER_MAX_ARCS_PER_RING];
+    int num_arcs = water_find_arcs(active, arcs);
+
+    // Sort by CW distance of first_sec from zone_arc_start (handles zones
+    // crossing 0 deg; see the smooth loop's sort).
+    for (int a = 0; a < num_arcs-1; a++)
+        for (int b = a+1; b < num_arcs; b++) {
+            float s_a = arcs[a].first_sec * WATER_SECTOR_DEG;
+            float s_b = arcs[b].first_sec * WATER_SECTOR_DEG;
+            float da = fmodf(s_a - zone_arc_start + 360.0f, 360.0f);
+            float db = fmodf(s_b - zone_arc_start + 360.0f, 360.0f);
+            if (db < da) { water_arc_t tmp=arcs[a]; arcs[a]=arcs[b]; arcs[b]=tmp; }
+        }
+
+    int n_out = 0;
+    for (int ai = 0; ai < num_arcs && n_out < WATER_MAX_ARCS_PER_RING; ai++) {
+        float first_b = (float)(arcs[ai].first_sec) * WATER_SECTOR_DEG;
+        float last_b  = (float)((arcs[ai].last_sec + 1) % WATER_SECTORS) * WATER_SECTOR_DEG;
+
+        float _lo_cw_from_start = fmodf(first_b - zone_arc_start + 360.0f, 360.0f);
+        bool  _first_in_zone    = (_lo_cw_from_start <= zone_arc_deg + 0.5f);
+        float left_gap = fminf(_lo_cw_from_start,
+                               fmodf(zone_arc_start - first_b + 360.0f, 360.0f));
+        float lo = (!_first_in_zone || left_gap < 0.5f * WATER_SECTOR_DEG)
+                   ? zone_arc_start : first_b;
+
+        float _hi_cw_from_start = fmodf(last_b - zone_arc_start + 360.0f, 360.0f);
+        bool  _last_in_zone     = (_hi_cw_from_start <= zone_arc_deg + 0.5f);
+        float right_gap = fminf(fmodf(last_b      - zone_arc_end + 360.0f, 360.0f),
+                                fmodf(zone_arc_end - last_b      + 360.0f, 360.0f));
+        float hi = (!_last_in_zone || right_gap < 0.5f * WATER_SECTOR_DEG)
+                   ? zone_arc_end : last_b;
+
+        // Full-circle arc (all sectors active): lo == hi after the snaps and
+        // every fmodf span collapses to 0. Represent it as a 359.5 deg sweep
+        // so the clip and the glide engine see a real span.
+        if (active_count == WATER_SECTORS &&
+            fmodf(hi - lo + 360.0f, 360.0f) < 0.01f) {
+            hi = fmodf(lo + 359.5f, 360.0f);
+        }
+
+        if (have_zone && lo == first_b)
+            lo = zone_refine_arc_bound(zone, ring_throw, first_b, WATER_SECTOR_DEG);
+        if (have_zone && hi == last_b)
+            hi = zone_refine_arc_bound(zone, ring_throw, last_b, WATER_SECTOR_DEG);
+        // b309: tighten to the longest contiguous fully-inside sub-arc.
+        if (have_zone)
+            zone_clip_arc_to_polygon(zone, ring_throw, &lo, &hi, 0.5f);
+
+        float seg_deg = fmodf(hi - lo + 360.0f, 360.0f);
+        if (seg_deg < 0.5f * WATER_SECTOR_DEG) continue;   // b309: don't re-expand
+        lo_out[n_out] = fmodf(lo + 360.0f, 360.0f);
+        hi_out[n_out] = fmodf(hi + 360.0f, 360.0f);
+        n_out++;
+    }
+    return n_out;
+}
+
+// b423: ring throw -> valve angle, mirroring the smooth ring loop's lookup:
+// band-anchored direct-valve interpolation for sub-cal rings (b382), the
+// throw-cal table otherwise, pressure-ratio fallback when uncalibrated.
+// pressure_scale applies smooth's pass-0 global supply correction (open
+// further when today's supply is below cal). Clamped to the valve's range.
+static float serpentine_ring_valve_deg(float ring_throw, bool direct_ring,
+                                  float ref_throw_direct, bool have_throw_cal,
+                                  float act_max_throw, float pressure_scale,
+                                  float psi_min, float psi_max)
+{
+    // b428: do NOT apply the global pressure_scale here. It is measured at
+    // FULL OPEN, where a well/tank supply sags hardest; at partial openings
+    // the supply barely sags (b427 wet run: back-computed supply 5.7 PSI at
+    // full-flow rings vs 13.2 PSI at barely-open ones), so scaling every
+    // lookup throw by 1/scale -- smooth's pass-0 trick -- over-opened every
+    // ring and landed water at 1.4x (outer) to 2.3x (inner) of each ring's
+    // radius. The cal curve already embeds cal-day partial-open supply
+    // behavior; day-to-day correction belongs to per-ring measured corr
+    // (Phase B), not a full-open global multiplier. Smooth survives the
+    // same scale because its corr fixes pass 1+ and one pass is 1/N of the
+    // run; serpentine's single coat is 100% of it.
+    (void)pressure_scale;
+    float vrt = ring_throw;
+    float v;
+    if (direct_ring) {
+        float ref_valve = (ref_throw_direct > 0.0f)
+            ? cal_throw_to_valve_deg(ref_throw_direct) : VALVE_CAL_START_DEG;
+        v = (ref_throw_direct > 0.0f)
+            ? VALVE_CAL_START_DEG
+              + (ref_valve - VALVE_CAL_START_DEG) * (vrt / ref_throw_direct)
+            : VALVE_CAL_START_DEG;
+    } else if (have_throw_cal) {
+        v = cal_throw_to_valve_deg(vrt);
+    } else {
+        float ring_pct = vrt / act_max_throw * 100.0f;
+        float ring_psi = psi_min + (ring_pct / 100.0f) * (psi_max - psi_min);
+        v = cal_pressure_to_valve_deg(ring_psi);
+    }
+    if (v < VALVE_CAL_START_DEG) v = VALVE_CAL_START_DEG;
+    return fmaxf(VALVE_CLOSED_DEG, fminf(VALVE_OPEN_DEG, v));
+}
+
+// b429: flow-solved sweep speed -- one sweep of this ring deposits
+// per_pass_depth at the calibration-reference PSI (smooth's solver: dps =
+// Q_ref * active_deg / (depth * 60000 * ring_area), annular area with the
+// splash-radius special case for short throws). Clamped to the speed map's
+// continuous band; a ceiling-pinned inner ring over-deposits once and is
+// then satisfied by the cumulative tracker (the b382 TopCorner lesson:
+// never skip, always water).
+static float serpentine_ring_dps(float ring_throw, float inner_throw,
+                            float active_deg, float per_pass_depth,
+                            const speed_map_t *spd, bool have_spd)
+{
+    float r_outer = ring_throw  / 1000.0f;
+    float r_inner = inner_throw / 1000.0f;
+    if (ring_throw < WATER_MIN_ELLIPSE_THROW_MM) {
+        float sr = WATER_INNER_SPLASH_RADIUS_MM / 1000.0f;
+        r_outer = ring_throw / 1000.0f + sr * 0.5f;
+        r_inner = fmaxf(0.0f, ring_throw / 1000.0f - sr * 0.5f);
+    }
+    float arc_fraction = active_deg / 360.0f;
+    float ring_area = 3.14159f * (r_outer * r_outer - r_inner * r_inner)
+                      * arc_fraction;
+    float dps = 12.0f;
+    float ref_psi = cal_throw_to_psi(ring_throw);
+    if (ring_area > 1e-4f && per_pass_depth > 0.001f && ref_psi > 0.1f) {
+        float Q_ref = NOZZLE_FLOW_K * powf(ref_psi, NOZZLE_FLOW_N);
+        dps = Q_ref * active_deg / (per_pass_depth * 60000.0f * ring_area);
+    }
+    float min_dps = have_spd ? spd->min_continuous_dps : 10.9f;
+    float max_dps = (have_spd && spd->num_points > 0)
+                    ? spd->deg_per_sec[spd->num_points - 1] : 118.0f;
+    if (dps < min_dps) dps = min_dps;
+    if (dps > max_dps) dps = max_dps;
+    return dps;
+}
+
+// b423: build the serpentine leg list for ONE pass into s_serpentine_legs[].
+// Ring order out->in (or reversed); rings with skip[] set emit nothing --
+// the next ring's connector absorbs the radial distance. First emitted
+// ring: dry REPOS to the entry bearing + radial open. Every other arc is
+// reached by a b426 boundary-hugging wet connector (see the inline comment
+// in the loop), then swept to its far bound, direction alternating per
+// ring. The valve closes only when a connector crosses a true exclusion
+// (polygon extent below the waterable floor). Returns the leg count.
+static int serpentine_build_pass_plan(
+    const zone_perimeter_t *zone, bool have_zone,
+    const float *sector_throw,
+    const float *ring_throws, const bool *ring_direct,
+    const float *ring_ref_throw, int num_rings,
+    const bool *skip, bool out_to_in, bool start_cw,
+    float zone_arc_start, float zone_arc_end, float zone_arc_deg,
+    float act_max_throw, bool have_throw_cal, float pressure_scale,
+    float psi_min, float psi_max,
+    const speed_map_t *spd, bool have_spd,
+    float serpentine_dps,            // > 0 = manual override; 0 = flow-solved (b429)
+    float depth_mm,             // b429: per-pass deposit target for the solver
+    const float *valve_corr)    // b429: per-ring lookup-throw multiplier
+{
+    int  n     = 0;
+    bool cw    = start_cw;
+    bool first = true;
+    float prev_exit_b = -1.0f;   // b425: bearing where the previous sweep ended
+    float prev_throw  = 0.0f;    // b425: its ring throw, for the connector
+    // b426: below this throw a boundary-hug waypoint can't water anyway --
+    // the connector goes dry instead (true exclusions stay dry).
+    float turn_floor = fmaxf(cal_get_min_throw_mm(), 500.0f);
+
+#define SERPENTINE_EMIT(_b, _v, _duty, _dps, _ring, _dir, _kind, _throw) do {      \
+        if (n >= SERPENTINE_MAX_LEGS) {                                            \
+            INFO("Serpentine plan: leg cap (%d) hit -- truncating", SERPENTINE_MAX_LEGS);\
+            return n;                                                         \
+        }                                                                     \
+        s_serpentine_legs[n++] = (serpentine_leg_t){ .b1_deg=(_b), .v1_deg=(_v),        \
+            .duty=(_duty), .dps=(_dps), .ring=(int8_t)(_ring),                \
+            .dir=(int8_t)(_dir), .kind=(uint8_t)(_kind),                      \
+            .ring_throw=(_throw) };                                           \
+    } while (0)
+
+    for (int ri = 0; ri < num_rings && ri < WATER_RUN_MAX_RINGS; ri++) {
+        int ring = out_to_in ? ri : (num_rings - 1 - ri);
+        if (ring >= WATER_RUN_MAX_RINGS || skip[ring]) continue;
+        float ring_throw = ring_throws[ring];
+
+        float lo[WATER_MAX_ARCS_PER_RING], hi[WATER_MAX_ARCS_PER_RING];
+        int na = serpentine_arc_bounds(zone, have_zone, ring_throw, sector_throw,
+                                  act_max_throw, zone_arc_start, zone_arc_end,
+                                  zone_arc_deg, lo, hi);
+        if (na == 0) continue;
+
+        // b429: flow-solved per-ring speed (or the manual speed= override),
+        // and the per-ring corr applied to the valve lookup throw (b303
+        // clamp so corr can engage the beyond-cal extrapolation).
+        float active_deg = 0.0f;
+        for (int k = 0; k < na; k++)
+            active_deg += fmodf(hi[k] - lo[k] + 360.0f, 360.0f);
+        float inner_throw = (ring == num_rings - 1) ? ring_throw * 0.92f
+                                                    : ring_throws[ring + 1];
+        float dps_ring = (serpentine_dps > 0.0f)
+            ? serpentine_dps
+            : serpentine_ring_dps(ring_throw, inner_throw, active_deg, depth_mm,
+                             spd, have_spd);
+        float lookup_throw = fminf(ring_throw * valve_corr[ring],
+                                   act_max_throw * 1.5f);
+        float valve = serpentine_ring_valve_deg(lookup_throw, ring_direct[ring],
+                                           ring_ref_throw[ring], have_throw_cal,
+                                           act_max_throw, pressure_scale,
+                                           psi_min, psi_max);
+        uint16_t duty = spd_duty_for_dps(spd, have_spd, dps_ring, cw);
+
+        // Arcs in physical sweep order for this ring's direction.
+        for (int k = 0; k < na; k++) {
+            int   ai    = cw ? k : (na - 1 - k);
+            float entry = cw ? lo[ai] : hi[ai];
+            float exitb = cw ? hi[ai] : lo[ai];
+
+            if (first) {
+                SERPENTINE_EMIT(entry, -1.0f, 0, 0.0f, -1, 0, SERPENTINE_LEG_REPOS, 0.0f);
+                SERPENTINE_EMIT(entry, valve, 0, 0.0f, ring, 0, SERPENTINE_LEG_TURN, ring_throw);
+                first = false;
+            } else {
+                // b426: boundary-hugging wet connector -- used for BOTH
+                // ring-to-ring turns and same-ring lobe gaps. The OEM
+                // serpentine never shuts the stream off at a turn: when the
+                // direct glide would exit the polygon, the path rides just
+                // inside the boundary instead (radius = min(linear glide,
+                // perimeter extent - margin) at ~4 deg waypoints; the glide
+                // engine carries through same-direction waypoint chains, so
+                // it stays one continuous motion). The valve closes only
+                // when the polygon's extent at some bearing drops below the
+                // waterable floor -- a true exclusion (driveway-style notch)
+                // that must stay dry. Each waypoint is PIP-verified; any
+                // failure also falls back to the dry hop (b425 trio).
+                float d = entry - prev_exit_b;
+                while (d >  180.0f) d -= 360.0f;
+                while (d < -180.0f) d += 360.0f;
+                int nw = (int)(fabsf(d) / SERPENTINE_TURN_STEP_DEG) + 1;
+                if (nw > SERPENTINE_TURN_MAX_WPS) nw = SERPENTINE_TURN_MAX_WPS;
+                float wpb[SERPENTINE_TURN_MAX_WPS], wpr[SERPENTINE_TURN_MAX_WPS];
+                bool wet_ok = true;
+                for (int wi = 1; wi <= nw; wi++) {
+                    float f = (float)wi / (float)nw;
+                    float b = fmodf(prev_exit_b + d * f + 360.0f, 360.0f);
+                    float r = prev_throw + (ring_throw - prev_throw) * f;
+                    if (have_zone) {
+                        float ext = water_perimeter_throw(zone, b, psi_min, psi_max)
+                                    - SERPENTINE_TURN_MARGIN_MM;
+                        if (ext < r) r = ext;
+                        if (!zone_contains_point(zone, b, r))
+                            r -= SERPENTINE_TURN_MARGIN_MM;   // one nudge inward
+                        if (r < turn_floor || !zone_contains_point(zone, b, r)) {
+                            wet_ok = false;
+                            break;
+                        }
+                    }
+                    wpb[wi - 1] = b;
+                    wpr[wi - 1] = r;
+                }
+                if (wet_ok) {
+                    for (int wi = 0; wi < nw; wi++) {
+                        bool last = (wi == nw - 1);
+                        float wv = last ? valve
+                            : serpentine_ring_valve_deg(wpr[wi], false, 0.0f,
+                                                   have_throw_cal, act_max_throw,
+                                                   pressure_scale, psi_min, psi_max);
+                        SERPENTINE_EMIT(last ? entry : wpb[wi], wv, duty, dps_ring,
+                                   ring, 0, SERPENTINE_LEG_TURN, ring_throw);
+                    }
+                    if (nw > 2)
+                        INFO("Serpentine plan r%d: boundary-hug turn %.1f -> %.1f "
+                             "(%d waypoints)", ring + 1, prev_exit_b, entry, nw);
+                } else {
+                    // True exclusion: close IN PLACE, hop dry, reopen at the
+                    // entry (upward, the b367-safe direction).
+                    SERPENTINE_EMIT(prev_exit_b, VALVE_CAL_START_DEG, 0, 0.0f, -1, 0,
+                               SERPENTINE_LEG_TURN, 0.0f);              // radial close
+                    SERPENTINE_EMIT(entry, VALVE_CAL_START_DEG, 0, 0.0f, -1, 0,
+                               SERPENTINE_LEG_TRANSIT, 0.0f);           // dry hop
+                    SERPENTINE_EMIT(entry, valve, 0, 0.0f, ring, 0,
+                               SERPENTINE_LEG_TURN, ring_throw);        // reopen
+                    INFO("Serpentine plan r%d: connector %.1f -> %.1f below waterable "
+                         "floor -- dry hop", ring + 1, prev_exit_b, entry);
+                }
+            }
+            SERPENTINE_EMIT(exitb, valve, duty, dps_ring, ring, cw ? +1 : -1,
+                       SERPENTINE_LEG_SWEEP, ring_throw);
+            prev_exit_b = exitb;                                   // b425
+            prev_throw  = ring_throw;   // b426: per ARC (lobe-gap connectors)
+            float span = fmodf(hi[ai] - lo[ai] + 360.0f, 360.0f);
+            INFO("Serpentine plan r%d arc%d: %.1f -> %.1f %s (%.1f deg) v=%.1f "
+                 "duty=%u %.1fdps", ring + 1, ai + 1, entry, exitb,
+                 cw ? "CW" : "CCW", span, valve, duty, dps_ring);
+        }
+        cw = !cw;
+    }
+#undef SERPENTINE_EMIT
+    return n;
+}
+
+// b423: the glide executor -- generalized from zone_trace_run's leg loop
+// (b417) with per-leg duty, a 2-deg CSV/trace sampler on wet sweep legs
+// (feeds s_smooth_accum in RAM; no file I/O mid-run, b285/b288), per-leg
+// measured dps + avg PSI feeding the cumulative depth tracker, stiction
+// recovery kicks and the dwell watchdog (gentle-sweep patterns), and
+// abort via s_water_abort / uart 'q' (serpentine IS the watering run, so no
+// yield-to-watering check). Motion model unchanged from b417: every leg
+// derived from the ACTUAL current bearing, the valve chasing a target
+// interpolated along the leg's measured sweep progress, carry-through at
+// same-direction joints, cosine-ease braking only into reversals/radials.
+// Does NOT close the valve or touch the rails on exit -- the caller's
+// shared closeout owns teardown.
+static bool serpentine_glide_legs(const serpentine_leg_t *legs, int n,
+                             const float *ring_throws, int num_rings,
+                             float *cumulative_depth,
+                             float *run_psi_sum, int *run_psi_n,
+                             int *ring_sweeps_out,
+                             TickType_t t_start, bool dry)
+{
+    const uint16_t N_MIN_DUTY    = 70;
+    const uint16_t N_ALIGN_DUTY  = 380;   // dry reposition/transit (aim speed)
+    const float    N_TOL_DEG     = 1.0f;
+    const float    MIN_SWEEP_DEG = 1.0f;  // below this a leg is radial
+    const uint16_t V_CHASE_DUTY  = 220;
+    const uint16_t V_MIN_DUTY    = 70;
+    const float    V_TOL_DEG     = 0.8f;
+    const float    V_DECEL_DEG   = 4.0f;
+    const float    V_LAG_DEG     = 5.0f;
+    const float    V_NOM_DPS     = 8.0f;  // timeout estimates only
+    const uint32_t TICK_MS       = 30;
+    const int      VALVE_OPEN_DIR = -1;   // FWD pin closes valve (b318/b418)
+
+    chase_motor_t nm = {0}, vm = {0};
+    if (!chase_motor_setup(&nm, NOZZLE_PIN_FWD, NOZZLE_PIN_REV)) {
+        INFO("serpentine: nozzle PWM setup failed");
+        return false;
+    }
+    if (!chase_motor_setup(&vm, VALVE_PIN_FWD, VALVE_PIN_REV)) {
+        INFO("serpentine: valve PWM setup failed");
+        chase_motor_teardown(&nm);
+        return false;
+    }
+
+    bool ok = true;
+    int  v_dir = 0;
+    bool flow_checked    = false;
+    // b427: the no-flow gate accumulates samples ACROSS legs -- Edge's outer
+    // arcs are 6-10 deg (~3 samples each), too few to judge supply on one.
+    float flow_psi_sum   = 0.0f;
+    int   flow_psi_n     = 0;
+    int  last_trace_ring = -1;
+    TickType_t t_run = xTaskGetTickCount();
+
+    for (int leg = 0; leg < n && ok; leg++) {
+        const serpentine_leg_t *L = &legs[leg];
+        uint16_t n_raw = 0, v_raw = 0;
+        as5600_read(ADDR_AS5600,  &n_raw, NULL, NULL);
+        as5600_read(ADDR_AS5600L, &v_raw, NULL, NULL);
+        float cur_b = n_raw * (360.0f / 4096.0f);
+        float v0    = v_raw * (360.0f / 4096.0f);
+
+        // Leg geometry from the ACTUAL current position (positioning error
+        // never accumulates -- b417). Sweeps/transits carry an explicit
+        // direction: ring arcs can exceed 180 deg (sprinkler-inside zones),
+        // where shortest-path derivation would sweep the wrong way.
+        float span; int dirn;
+        if (L->dir > 0) {
+            span = fmodf(L->b1_deg - cur_b + 360.0f, 360.0f); dirn = +1;
+        } else if (L->dir < 0) {
+            span = fmodf(cur_b - L->b1_deg + 360.0f, 360.0f); dirn = -1;
+        } else {
+            float d = L->b1_deg - cur_b;
+            while (d >  180.0f) d -= 360.0f;
+            while (d < -180.0f) d += 360.0f;
+            span = fabsf(d);
+            dirn = (d >= 0.0f) ? +1 : -1;
+        }
+        if (span > 355.0f) span = 0.0f;   // explicit-dir wrap noise: already there
+        bool  radial  = (span < MIN_SWEEP_DEG);
+        bool  dry_leg = (L->v1_deg < 0.0f) || dry;
+        float v1      = dry_leg ? v0 : L->v1_deg;
+        bool  sweep   = (L->kind == SERPENTINE_LEG_SWEEP);
+        uint16_t leg_duty =
+            (L->kind == SERPENTINE_LEG_REPOS || L->kind == SERPENTINE_LEG_TRANSIT)
+                ? N_ALIGN_DUTY
+                : (L->duty > 0 ? L->duty : N_ALIGN_DUTY);
+        if (leg_duty < N_MIN_DUTY) leg_duty = N_MIN_DUTY;
+        // Speed-scaled decel band: ~0.3 s of travel at the leg's planned
+        // speed (zone_trace's fixed 12/5 deg was tuned for <= 25 dps).
+        float decel_band = fmaxf(5.0f, (L->dps > 0.1f ? L->dps : 25.0f) * 0.3f);
+
+        // Brake into this leg's end unless the path carries straight
+        // through into the next leg (same direction, non-radial).
+        bool brake_end = true;
+        if (!radial && leg + 1 < n) {
+            const serpentine_leg_t *NL = &legs[leg + 1];
+            float dn = NL->b1_deg - L->b1_deg;
+            while (dn >  180.0f) dn -= 360.0f;
+            while (dn < -180.0f) dn += 360.0f;
+            int ndir = (NL->dir != 0) ? NL->dir : ((dn >= 0.0f) ? +1 : -1);
+            brake_end = (fabsf(dn) < MIN_SWEEP_DEG) || (ndir != dirn);
+        }
+
+        float eff_dps = (L->dps > 0.5f) ? L->dps : (float)leg_duty / 15.0f;
+        float exp_s = radial ? 0.0f : span / eff_dps;
+        float vexp  = fabsf(v1 - v0) / V_NOM_DPS;
+        if (vexp > exp_s) exp_s = vexp;
+        uint32_t leg_timeout = (uint32_t)(exp_s * 2000.0f) + 4000;
+
+        // b283: tag trace samples with the ring about to be swept.
+        if (sweep && !dry_leg && L->ring >= 0 && L->ring != last_trace_ring) {
+            water_trace_mark_ring(L->ring, L->v1_deg);
+            last_trace_ring = L->ring;
+        }
+
+        if (radial) {
+            chase_motor_apply(&nm, 0, 0);
+        } else if (nm.dir != dirn || nm.duty == 0) {
+            // Entering a fresh direction. If the motor is still turning the
+            // other way, the eased reverse handles it; from rest, a brief
+            // boost breaks stiction at low sweep duties (gentle kickstart).
+            if (nm.dir != 0 && nm.dir != dirn) {
+                chase_motor_reverse_fast(&nm, leg_duty);
+            } else {
+                uint16_t kick = (uint16_t)(leg_duty + 100u);
+                if (kick > 480u) kick = 480u;
+                chase_motor_apply(&nm, dirn, kick);
+                vTaskDelay(pdMS_TO_TICKS(60));
+                chase_motor_apply(&nm, dirn, leg_duty);
+            }
+        }
+
+        float leg_psi_sum = 0.0f; int leg_psi_n = 0;
+        float last_csv_prog = 0.0f;
+        float prev_b = cur_b, traveled = 0.0f;
+        TickType_t t_leg = xTaskGetTickCount();
+        TickType_t last_motion_tick = t_leg;
+        float      last_motion_b    = cur_b;
+        int        kicks_used       = 0;
+        TickType_t last_dwell_tick  = t_leg;
+        float      last_dwell_b     = cur_b;
+
+        for (;;) {
+            if (uart_getchar(0) != 0 || s_water_abort) {
+                s_water_abort = true;
+                ok = false;
+                break;
+            }
+            if ((uint32_t)pdTICKS_TO_MS(xTaskGetTickCount() - t_leg) >= leg_timeout) {
+                INFO("serpentine: leg %d timeout (%.1f / %.1f deg) -- continuing",
+                     leg, fabsf(traveled), span);
+                break;   // next leg re-derives from the actual position
+            }
+            vTaskDelay(pdMS_TO_TICKS(TICK_MS));
+            TOUCH_ACTIVITY();
+
+            as5600_read(ADDR_AS5600,  &n_raw, NULL, NULL);
+            as5600_read(ADDR_AS5600L, &v_raw, NULL, NULL);
+            cur_b = n_raw * (360.0f / 4096.0f);
+            float cur_v = v_raw * (360.0f / 4096.0f);
+
+            float db = cur_b - prev_b;
+            while (db >  180.0f) db -= 360.0f;
+            while (db < -180.0f) db += 360.0f;
+            traveled += db;
+            prev_b    = cur_b;
+
+            float progress = radial ? span : traveled * (float)dirn;
+            if (progress < 0.0f)  progress = 0.0f;
+            if (progress > span)  progress = span;
+            float frac = (radial || span < 0.01f) ? 1.0f : progress / span;
+
+            // Valve: chase the along-leg interpolated target.
+            float v_tgt = v0 + (v1 - v0) * frac;
+            float v_err = v_tgt - cur_v;
+            float v_abs = fabsf(v_err);
+            if (v_abs < V_TOL_DEG) {
+                if (v_dir) { chase_motor_apply(&vm, 0, 0); v_dir = 0; }
+            } else {
+                int want = (v_err >= 0.0f) ? VALVE_OPEN_DIR : -VALVE_OPEN_DIR;
+                uint16_t vd;
+                if (v_abs < V_DECEL_DEG) {
+                    float t    = v_abs / V_DECEL_DEG;
+                    float ease = 0.5f * (1.0f - cosf((float)M_PI * t));
+                    vd = (uint16_t)((float)V_MIN_DUTY
+                            + ease * (float)(V_CHASE_DUTY - V_MIN_DUTY));
+                } else {
+                    vd = V_CHASE_DUTY;
+                }
+                if (v_dir && want != v_dir) {
+                    chase_motor_reverse_fast(&vm, vd);
+                    v_dir = vm.dir;
+                } else {
+                    chase_motor_apply(&vm, want, vd);
+                    v_dir = want;
+                }
+                s_valve_last_dir = v_dir;
+            }
+
+            // Dwell watchdog: cap valve-open time near one bearing (the
+            // valve is open for the entire run; gentle-sweep pattern).
+            if (!dry_leg) {
+                float dd = fabsf(cur_b - last_dwell_b);
+                if (dd > 180.0f) dd = 360.0f - dd;
+                if (dd > 3.0f) {
+                    last_dwell_tick = xTaskGetTickCount();
+                    last_dwell_b    = cur_b;
+                } else if (!radial &&
+                           (uint32_t)pdTICKS_TO_MS(xTaskGetTickCount() - last_dwell_tick)
+                               > s_dwell_timeout_ms) {
+                    ESP_LOGW(TAG, "serpentine: dwell watchdog at ~%.1f deg with valve "
+                                  "open -- slamming valve closed", cur_b);
+                    water_set_status(WATER_STATUS_NOZZLE_FAULT);
+                    chase_motor_apply(&nm, 0, 0);
+                    chase_motor_apply(&vm, 0, 0);
+                    valve_goto(VALVE_CLOSED_DEG, 2.0f, 8000, false);
+                    ok = false;
+                    break;
+                }
+            }
+
+            if (radial) {
+                if (v_abs < V_TOL_DEG) break;   // valve settled -> leg done
+                continue;
+            }
+
+            // Nozzle: constant duty, eased only into braking ends.
+            float to_go = span - progress;
+            if (to_go <= N_TOL_DEG) {
+                if (brake_end) chase_motor_apply(&nm, 0, 0);
+                break;
+            }
+            uint16_t nd = leg_duty;
+            if (brake_end && to_go < decel_band) {
+                float t    = to_go / decel_band;
+                float ease = 0.5f * (1.0f - cosf((float)M_PI * t));
+                nd = (uint16_t)((float)N_MIN_DUTY
+                        + ease * (float)(leg_duty - N_MIN_DUTY));
+            }
+            if (v_abs > V_LAG_DEG) nd = N_MIN_DUTY;   // let the valve catch up
+            chase_motor_apply(&nm, dirn, nd);
+            s_nozzle_last_dir = dirn;
+
+            // Stiction recovery: no encoder motion mid-leg -> boost kick
+            // (gentle-sweep recovery pattern; the dwell watchdog above and
+            // the leg timeout are the fault backstops).
+            {
+                float md = fabsf(cur_b - last_motion_b);
+                if (md > 180.0f) md = 360.0f - md;
+                if (md > 0.1f) {
+                    last_motion_tick = xTaskGetTickCount();
+                    last_motion_b    = cur_b;
+                } else if ((uint32_t)pdTICKS_TO_MS(xTaskGetTickCount() - last_motion_tick)
+                               > 800u
+                           && to_go > decel_band && kicks_used < 6) {
+                    uint16_t kick = (uint16_t)(leg_duty + 100u);
+                    if (kick > 480u) kick = 480u;
+                    INFO("serpentine: leg %d slow at %.1f deg -- recovery kick %d/6",
+                         leg, cur_b, kicks_used + 1);
+                    chase_motor_apply(&nm, dirn, kick);
+                    vTaskDelay(pdMS_TO_TICKS(150));
+                    chase_motor_apply(&nm, dirn, nd);
+                    kicks_used++;
+                    last_motion_tick = xTaskGetTickCount();
+                }
+            }
+
+            // Sampler: every 2 deg of a wet sweep leg, mirror the gentle
+            // sweep's CSV/trace row. In smooth-aggregate mode this lands in
+            // the RAM buckets; ring index is 0-based to match the flush.
+            if (sweep && !dry_leg && progress >= last_csv_prog + 2.0f) {
+                last_csv_prog = progress;
+                float t_s = (float)(xTaskGetTickCount() - t_start)
+                            / (float)configTICK_RATE_HZ;
+                float csv_psi = 0.0f; mprls_read_quiet(&csv_psi);
+                if (csv_psi > 0.1f) {
+                    leg_psi_sum += csv_psi; leg_psi_n++;
+                    if (run_psi_sum) { *run_psi_sum += csv_psi; (*run_psi_n)++; }
+                }
+                water_trace_sample(csv_psi);
+                float _at2 = cal_pressure_to_throw_mm(csv_psi);
+                float _tp  = cal_throw_to_psi(L->ring_throw);
+                float _tr  = cur_b * (float)M_PI / 180.0f;
+                int   _sn  = ((int)(cur_b / WATER_SECTOR_DEG) + WATER_SECTORS)
+                             % WATER_SECTORS;
+                water_csv_write_row(s_water_csv_f, t_s, L->ring, 1, _sn,
+                    (float)_sn * WATER_SECTOR_DEG, cur_b,
+                    v1, cur_v,
+                    L->ring_throw, _at2, _tp, csv_psi, _tr, s_csv_pass_type);
+            }
+        }   // tick loop
+
+        if (!ok) break;
+
+        // b427: PSI settle after a flow-starting valve open (run start, or
+        // reopen after a dry hop). The valve chase reaches the ring target
+        // in ~3 s but supply pressure needs ~1.5 s more to stabilize (b361
+        // waits 1500 ms in the supply check for the same reason). Without
+        // this, the first 6-deg outer arc sampled 0.26 PSI of just-arriving
+        // water and tripped the no-flow abort.
+        if (radial && !dry_leg
+                && v0 <= VALVE_CAL_START_DEG + 2.0f
+                && v1 >  VALVE_CAL_START_DEG + 2.0f) {
+            vTaskDelay(pdMS_TO_TICKS(1800));
+            TOUCH_ACTIVITY();
+        }
+
+        // Wet sweep leg done: measured speed -> depth credit + ring data.
+        if (sweep && !dry_leg && L->ring >= 0 && L->ring < WATER_RUN_MAX_RINGS) {
+            uint32_t leg_ms = (uint32_t)pdTICKS_TO_MS(xTaskGetTickCount() - t_leg);
+            float meas_deg  = fabsf(traveled);
+            float meas_dps  = (leg_ms > 200 && meas_deg > 0.5f)
+                              ? meas_deg * 1000.0f / (float)leg_ms
+                              : (L->dps > 0.1f ? L->dps : 8.0f);
+            float avg_psi   = (leg_psi_n > 0) ? leg_psi_sum / (float)leg_psi_n
+                                              : 0.0f;
+
+            // First flow of the run: no detectable flow means supply is off
+            // / valve fault -- stop rather than dry-trace the whole zone
+            // (WATER_MIN_FLOW_PSI gate, smooth's no-flow check). b427:
+            // judge on >= 4 samples accumulated across however many sweep
+            // legs it takes, not one tiny outer arc's worth.
+            if (!flow_checked) {
+                flow_psi_sum += leg_psi_sum;
+                flow_psi_n   += leg_psi_n;
+                if (flow_psi_n >= 4) {
+                    flow_checked = true;
+                    float fav = flow_psi_sum / (float)flow_psi_n;
+                    if (fav < WATER_MIN_FLOW_PSI) {
+                        INFO("serpentine: no flow over first %d samples (%.3f PSI "
+                             "< %.2f) -- stopping", flow_psi_n, fav,
+                             WATER_MIN_FLOW_PSI);
+                        water_set_status(WATER_STATUS_WATER_LOSS);
+                        ok = false;
+                        break;
+                    }
+                    s_water_run_had_flow = true;
+                }
+            }
+
+            int   ring = L->ring;
+            float ro   = ring_throws[ring];
+            float ri   = (ring == num_rings - 1) ? ro * 0.92f
+                                                 : ring_throws[ring + 1];
+            cumulative_depth[ring] +=
+                nozzle_precip_depth_mm(ro, ri, meas_dps, avg_psi);
+
+            float _at = (avg_psi > 0.1f) ? cal_pressure_to_throw_mm(avg_psi) : ro;
+            float _arc_s = (dirn > 0)
+                ? fmodf(L->b1_deg - meas_deg + 360.0f, 360.0f) : L->b1_deg;
+            float _arc_e = (dirn > 0)
+                ? L->b1_deg : fmodf(L->b1_deg + meas_deg, 360.0f);
+            s_last_water_run.rings[ring] = (water_ring_data_t){
+                .throw_mm        = ro,
+                .avg_psi         = avg_psi,
+                .actual_throw_mm = _at,
+                .dps             = meas_dps,
+                .active_deg      = meas_deg,
+                .arc_start_deg   = _arc_s,
+                .arc_end_deg     = _arc_e,
+                .valve_deg       = L->v1_deg,
+            };
+            if (ring_sweeps_out) (*ring_sweeps_out)++;
+            INFO("serpentine: r%d sweep: %.1f deg in %u ms (%.2f dps) %.2f PSI "
+                 "cum %.2fmm", ring + 1, meas_deg, (unsigned)leg_ms,
+                 meas_dps, avg_psi, cumulative_depth[ring]);
+        }
+    }   // leg loop
+
+    chase_motor_apply(&nm, 0, 0);
+    chase_motor_apply(&vm, 0, 0);
+    chase_motor_teardown(&nm);
+    chase_motor_teardown(&vm);
+
+    INFO("serpentine: pass %s after %u ms", ok ? "complete" : "stopped",
+         (unsigned)pdTICKS_TO_MS(xTaskGetTickCount() - t_run));
+    return ok;
+}
+
+// b423: serpentine pass driver -- called from phase_water_zone in place of the
+// smooth/gentle pass loop. Builds a skip mask (unwaterable, inner/direct
+// rings deferred in Phase A, satisfied rings on later passes), plans one
+// serpentine per pass, executes it, and dumps per-ring cumulative depth in
+// smooth's catch-cup format. Alternates out->in / in->out per pass so pass
+// N+1 starts at the ring where pass N ended. Teardown (valve close, rails,
+// aggregate flush, summary) belongs to the caller's shared closeout.
+static void water_serpentine_passes(
+    const zone_perimeter_t *zone, bool have_zone,
+    const float *sector_throw,
+    const float *ring_throws, const bool *ring_direct,
+    const float *ring_ref_throw, int num_rings,
+    const bool *ring_unwaterable,
+    float *cumulative_depth,
+    float zone_arc_start, float zone_arc_end, float zone_arc_deg,
+    float act_max_throw, float act_min_throw, bool have_throw_cal,
+    float pressure_scale, float psi_min, float psi_max,
+    const speed_map_t *spd, bool have_spd,
+    float depth_mm, int passes, float serpentine_dps, bool dry,
+    int *ring_sweeps_out, float *run_psi_sum, int *run_psi_n,
+    TickType_t t_start)
+{
+    // b429: speed= is now a manual override (testing); 0/absent means
+    // flow-solved per ring in the planner.
+    if (serpentine_dps > 0.0f) {
+        if (serpentine_dps < 3.0f)  serpentine_dps = 3.0f;
+        if (serpentine_dps > 20.0f) serpentine_dps = 20.0f;
+    }
+
+    if (dry) passes = 1;   // b429: rehearsal -- nothing credits depth, one
+                           // pass of motion is the whole point
+
+    // b429: per-ring valve throw correction, smooth's iterative scheme
+    // (blend 0.6 old / 0.4 new of target/actual, clamped 0.5..1.6).
+    // Replaces the global pressure_scale that b428 removed: corr learns
+    // each ring's real supply behavior from its own measured throw.
+    float corr[WATER_RUN_MAX_RINGS];
+    for (int i = 0; i < WATER_RUN_MAX_RINGS; i++) corr[i] = 1.0f;
+
+    // b432: inner/direct-valve rings are NOT deferred anymore. The throw cal
+    // reaches ~330 mm on this fleet, so nearly every ring is cal-addressable
+    // (direct rings use the b382 band-anchored interpolation). The b367
+    // seat-dead-band worry is covered structurally: in->out passes open the
+    // valve upward from closed through every inner ring's angle (the safe
+    // direction), and a dead-band miss on an out->in pass reads ~0 PSI, earns
+    // no depth credit, and is simply re-attempted next pass.
+    (void)act_min_throw;
+    // b434: throw-convergence retire (smooth's b297 insight, bounded). A
+    // depth-satisfied ring whose TRUSTWORTHY measured throw is still short
+    // of target landed its water inward of where it belongs -- the b432
+    // Edge run left the boundary band ~14% light on 4 supply-limited outer
+    // rings. Re-fire such rings (corr keeps climbing between passes) up to
+    // 3 extra times, then accept. The +/-25% plausibility window keeps the
+    // low-PSI inner-ring throw artifact (reads up to 2x) from ever causing
+    // re-fire loops; over-throw is not re-fired (beyond +25% it's artifact,
+    // within it the water still landed inside the splash band).
+    uint8_t throw_retries[WATER_RUN_MAX_RINGS] = {0};
+    for (int pass = 0; pass < passes; pass++) {
+        bool skip[WATER_RUN_MAX_RINGS];
+        int  todo = 0;
+        for (int i = 0; i < num_rings && i < WATER_RUN_MAX_RINGS; i++) {
+            bool depth_ok = (pass > 0 && cumulative_depth[i] >= depth_mm);
+            if (depth_ok && !ring_unwaterable[i]) {
+                water_ring_data_t *r = &s_last_water_run.rings[i];
+                if (r->throw_mm > 100.0f && r->actual_throw_mm > 100.0f) {
+                    float ratio = r->actual_throw_mm / r->throw_mm;
+                    if (ratio >= 0.75f && ratio < 0.90f && throw_retries[i] < 3) {
+                        throw_retries[i]++;
+                        depth_ok = false;   // re-fire for throw convergence
+                        INFO("Serpentine ring %d: depth ok but throw %.2fx -- "
+                             "re-fire %u/3", i + 1, ratio, throw_retries[i]);
+                    }
+                }
+            }
+            skip[i] = ring_unwaterable[i] || depth_ok;
+            if (!skip[i]) todo++;
+        }
+        if (todo == 0) {
+            INFO("Serpentine: all rings satisfied after pass %d -- done", pass);
+            break;
+        }
+        bool out_to_in = (pass % 2 == 0);
+        int n = serpentine_build_pass_plan(zone, have_zone, sector_throw,
+                                      ring_throws, ring_direct, ring_ref_throw,
+                                      num_rings, skip, out_to_in,
+                                      /*start_cw=*/out_to_in,
+                                      zone_arc_start, zone_arc_end, zone_arc_deg,
+                                      act_max_throw, have_throw_cal,
+                                      pressure_scale, psi_min, psi_max,
+                                      spd, have_spd, serpentine_dps, depth_mm, corr);
+        if (n == 0) {
+            // b434: the only rings left are polygon-clipped to zero width
+            // (e.g. the outermost ring on a spike-shaped zone) -- they can
+            // never be watered, so this IS completion, not an error.
+            INFO("Serpentine: all waterable rings satisfied after pass %d "
+                 "(remaining rings clipped to zero by polygon) -- done", pass);
+            break;
+        }
+        if (serpentine_dps > 0.0f)
+            INFO("--- Serpentine pass %d: %d legs, %d ring(s), %s, manual %.1f dps%s ---",
+                 pass + 1, n, todo, out_to_in ? "out->in" : "in->out",
+                 serpentine_dps, dry ? " [DRY]" : "");
+        else
+            INFO("--- Serpentine pass %d: %d legs, %d ring(s), %s, flow-solved%s ---",
+                 pass + 1, n, todo, out_to_in ? "out->in" : "in->out",
+                 dry ? " [DRY]" : "");
+        s_csv_pass_type = (uint8_t)(pass + 1);
+        if (!serpentine_glide_legs(s_serpentine_legs, n, ring_throws, num_rings,
+                              cumulative_depth, run_psi_sum, run_psi_n,
+                              ring_sweeps_out, t_start, dry)) {
+            return;   // aborted/faulted -- shared closeout tears down
+        }
+        // b429: iterative per-ring throw correction, smooth's scheme verbatim
+        // (psi_min gate rejects cold-start under-throw; clamp 0.5..1.6 so
+        // persistent under-throw can engage the beyond-cal extrapolation).
+        if (!dry) {
+            for (int i = 0; i < num_rings && i < WATER_RUN_MAX_RINGS; i++) {
+                water_ring_data_t *r = &s_last_water_run.rings[i];
+                if (skip[i] || r->throw_mm < 1.0f || r->actual_throw_mm < 100.0f)
+                    continue;
+                bool _under = r->actual_throw_mm < r->throw_mm;
+                if (_under && r->avg_psi < psi_min) continue;   // cold-start
+                float new_corr = fmaxf(0.5f, fminf(1.6f,
+                                       r->throw_mm / r->actual_throw_mm));
+                float old_corr = corr[i];
+                corr[i] = old_corr * 0.6f + new_corr * 0.4f;
+                if (fabsf(corr[i] - 1.0f) > 0.05f)
+                    INFO("  Serpentine ring %d corr %.3f->%.3f (%.0f->%.0fmm, psi %.2f)",
+                         i + 1, old_corr, corr[i],
+                         r->throw_mm, r->actual_throw_mm, r->avg_psi);
+            }
+            // Pass 0: un-credit rings whose water landed in the wrong ring
+            // (smooth's seed gate -- |corr-1| > 0.20 means the deposit
+            // geometry was off by more than a ring's worth).
+            if (pass == 0) {
+                for (int i = 0; i < num_rings && i < WATER_RUN_MAX_RINGS; i++) {
+                    if (fabsf(corr[i] - 1.0f) > 0.20f && cumulative_depth[i] > 0.0f) {
+                        INFO("  Serpentine ring %d: pass 0 depth not credited (corr %.3f)",
+                             i + 1, corr[i]);
+                        cumulative_depth[i] = 0.0f;
+                    }
+                }
+            }
+        }
+
+        // Per-ring cumulative depth dump (catch-cup aid, smooth's format;
+        // b429: chunked 12 rings/line -- one 400-byte line truncated at r13).
+        for (int i0 = 0; i0 < num_rings && i0 < WATER_RUN_MAX_RINGS; i0 += 12) {
+            char _depbuf[260];
+            int _off = 0;
+            int _hi = i0 + 12;
+            for (int i = i0; i < _hi && i < num_rings && i < WATER_RUN_MAX_RINGS; i++) {
+                if (ring_throws[i] < 1.0f) continue;
+                int _n = snprintf(_depbuf + _off, sizeof(_depbuf) - _off,
+                                  " %d=%.1fm:%.2fmm", i + 1,
+                                  ring_throws[i] / 1000.0f, cumulative_depth[i]);
+                if (_n < 0 || _n >= (int)(sizeof(_depbuf) - _off)) break;
+                _off += _n;
+            }
+            INFO("Serpentine pass %d ring depths [%d-%d]:%s",
+                 pass + 1, i0 + 1, _hi, _depbuf);
+        }
+    }
+}
+
 static void phase_chase_water_zone(void)
 {
     int duration_min = s_chase_duration_min;
@@ -7486,8 +8484,16 @@ static void phase_chase_water_zone(void)
         float b1 = (i < n - 1) ? sb[i + 1] : sb[0] + 360.0f;
         if (b1 - b0 > max_gap) { max_gap = b1 - b0; gap_lo = b0; gap_hi = b1; }
     }
+    float cpsi_min = cal.pressure_psi[0], cpsi_max = cal.pressure_psi[0];
+    for (int i = 1; i < cal.num_points; i++) {
+        if (cal.pressure_psi[i] < cpsi_min) cpsi_min = cal.pressure_psi[i];
+        if (cal.pressure_psi[i] > cpsi_max) cpsi_max = cal.pressure_psi[i];
+    }
     float arc_start, arc_end, arc_deg;
-    if (max_gap > 45.0f) {
+    // b435: only restrict the chase envelope if the gap is genuinely empty --
+    // a long straight boundary edge can span a >45deg vertex gap.
+    if (max_gap > 45.0f &&
+        zone_gap_is_empty(&zone, gap_lo, max_gap, cpsi_min, cpsi_max)) {
         arc_start = fmodf(gap_hi, 360.0f);
         arc_end   = gap_lo;
         arc_deg   = fmodf(arc_end - arc_start + 360.0f, 360.0f);
@@ -8514,7 +9520,10 @@ static void phase_water_zone(void)
             float b0=sb[i], b1=(i<zone.num_points-1)?sb[i+1]:sb[0]+360.0f;
             if (b1-b0>max_gap){max_gap=b1-b0;gap_lo_z=b0;gap_hi_z=b1;}
         }
-        if (max_gap > 45.0f) {
+        // b435: only restrict the sweep arc if the gap is genuinely empty --
+        // a long straight boundary edge can span a >45deg vertex gap.
+        if (max_gap > 45.0f &&
+            zone_gap_is_empty(&zone, gap_lo_z, max_gap, psi_min, psi_max)) {
             zone_arc_start = fmodf(gap_hi_z, 360.0f); // left zone edge
             zone_arc_end   = gap_lo_z;                // right zone edge
             zone_arc_deg   = fmodf(gap_lo_z - gap_hi_z + 360.0f, 360.0f);
@@ -8658,8 +9667,10 @@ static void phase_water_zone(void)
     // Web-triggered: s_web_water_mode already set, skip interactive prompt
     int sel;
     if (s_web_water_mode > 0) {
-        // 0=idle, 1-4=metered, 5-6=gentle, 7=smooth, 99=demo
-        sel = (s_web_water_mode == 99) ? 'd' : (s_web_water_mode == 7) ? 's' : ('0' + s_web_water_mode);
+        // 0=idle, 1-4=metered, 5-6=gentle, 7=smooth, 8=serpentine (b423), 99=demo
+        sel = (s_web_water_mode == 99) ? 'd' :
+              (s_web_water_mode == 8)  ? 'n' :
+              (s_web_water_mode == 7)  ? 's' : ('0' + s_web_water_mode);
         INFO("Web mode: %c", sel);
     } else {
         sel = uart_getchar(30000);
@@ -8673,6 +9684,10 @@ static void phase_water_zone(void)
     bool  demo_mode   = (sel == 'd' || sel == 'D');
     bool  gentle_mode = (sel == '5' || sel == '6');
     bool  smooth_mode = (sel == 's' || sel == 'S');
+    bool  serpentine_mode  = (sel == 'n' || sel == 'N');   // b423: web-only mode 8
+    // b423: serpentine params, consumed once like depth_eighths below.
+    float serpentine_dps = s_web_serpentine_dps; s_web_serpentine_dps = 0.0f;
+    bool  serpentine_dry = s_web_serpentine_dry; s_web_serpentine_dry = false;
     // Depth target in eighths of an inch (1..8 = 1/8".. 1"), supplied by the
     // web/schedule path and consumed once here. 0 = legacy digit-encoded depth.
     // Pulse repeats the base 1/8" pass N times; gentle/smooth target the same
@@ -8688,11 +9703,12 @@ static void phase_water_zone(void)
                         (sel == '3' || sel == '4') ? 2 : 1;
     if (demo_mode)   { depth_mm = 0.0f; passes = 1; }
     if (smooth_mode) { passes = 30; } // adaptive; depth_mm target set above
+    if (serpentine_mode)  { passes = 30; } // b429: adaptive, exits when all rings satisfied
 
     // b283: arm pressure trace recorder for smooth/gentle runs only (pulse
     // mode's per-arc valve PID would make valve_deg snapshots meaningless).
     // Demo mode also skipped -- no real watering, nothing to characterize.
-    if ((smooth_mode || gentle_mode) && !demo_mode) {
+    if ((smooth_mode || gentle_mode || serpentine_mode) && !demo_mode) {
         water_trace_reset(s_water_zone_id);
     }
 
@@ -8705,7 +9721,7 @@ static void phase_water_zone(void)
     // contiguous CPU during the watering loop -- doesn't fix the flash/WiFi
     // race directly but reduces the number of moments where the two
     // subsystems happen to interleave.
-    if ((smooth_mode || gentle_mode) && !demo_mode) {
+    if ((smooth_mode || gentle_mode || serpentine_mode) && !demo_mode) {
         s_watering_quiet = true;
         UBaseType_t _old_prio = uxTaskPriorityGet(NULL);
         vTaskPrioritySet(NULL, 15);
@@ -8815,7 +9831,9 @@ static void phase_water_zone(void)
     // arc instead of hammering one spot. Encoder-based reversal at swing
     // endpoints, plus a 3s safety fallback in case encoder reads fail.
     float pressure_scale = 1.0f;
-    if (!demo_mode && psi_max > 0.5f) {
+    // b424: serpentine dry rehearsal must not open the valve -- skip the 12s
+    // full-open supply check (pressure_scale stays 1.0; no water flows).
+    if (!demo_mode && !serpentine_dry && psi_max > 0.5f) {
         valve_goto(VALVE_OPEN_DEG, 1.0f, 8000, false);
         vTaskDelay(pdMS_TO_TICKS(1500));   // settle after valve open
 
@@ -9074,8 +10092,11 @@ static void phase_water_zone(void)
     s_last_depth_mm    = depth_mm;
     s_csv_pass_type    = 1;
     s_smooth_wbin_path[0] = '\0';
-    bool _defer_open = smooth_mode && !s_water_detail_log;
-    if (!demo_mode && storage_ready()) {
+    bool _defer_open = (smooth_mode || serpentine_mode) && !s_water_detail_log;  // b423
+    // b424: serpentine dry rehearsal writes no watering log -- without this gate
+    // it would remove the zone's previous wbin and flush an empty aggregate
+    // over the last real run's heatmap data.
+    if (!demo_mode && !serpentine_dry && storage_ready()) {
         storage_ensure_dirs();  // /lfs/water must exist before fopen
         // Remove any stale CSV for this zone first to reclaim LittleFS space.
         char _old_csv[64]; water_csv_path_find(s_water_zone_id, _old_csv, sizeof(_old_csv));
@@ -9085,7 +10106,7 @@ static void phase_water_zone(void)
         // Smooth aggregates per-sector summaries (~41KB regardless of passes).
         // Gentle now writes per-pass per-sample rows over up to GENTLE_MAX_PASSES
         // passes -- bump allocation accordingly. Pulse stays at 300KB (1-2 passes).
-        storage_make_room(smooth_mode ? 64 * 1024
+        storage_make_room((smooth_mode || serpentine_mode) ? 64 * 1024
                                        : (gentle_mode ? 600 * 1024 : 300 * 1024),
                           s_water_zone_id);
         // Skip if still < 64 KB free.
@@ -9156,7 +10177,7 @@ static void phase_water_zone(void)
     // Smooth mode: accumulate sector measurements instead of writing per-pass rows.
     // When s_water_detail_log is on (set from landing page), write per-pass records
     // instead so the full 2°-sample data is available for debugging and evaluation.
-    if (smooth_mode && !s_water_detail_log) {
+    if ((smooth_mode || serpentine_mode) && !s_water_detail_log) {   // b423
         s_smooth_accum_mode = true;
         memset(s_smooth_accum, 0, sizeof(s_smooth_accum));
     }
@@ -9188,6 +10209,27 @@ static void phase_water_zone(void)
     if (smooth_mode) {
         INFO("b296 scheduler armed: median_throw=%.0fmm cal_supply=%.2f PSI",
              sched_median_throw, sched_cal_supply);
+    }
+
+    // b423: serpentine mode -- continuous serpentine. Branches here, after the
+    // shared preamble (cal/zone load, ring plan, pressure check, log
+    // setup), and rejoins at the shared abort:/closeout below. The
+    // smooth/gentle pass loop never runs; the b296 scheduler is replaced
+    // by monotonic out->in ordering (supply-aligned by construction).
+    if (serpentine_mode) {
+        int _serpentine_sweeps = 0;
+        float _spsi_sum = 0.0f; int _spsi_n = 0;
+        water_serpentine_passes(&zone, have_zone, sector_throw,
+                           ring_throws, ring_direct, ring_ref_throw, num_rings,
+                           ring_unwaterable, smooth_cumulative_depth,
+                           zone_arc_start, zone_arc_end, zone_arc_deg,
+                           act_max_throw, act_min_throw, have_throw_cal,
+                           pressure_scale, psi_min, psi_max, &spd, have_spd,
+                           depth_mm, passes, serpentine_dps, serpentine_dry,
+                           &_serpentine_sweeps, &_spsi_sum, &_spsi_n, t_start);
+        rings_done += _serpentine_sweeps;
+        (void)_spsi_sum; (void)_spsi_n;
+        goto abort;   // shared closeout: valve close, flush, depth, summary
     }
 
     for (int pass = 0; pass < passes; pass++) {
@@ -9502,33 +10544,8 @@ static void phase_water_zone(void)
              use_pulse_mode ? "[PULSE]" : gentle_mode ? "[GENTLE]" : smooth_mode ? "[SMOOTH]" : "");
 
         // Lookup run_duty from the appropriate directional speed table.
-        // CCW (NREV) may run at a very different speed than CW (NFWD)
-        // at the same duty -- use the CCW-specific table when available.
-        uint16_t run_duty = 250;
-        {
-            bool use_ccw = !cw && have_spd && (spd.num_points_ccw >= 2);
-            int   np  = use_ccw ? spd.num_points_ccw  : spd.num_points;
-            uint16_t *dt = use_ccw ? spd.duty_ccw       : spd.duty;
-            float    *ds = use_ccw ? spd.deg_per_sec_ccw: spd.deg_per_sec;
-            if (have_spd && np >= 2) {
-                float dps = nozzle_dps;
-                if (dps <= ds[0]) {
-                    run_duty = dt[0];
-                } else if (dps >= ds[np-1]) {
-                    run_duty = dt[np-1];
-                } else {
-                    for (int k = 0; k < np-1; k++) {
-                        if (dps >= ds[k] && dps <= ds[k+1]) {
-                            float fr = (dps - ds[k]) / (ds[k+1] - ds[k]);
-                            run_duty = (uint16_t)(dt[k] + fr*(dt[k+1]-dt[k]));
-                            break;
-                        }
-                    }
-                }
-            }
-            if (use_ccw)
-                INFO("  (CCW table: duty=%u for %.1fdps)", run_duty, nozzle_dps);
-        }
+        // b423: extracted verbatim to spd_duty_for_dps() (shared with serpentine).
+        uint16_t run_duty = spd_duty_for_dps(&spd, have_spd, nozzle_dps, cw);
         if (demo_mode) run_duty = spd.num_points>0 ? spd.duty[spd.num_points-1] : 480;
 
         // --- Sweep each arc segment ---
@@ -10280,7 +11297,7 @@ abort:
     // pass loop has fully exited and WiFi is in Quiet-mode (low-rate),
     // we keep the loop's tail free of metadata-relocation events that
     // race with WiFi PHY cache-disable.
-    if (smooth_mode && s_smooth_accum_mode && s_smooth_wbin_path[0] && !s_water_csv_f) {
+    if ((smooth_mode || serpentine_mode) && s_smooth_accum_mode && s_smooth_wbin_path[0] && !s_water_csv_f) {
         s_water_csv_f = fopen(s_smooth_wbin_path, "wb");
         if (s_water_csv_f) {
             uint32_t _magic = WATER_BIN_MAGIC;
@@ -10292,7 +11309,7 @@ abort:
             ESP_LOGW(TAG, "Smooth aggregate: could not open %s", s_smooth_wbin_path);
         }
     }
-    if (smooth_mode && s_smooth_accum_mode && s_water_csv_f) {
+    if ((smooth_mode || serpentine_mode) && s_smooth_accum_mode && s_water_csv_f) {
         int _aggr_n = 0;
         for (int _r = 0; _r < num_rings && _r < WATER_RUN_MAX_RINGS; _r++) {
             // Report the splash-true depth (display only -- control loop used
@@ -10354,7 +11371,7 @@ abort:
         float r_inner = (i == num_rings - 1)
                       ? r->throw_mm * 0.92f
                       : s_last_water_run.rings[i + 1].throw_mm;
-        if ((smooth_mode || gentle_mode) && smooth_cumulative_depth[i] > 0.005f) {
+        if ((smooth_mode || gentle_mode || serpentine_mode) && smooth_cumulative_depth[i] > 0.005f) {
             // Splash-true depth for the heatmap (control used raw geometric).
             r->depth_mm = smooth_display_depth_mm(smooth_cumulative_depth[i],
                                                   r->throw_mm, r_inner);
@@ -10437,7 +11454,7 @@ abort:
     // only -- the refined values aren't persisted or used yet (b285's job).
     // The log lets us validate the on-device refit matches the off-device
     // analyze_water_trace.py output before trusting it to drive behavior.
-    if ((smooth_mode || gentle_mode) && !demo_mode && rings_done > 0) {
+    if ((smooth_mode || gentle_mode || serpentine_mode) && !demo_mode && rings_done > 0) {
         water_trace_save(s_water_zone_id);
         water_trace_refit_f_and_log();
     } else if (s_trace_active) {
@@ -10505,6 +11522,12 @@ abort:
     int expected_rings = num_rings * passes;
     if (demo_mode) {
         INFO("Demo complete -- %d/%d rings.", rings_done, num_rings);
+    } else if (serpentine_mode) {
+        // b423: serpentine skips inner rings (Phase A) so the expected_rings
+        // identity doesn't hold; also must never fall into the pulse
+        // cleanup-pass branch below.
+        INFO("Serpentine %s -- %d ring sweep(s), %.3fmm target.",
+             s_water_abort ? "stopped" : "complete", rings_done, depth_mm);
     } else if (rings_done == expected_rings) {
         INFO("Watering complete. %.3fmm applied. ~%.0f min.", depth_mm, total_time);
         if (gentle_mode) {
@@ -11842,7 +12865,7 @@ static esp_err_t api_device_name_handler(httpd_req_t *req)
     httpd_resp_sendstr(req,"{\"ok\":true}"); return ESP_OK;
 }
 
-// POST /zone/water  body: id=N&mode=1|2|3|4|d
+// POST /zone/water  body: id=N&mode=1|2|3|4|5|6|7|8|c|d  (8=serpentine, b431)
 // Triggers a watering run in a one-shot task (non-blocking to HTTP handler)
 static void water_task(void *arg) {
     vTaskDelay(pdMS_TO_TICKS(200));  // brief yield so HTTP response can send
@@ -11871,8 +12894,10 @@ static esp_err_t zone_water_handler(httpd_req_t *req)
     httpd_query_key_value(body,"id",id_s,sizeof(id_s));
     httpd_query_key_value(body,"duration",dur_s,sizeof(dur_s));
     // b311: 'c'/'C' = chase mode (requires duration=1..10).
+    // b423: '8' = serpentine (continuous serpentine).
     int mode = mode_s[0]>'0'&&mode_s[0]<='6' ? mode_s[0]-'0' :
                mode_s[0]=='7'                 ? 7  :
+               mode_s[0]=='8'                 ? 8  :
                mode_s[0]=='c'||mode_s[0]=='C' ? WATER_MODE_CHASE :
                mode_s[0]=='d'||mode_s[0]=='D' ? 99 : 0;
     uint16_t zone_id = (uint16_t)atoi(id_s);
@@ -11908,6 +12933,16 @@ static esp_err_t zone_water_handler(httpd_req_t *req)
     int depth8_req = atoi(depth_q);
     s_web_water_depth_eighths = (mode == WATER_MODE_CHASE || depth8_req < 1 || depth8_req > 8)
                                   ? 0 : depth8_req;
+    // b423: serpentine tuning params. speed = nozzle dps (3..20; absent/0 ->
+    // default 8). dry=1 runs the full serpentine with the valve held
+    // closed -- a polygon-containment rehearsal before water flows.
+    {
+        char spd_q[8]={0}, dry_q[4]={0};
+        httpd_query_key_value(body,"speed",spd_q,sizeof(spd_q));
+        httpd_query_key_value(body,"dry",dry_q,sizeof(dry_q));
+        s_web_serpentine_dps = (mode == 8) ? strtof(spd_q, NULL) : 0.0f;
+        s_web_serpentine_dry = (mode == 8 && dry_q[0] == '1');
+    }
     s_web_water_mode = mode;
     // b294: moved from APP_CPU (core 1) to PRO_CPU (core 0). The original
     // pin-to-core-1 reasoning was "isolate motion control from WiFi/lwIP
@@ -14404,8 +15439,9 @@ int irrigoto_get_zone(void)
 
 int irrigoto_get_mode(void)
 {
-    // s_web_water_mode: 0=idle, 1-4=metered/pulse, 5-6=gentle, 7=smooth
-    // Map to HA options: 0=Pulse, 1=Gentle, 2=Smooth
+    // s_web_water_mode: 0=idle, 1-4=metered/pulse, 5-6=gentle, 7=smooth, 8=serpentine
+    // Map to HA options: 0=Pulse, 1=Gentle, 2=Smooth, 3=Serpentine (b431)
+    if (s_web_water_mode == 8)                     return 3;  // serpentine
     if (s_web_water_mode == 7)                     return 2;  // smooth
     if (s_web_water_mode == 5 || s_web_water_mode == 6) return 1; // gentle
     return 0;  // pulse / idle
@@ -14415,6 +15451,7 @@ void irrigoto_get_status(char *buf, size_t len)
 {
     if (s_web_water_mode != 0) {
         const char *mname =
+            (s_web_water_mode == 8)                    ? "serpentine"  :   // b423
             (s_web_water_mode == 7)                    ? "smooth" :
             (s_web_water_mode >= 5)                    ? "gentle" : "pulse";
         // b422: name-first -- the zone number is only a correlation key for
@@ -14537,6 +15574,7 @@ void irrigoto_last_water_mode_label(char *buf, size_t len)
         case 5:  l = "Gentle 1/8 in";     break;
         case 6:  l = "Gentle 1/4 in";     break;
         case 7:  l = "Smooth 1/8 in";     break;
+        case 8:  l = "Serpentine";             break;   // b431: depth via depth= param
         default: l = "unknown";           break;
     }
     snprintf(buf, len, "%s", l);
@@ -14697,7 +15735,17 @@ static bool ring_covers(const water_ring_data_t *r, float bearing_deg, float r_m
         in_arc = (bearing_deg >= r->arc_start_deg || bearing_deg <= r->arc_end_deg);
     }
     if (!in_arc) return false;
-    float ref = (r->actual_throw_mm > 100.0f) ? r->actual_throw_mm : r->throw_mm;
+    // b433: trust the PSI-derived actual throw only within +/-25% of target
+    // (the heatmap card's plausibility rule). Below ~1.5 PSI the pressure->
+    // throw model over-reads up to 2x, which displaced inner-ring footprints
+    // outward and deflated the serpentine run's coverage from a fair 87% to
+    // 71.5% (the watered center rastered as "missed"). Genuine under-throw
+    // (e.g. supply-limited outer rings at 0.86x) stays measured.
+    float ref = r->throw_mm;
+    if (r->actual_throw_mm > 100.0f && r->throw_mm > 100.0f) {
+        float ratio = r->actual_throw_mm / r->throw_mm;
+        if (ratio >= 0.75f && ratio <= 1.25f) ref = r->actual_throw_mm;
+    }
     float half = (float)WATER_RING_SPACING * 0.5f;
     return (r_mm >= ref - half && r_mm <= ref + half);
 }
@@ -14914,6 +15962,7 @@ static int schedule_web_mode(uint8_t mode)
     switch (mode) {
         case 0:  return 1;  // Pulse
         case 1:  return 5;  // Gentle
+        case 3:  return 8;  // Serpentine (b431)
         default: return 7;  // Smooth
     }
 }
@@ -14953,7 +16002,7 @@ void irrigoto_set_mode(int mode)
 // e.g. "2,2,0,06,30,127,1" = zone 2, smooth, 1/8", 6:30 AM, all days, enabled
 //
 // days_mask: bit0=Sun, bit1=Mon, ..., bit6=Sat (matches struct tm tm_wday)
-// mode:      0=Pulse, 1=Gentle, 2=Smooth
+// mode:      0=Pulse, 1=Gentle, 2=Smooth, 3=Serpentine (b431)
 // depth:     0=1/8" (3.175 mm), 1=1/4" (6.35 mm).  Smooth always uses 1/8".
 //
 // Time source: the system clock is set by ESPHome's homeassistant time

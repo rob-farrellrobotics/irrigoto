@@ -969,15 +969,30 @@ class IrrigotoHeatmapCard extends HTMLElement {
     for (let i = 1; i < lines.length; i++) {
       const c = lines[i].split(",");
       if (!c.length) continue;
-      const actMm = Number(c[idx("throw_mm_actual")]);
-      if (!(actMm > 100)) continue;
+      const rawActMm = Number(c[idx("throw_mm_actual")]);
+      if (!(rawActMm > 100)) continue;
+      const tgtMm = Number(c[idx("throw_mm_target")]);
+      // Low-PSI position guard: below ~1.5 PSI the pressure->throw model
+      // over-reads badly (up to 2x on inner rings), so the "actual" radius
+      // is artifact, not landing position. Serpentine runs surfaced this:
+      // it retires rings on DEPTH, so the position residue survives into
+      // the aggregate and the heat piled into the mid-radius band (smooth
+      // masks it by re-firing rings until measured throw is within 20%).
+      // Trust the measured radius only within +/-25% of the ring target;
+      // beyond that, render at the target radius. Depth/color unaffected.
+      let actMm = rawActMm;
+      if (tgtMm > 100) {
+        const ratio = rawActMm / tgtMm;
+        if (ratio < 0.75 || ratio > 1.25) actMm = tgtMm;
+      }
       out.push({
         ring: Number(c[idx("ring")]),
         sector: Number(c[idx("sector")]),
         actDeg: Number(c[idx("nozzle_deg_actual")]),
         tgtDeg: Number(c[idx("nozzle_deg_target")]),
         actMm,
-        tgtMm: Number(c[idx("throw_mm_target")]),
+        rawActMm,
+        tgtMm,
         psiAct: Number(c[idx("pressure_psi_actual")]),
         psiTgt: Number(c[idx("pressure_psi_target")]),
         timeS: iTime >= 0 ? Number(c[iTime]) : NaN,

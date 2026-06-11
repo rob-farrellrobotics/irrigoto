@@ -128,6 +128,7 @@ input_select:
       - Pulse
       - Gentle
       - Smooth
+      - Serpentine
     initial: Pulse
   <<DEV_USC>>_water_depth:
     name: <<DEV_DASH>> water depth
@@ -241,7 +242,7 @@ script:
   # watering" button). The zone selector carries the id as "Name (#id)", so
   # the id (including 0) resolves unambiguously; mode maps to the firmware
   # style digit, depth to eighths of an inch:
-  #   Pulse=1  Gentle=5  Smooth=7      depth 1..8 = 1/8".. 1"
+  #   Pulse=1  Gentle=5  Smooth=7  Serpentine=8      depth 1..8 = 1/8".. 1"
   <<DEV_USC>>_water_now:
     alias: "irrigoto <<DEV_DASH>>: start watering selected zone/mode/depth"
     icon: mdi:play-circle
@@ -261,6 +262,7 @@ script:
           mode_digit: >-
             {%- if mode_sel == 'Pulse' -%}1
             {%- elif mode_sel == 'Gentle' -%}5
+            {%- elif mode_sel == 'Serpentine' -%}8
             {%- else -%}7
             {%- endif -%}
       - if:

@@ -33,6 +33,21 @@ Practically, that means:
 3. Keep changes focused; firmware changes should compile
    (`python -m esphome compile esphome/irrigoto.yaml`).
 
+## Embedded web UI pages
+
+The device's web pages live in `components/irrigoto/html/`. Each page is a
+pair: the `.html` file (source of truth — edit this one) and a generated
+`*_html.h` (the C++ raw-string literal the firmware embeds). After editing a
+`.html`, run:
+
+```
+python components/irrigoto/html/regen.py
+```
+
+and commit both files. `regen.py --check` verifies every pair is in sync.
+Never edit the `*_html.h` files directly — past hand-edits let the pairs
+drift until regenerating a header silently reverted shipped features.
+
 ## Secrets
 
 Never commit real credentials. Per-user secrets are gitignored and provided via

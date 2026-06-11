@@ -17,7 +17,7 @@
 //   Sensors     : pressure_psi, battery_mv, throw_mm
 //   BinarySensor: watering (running / idle)
 //   TextSensor  : status, zone_name
-//   Select      : zone (1-4), mode (Pulse / Gentle / Smooth)
+//   Select      : zone (1-4), mode (Pulse / Gentle / Smooth / Serpentine)
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "esphome/core/component.h"

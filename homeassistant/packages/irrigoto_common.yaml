@@ -68,7 +68,7 @@ shell_command:
     'http://{{ ip }}/zone/water'
 
   # Start a normal watering run on one zone. mode is the style digit
-  # (1=Pulse, 5=Gentle, 7=Smooth); depth is the target in eighths of an inch
+  # (1=Pulse, 5=Gentle, 7=Smooth, 8=Serpentine); depth is the target in eighths of an inch
   # (1..8 = 1/8".. 1"). (Chase uses irrigoto_chase_zone with mode=c.) The
   # per-device water_now script fills these from the zone/mode/depth selectors.
   irrigoto_water_zone: >-
