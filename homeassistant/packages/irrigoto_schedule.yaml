@@ -24,7 +24,7 @@
 #   | |          |               | | | | minute
 #   | |          |               | | | hour
 #   | |          |               | | depth (eighths of an inch, 1..8 = 1/8".. 1")
-#   | |          |               | mode (0 = Pulse, 1 = Gentle, 2 = Smooth)
+#   | |          |               | mode (0 = Pulse, 1 = Gentle, 2 = Smooth, 3 = Serpentine)
 #   | |          |               zone (1-based)
 #   | |          device slug
 #   | last_modified (unix epoch when this slot was last saved by HA)
@@ -45,7 +45,7 @@
 # Form helpers (compose_*) hold the values being edited:
 #   compose_device   device-slug select
 #   compose_zone     1..8
-#   compose_mode     Pulse | Gentle | Smooth
+#   compose_mode     Pulse | Gentle | Smooth | Serpentine
 #   compose_depth    1/8" .. 1" (eighths)
 #   compose_time     time picker
 #   compose_days     Daily | Weekdays | Weekends | MWF | TTh | each
@@ -108,7 +108,7 @@ input_select:
   irrigoto_compose_mode:
     name: "irrigoto compose: mode"
     icon: mdi:water-pump
-    options: [Pulse, Gentle, Smooth]
+    options: [Pulse, Gentle, Smooth, Serpentine]
     initial: Smooth
 
   irrigoto_compose_depth:
@@ -229,7 +229,7 @@ script:
             {%- set s = zone_sel -%}
             {{ ('(#' in s and ')' in s) or s.isdigit() }}
           mode_int: >-
-            {{ {'Pulse':0,'Gentle':1,'Smooth':2}.get(
+            {{ {'Pulse':0,'Gentle':1,'Smooth':2,'Serpentine':3}.get(
                   states('input_select.irrigoto_compose_mode'), 2) }}
           depth_int: >-
             {{ {'1/8"':1,'1/4"':2,'3/8"':3,'1/2"':4,
@@ -337,7 +337,7 @@ script:
       - variables:
           parsed: >-
             {%- set f = (raw | string).split(',') -%}
-            {%- set MODES = ['Pulse','Gentle','Smooth'] -%}
+            {%- set MODES = ['Pulse','Gentle','Smooth','Serpentine'] -%}
             {%- set DEPTHS = {1:'1/8"',2:'1/4"',3:'3/8"',4:'1/2"',5:'5/8"',6:'3/4"',7:'7/8"',8:'1"'} -%}
             {%- set INV = {
               127: 'Daily', 62: 'Weekdays', 65: 'Weekends',
@@ -533,7 +533,7 @@ template:
         attributes:
           error: ""
           entries: >-
-            {%- set MODES = ['Pulse','Gentle','Smooth'] -%}
+            {%- set MODES = ['Pulse','Gentle','Smooth','Serpentine'] -%}
             {%- set DEPTHS = {1:'1/8"',2:'1/4"',3:'3/8"',4:'1/2"',5:'5/8"',6:'3/4"',7:'7/8"',8:'1"'} -%}
             {%- set PRESETS = {127:'Daily', 62:'Weekdays', 65:'Weekends', 42:'MWF', 20:'TTh',
                                 1:'Sun', 2:'Mon', 4:'Tue', 8:'Wed', 16:'Thu', 32:'Fri', 64:'Sat'} -%}
@@ -627,7 +627,7 @@ template:
           {%- if entries | count == 0 -%}
             ok
           {%- else -%}
-            {%- set MODES = {'Pulse':0,'Gentle':1,'Smooth':2} -%}
+            {%- set MODES = {'Pulse':0,'Gentle':1,'Smooth':2,'Serpentine':3} -%}
             {%- set PRESETS = {'Daily':127,'Weekdays':62,'Weekends':65,'MWF':42,'TTh':20} -%}
             {%- set DBITS = {'Sun':0,'Mon':1,'Tue':2,'Wed':3,'Thu':4,'Fri':5,'Sat':6} -%}
             {%- set ns = namespace(items=[], conflicts=[]) -%}
@@ -681,7 +681,7 @@ template:
             {%- set entries = state_attr('sensor.irrigoto_desired_schedule', 'entries') | default([], true) -%}
             {%- if entries | count == 0 -%}{{ '' }}
             {%- else -%}
-              {%- set MODES = {'Pulse':0,'Gentle':1,'Smooth':2} -%}
+              {%- set MODES = {'Pulse':0,'Gentle':1,'Smooth':2,'Serpentine':3} -%}
               {%- set PRESETS = {'Daily':127,'Weekdays':62,'Weekends':65,'MWF':42,'TTh':20} -%}
               {%- set DBITS = {'Sun':0,'Mon':1,'Tue':2,'Wed':3,'Thu':4,'Fri':5,'Sat':6} -%}
               {%- set ns = namespace(items=[], first='') -%}

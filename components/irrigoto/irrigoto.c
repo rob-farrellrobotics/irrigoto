@@ -16347,6 +16347,7 @@ static int schedule_estimate_duration_min(uint8_t zone, uint8_t mode, uint8_t de
     int d = (depth >= 1 && depth <= 8) ? depth : 1;
     int base;
     switch (mode) {
+        case 3:  base = 12; break;  // serpentine (b435: Edge measured ~10.5 min/eighth)
         case 2:  base = 30; break;  // smooth (adaptive)
         case 1:  base = 15; break;  // gentle, per 1/8"
         default: base = 8;  break;  // pulse, per 1/8"
@@ -16476,7 +16477,7 @@ bool irrigoto_schedule_set_text(const char *text)
             ESP_LOGW(TAG, "%s", s_sched_last_status);
             return false;
         }
-        if (z < 1 || z > 250 || m < 0 || m > 2 || d < 0 || d > 8 ||
+        if (z < 1 || z > 250 || m < 0 || m > 3 || d < 0 || d > 8 ||   // b435: 3=Serpentine
             hh < 0 || hh > 23 || mm < 0 || mm > 59 ||
             days < 0 || days > 127 || en < 0 || en > 1) {
             snprintf(s_sched_last_status, sizeof(s_sched_last_status),
@@ -16599,7 +16600,7 @@ bool irrigoto_schedule_sync_text(const char *text)
             return false;
         }
         if (tomb == 0) {
-            if (z < 1 || z > 250 || m < 0 || m > 2 || d < 0 || d > 8 ||
+            if (z < 1 || z > 250 || m < 0 || m > 3 || d < 0 || d > 8 ||   // b435: 3=Serpentine
                 hh < 0 || hh > 23 || mm < 0 || mm > 59 ||
                 days < 0 || days > 127 || en < 0 || en > 1 ||
                 src < 0 || src > 3) {
