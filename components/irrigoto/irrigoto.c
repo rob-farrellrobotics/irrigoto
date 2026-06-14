@@ -83,41 +83,52 @@ static const char *TAG = "irrigoto";
 #define MPRLS_COUNT_MIN         0x19999Au
 #define MPRLS_COUNT_MAX         0xE66666u
 
-// ── TCA6408A registers ────────────────────────────────────────────────────────
+// ── GPIO expander / LED registers ─────────────────────────────────────────────
 #define TCA6408A_REG_OUTPUT     0x01
 #define TCA6408A_REG_CONFIG     0x03
+#define SX1502_REG_DATA         0x00
+#define SX1502_REG_DIR          0x01       // 1=input, 0=output
+#define SX1502_REG_ADVANCED     0xAB       // factory FW probes this register
 
-// TCA6408A LED bit mapping (confirmed from LED test menu):
-//
-//   Bit 0 = Red   (active LOW  -- 0=on, 1=off)
-//   Bit 1 = Blue  (active HIGH -- 1=on, 0=off)
-//   Bit 2 = Green (active HIGH -- 1=on, 0=off)
-//   Bits 3-7 = auxiliary / pump valve controls (unpopulated in this unit)
-//
-// DUAL-DRIVE ARCHITECTURE FOR RED LED (confirmed by hardware testing):
-//   The red LED has two independent drive paths that OR together:
-//   1. BQ25504 charger IC status pin -- lights red autonomously whenever
-//      solar charging is active, even during ESP32 deep sleep.
-//      This is hardware-only, no firmware involvement required.
-//      CONFIRMED: red LED lights during deep sleep when solar connected.
-//   2. TCA6408A bit 0 (active LOW) -- firmware-controllable.
-//      Can be used for error states, low battery warnings, etc.
-//   Either path alone lights the LED; both active = same result.
-//   Before sleep, set TCA to LED_OFF (0xF9) so bit0=HIGH, releasing
-//   red LED control to the BQ25504 charger exclusively.
-//
-//   Green and Blue are firmware-only (TCA6408A bits 1 and 2).
-//
-// Base "off" state: bit0=HIGH, bit1=LOW, bit2=LOW = 0xF9
-// To add a colour: set its bit (HIGH for B/G, LOW for R)
-#define LED_OFF         0xF9   // R=off(HIGH) G=off(LOW)  B=off(LOW)
-#define LED_RED         0xF8   // R=on(LOW)   G=off(LOW)  B=off(LOW)
-#define LED_GREEN       0xFD   // R=off(HIGH) G=on(HIGH)  B=off(LOW)
-#define LED_BLUE        0xFB   // R=off(HIGH) G=off(LOW)  B=on(HIGH)
-#define LED_YELLOW      0xFC   // R=on(LOW)   G=on(HIGH)  B=off(LOW)
-#define LED_CYAN        0xFF   // R=off(HIGH) G=on(HIGH)  B=on(HIGH)
-#define LED_PURPLE      0xFA   // R=on(LOW)   G=off(LOW)  B=on(HIGH)
-#define LED_WHITE       0xFE   // R=on(LOW)   G=on(HIGH)  B=on(HIGH)
+typedef enum {
+    LED_EXP_UNKNOWN = 0,
+    LED_EXP_TCA6408A,
+    LED_EXP_SX1502,
+} led_expander_t;
+
+// Logical LED states. tca_led_set() maps these to the detected expander's
+// physical register values.
+#define LED_OFF         0
+#define LED_RED         1
+#define LED_GREEN       2
+#define LED_BLUE        3
+#define LED_YELLOW      4
+#define LED_CYAN        5
+#define LED_PURPLE      6
+#define LED_WHITE       7
+
+// TCA6408A LED bit mapping (existing/default path):
+#define TCA_LED_OFF     0xF9   // R=off(HIGH) G=off(LOW)  B=off(LOW)
+#define TCA_LED_RED     0xF8   // R=on(LOW)   G=off(LOW)  B=off(LOW)
+#define TCA_LED_GREEN   0xFD   // R=off(HIGH) G=on(HIGH)  B=off(LOW)
+#define TCA_LED_BLUE    0xFB   // R=off(HIGH) G=off(LOW)  B=on(HIGH)
+#define TCA_LED_YELLOW  0xFC   // R=on(LOW)   G=on(HIGH)  B=off(LOW)
+#define TCA_LED_CYAN    0xFF   // R=off(HIGH) G=on(HIGH)  B=on(HIGH)
+#define TCA_LED_PURPLE  0xFA   // R=on(LOW)   G=off(LOW)  B=on(HIGH)
+#define TCA_LED_WHITE   0xFE   // R=on(LOW)   G=on(HIGH)  B=on(HIGH)
+
+// SX1502 LED map observed on this OtO via diagnostic page (2026-06-13).
+// Keep upper bits high when driving normal firmware states; the diagnostic raw
+// walk saw 0x00 as red, but bits 4-7 are not needed for the LED colours and
+// may be routed differently on future board variants.
+#define SX_LED_OFF      0xFE
+#define SX_LED_RED      0xF0
+#define SX_LED_GREEN    0xFB
+#define SX_LED_BLUE     0xFD
+#define SX_LED_YELLOW   0xF7   // no clean yellow observed; use visible white
+#define SX_LED_CYAN     0xFF   // observed light blue
+#define SX_LED_PURPLE   0xF7   // no clean purple observed; use visible white
+#define SX_LED_WHITE    0xF7
 
 // ── ADC / battery ─────────────────────────────────────────────────────────────
 #define VBATT_DIVIDER_RATIO     2.0f    // adjust after measuring resistors near J5
@@ -133,12 +144,14 @@ static const char *TAG = "irrigoto";
 // ── State ─────────────────────────────────────────────────────────────────────
 // Forward declarations
 static void tca_led_set(uint8_t val);
+static void led_expander_detect(void);
 
 static int s_pass = 0;
 static int s_fail = 0;
 static bool s_sensor_rail = false;
 static bool s_motor_rail  = false;
-static bool s_tca_outputs  = false;  // true once TCA6408A config set to outputs
+static bool s_tca_outputs  = false;  // true once LED expander pins are configured as outputs
+static led_expander_t s_led_expander = LED_EXP_UNKNOWN;
 static TickType_t          s_last_activity     = 0;  // tick count of last user input
 static volatile TickType_t s_last_web_req_tick = 0;  // tick of last zone web HTTP request
 static volatile bool s_ota_in_progress = false;  // true during OTA -- suppress sleep
@@ -675,6 +688,10 @@ static void sensor_rail_off(void)
     i2c_bus_deinit();
     gpio_set_level(GPIO_3V3SEN, 0);
     s_sensor_rail = false;
+    // The LED expander lives on the sensor rail. If that rail is power-cycled,
+    // its direction/output registers return to reset defaults and must be
+    // initialized again on the next LED write.
+    s_tca_outputs = false;
     INFO("Sensor rail OFF");
 }
 
@@ -972,15 +989,35 @@ static void phase_pressure(void)
 // ─────────────────────────────────────────────────────────────────────────────
 static void phase_tca6408a(void)
 {
-    STEP("TCA6408A GPIO Expander (0x20) / RGB LEDs");
+    STEP("GPIO Expander (0x20) / RGB LEDs");
     sensor_rail_on();
 
-    // Force bus reset to clear any stuck state from a prior crash mid-transaction
+    // Force bus reset to clear any stuck state from a prior crash mid-transaction.
+    // Clear the cached output-configured flag because the expander may have reset.
     i2c_bus_deinit();
     vTaskDelay(pdMS_TO_TICKS(20));
     i2c_bus_init();
     s_sensor_rail = true;
+    s_tca_outputs = false;
     vTaskDelay(pdMS_TO_TICKS(100));
+
+    led_expander_detect();
+    result(s_led_expander != LED_EXP_UNKNOWN, "LED expander detected");
+
+    if (s_led_expander == LED_EXP_SX1502) {
+        INFO("Detected SX1502 LED expander; cycling logical colours.");
+        const struct { uint8_t logical; const char *name; } colors[] = {
+            {LED_BLUE, "Blue"}, {LED_GREEN, "Green"}, {LED_WHITE, "White"},
+            {LED_RED, "Red"}, {LED_OFF, "Off"},
+        };
+        for (int i = 0; i < (int)(sizeof(colors) / sizeof(colors[0])); i++) {
+            tca_led_set(colors[i].logical);
+            INFO("  %s", colors[i].name);
+            vTaskDelay(pdMS_TO_TICKS(1500));
+        }
+        result(true, "SX1502 LED colour scan complete");
+        return;
+    }
 
     uint8_t cfg = 0xFF;
     esp_err_t r = i2c_bus_read_reg(ADDR_TCA6408A, TCA6408A_REG_CONFIG, &cfg, 1);
@@ -1005,6 +1042,7 @@ static void phase_tca6408a(void)
     i2c_bus_write_reg(ADDR_TCA6408A, TCA6408A_REG_OUTPUT, &val, 1);
     uint8_t all_out = 0x00;
     i2c_bus_write_reg(ADDR_TCA6408A, TCA6408A_REG_CONFIG, &all_out, 1);
+    s_tca_outputs = true;
     vTaskDelay(pdMS_TO_TICKS(50));
 
     INFO("Cycling bits LOW one at a time (5s each, all pins as outputs):");
@@ -4526,33 +4564,20 @@ static void phase_led_test(void)
 {
     STEP("LED Colour Test");
     sensor_rail_on();
-
-    // Ensure TCA is in output mode
-    if (!s_tca_outputs) {
-        uint8_t off = LED_OFF;
-        i2c_bus_write_reg(ADDR_TCA6408A, TCA6408A_REG_OUTPUT, &off, 1);
-        uint8_t all_out = 0x00;
-        i2c_bus_write_reg(ADDR_TCA6408A, TCA6408A_REG_CONFIG, &all_out, 1);
-        s_tca_outputs = true;
-    }
+    led_expander_detect();
 
     INFO("LED test -- press key to cycle:");
-    INFO("  0=Off  1=Bit0(0xFE)  2=Bit1(0xFD)  3=Bit2(0xFB)");
-    INFO("  4=Bits0+1(0xFC)  5=Bits0+2(0xFA)  6=Bits1+2(0xF9)  7=All(0xF8)");
-    INFO("  g=Green(0xFD)  b=Blue(0xFB)  c=Cyan(0xF9)  q=Quit");
+    INFO("  0=Off  r=Red  g=Green  b=Blue  w=White  c=Cyan  y=Yellow  p=Purple  q=Quit");
 
-    const struct { char key; uint8_t val; const char *name; } entries[] = {
-        {'0', 0xFF, "Off"},
-        {'1', 0xFE, "Bit0 only"},
-        {'2', 0xFD, "Bit1 only"},
-        {'3', 0xFB, "Bit2 only"},
-        {'4', 0xFC, "Bits 0+1"},
-        {'5', 0xFA, "Bits 0+2"},
-        {'6', 0xF9, "Bits 1+2"},
-        {'7', 0xF8, "All bits 0-2"},
-        {'g', LED_GREEN, "GREEN"},
-        {'b', LED_BLUE,  "BLUE"},
-        {'c', LED_CYAN,  "CYAN"},
+    const struct { char key; uint8_t logical; const char *name; } entries[] = {
+        {'0', LED_OFF,    "OFF"},
+        {'r', LED_RED,    "RED"},
+        {'g', LED_GREEN,  "GREEN"},
+        {'b', LED_BLUE,   "BLUE"},
+        {'w', LED_WHITE,  "WHITE"},
+        {'c', LED_CYAN,   "CYAN"},
+        {'y', LED_YELLOW, "YELLOW"},
+        {'p', LED_PURPLE, "PURPLE"},
     };
 
     while (true) {
@@ -4560,20 +4585,18 @@ static void phase_led_test(void)
         if (ch == 'q' || ch == 'Q' || ch == 0) break;
         bool found = false;
         for (int i = 0; i < (int)(sizeof(entries)/sizeof(entries[0])); i++) {
-            if (ch == entries[i].key) {
-                i2c_bus_write_reg(ADDR_TCA6408A, TCA6408A_REG_OUTPUT,
-                                  &entries[i].val, 1);
-                INFO("  %c -> 0x%02x [%s]", ch, entries[i].val, entries[i].name);
+            if (ch == entries[i].key || ch == (entries[i].key - 32)) {
+                tca_led_set(entries[i].logical);
+                INFO("  %c -> %s", ch, entries[i].name);
                 found = true;
                 break;
             }
         }
-        if (!found) INFO("  Unknown key '%c' -- 0=off g=green b=blue c=cyan q=quit", ch);
+        if (!found) INFO("  Unknown key '%c' -- 0=off r/g/b/w/c/y/p q=quit", ch);
     }
 
-    // Leave LEDs off
-    uint8_t off = LED_OFF;
-    i2c_bus_write_reg(ADDR_TCA6408A, TCA6408A_REG_OUTPUT, &off, 1);
+    // Leave LEDs off through the detected controller path.
+    tca_led_set(LED_OFF);
     INFO("LEDs off.");
 }
 
@@ -5176,19 +5199,106 @@ static void tcp_server_task(void *arg)
 // ─────────────────────────────────────────────────────────────────────────────
 // WiFi + Blue LED + OTA
 // ─────────────────────────────────────────────────────────────────────────────
+static uint8_t led_tca_value(uint8_t logical)
+{
+    switch (logical) {
+        case LED_RED:    return TCA_LED_RED;
+        case LED_GREEN:  return TCA_LED_GREEN;
+        case LED_BLUE:   return TCA_LED_BLUE;
+        case LED_YELLOW: return TCA_LED_YELLOW;
+        case LED_CYAN:   return TCA_LED_CYAN;
+        case LED_PURPLE: return TCA_LED_PURPLE;
+        case LED_WHITE:  return TCA_LED_WHITE;
+        case LED_OFF:
+        default:         return TCA_LED_OFF;
+    }
+}
+
+static uint8_t led_sx1502_value(uint8_t logical)
+{
+    switch (logical) {
+        case LED_RED:    return SX_LED_RED;
+        case LED_GREEN:  return SX_LED_GREEN;
+        case LED_BLUE:   return SX_LED_BLUE;
+        case LED_YELLOW: return SX_LED_YELLOW;
+        case LED_CYAN:   return SX_LED_CYAN;
+        case LED_PURPLE: return SX_LED_PURPLE;
+        case LED_WHITE:  return SX_LED_WHITE;
+        case LED_OFF:
+        default:         return SX_LED_OFF;
+    }
+}
+
+static void led_expander_detect(void)
+{
+    if (s_led_expander != LED_EXP_UNKNOWN) return;
+
+    sensor_rail_on();
+
+    uint8_t cfg = 0xFF;
+    esp_err_t r_tca = i2c_bus_read_reg(ADDR_TCA6408A, TCA6408A_REG_CONFIG, &cfg, 1);
+
+    // Factory OtO firmware probes the SX1502 advanced settings register.
+    // Be conservative: some GPIO expanders may ACK reserved command bytes, so
+    // only classify as SX1502 when the read succeeds AND the advanced register
+    // has its documented reset value (0x00). Otherwise preserve the existing
+    // TCA6408A-compatible default path.
+    uint8_t advanced = 0xFF;
+    esp_err_t r_sx = i2c_bus_read_reg(ADDR_TCA6408A, SX1502_REG_ADVANCED, &advanced, 1);
+    if (r_sx == ESP_OK && advanced == 0x00) {
+        s_led_expander = LED_EXP_SX1502;
+        INFO("LED expander detected: SX1502 (advanced=0x%02X, tca_cfg=0x%02X)", advanced, cfg);
+        return;
+    }
+
+    if (r_tca == ESP_OK) {
+        s_led_expander = LED_EXP_TCA6408A;
+        INFO("LED expander detected: TCA6408A-compatible (config=0x%02X)", cfg);
+        return;
+    }
+
+    s_led_expander = LED_EXP_TCA6408A;
+    ESP_LOGW(TAG, "LED expander detection failed (sx=%s tca=%s); using TCA6408A path",
+             esp_err_to_name(r_sx), esp_err_to_name(r_tca));
+}
+
 static void tca_led_set(uint8_t val)
 {
     sensor_rail_on();
+    led_expander_detect();
+
+    if (s_led_expander == LED_EXP_SX1502) {
+        uint8_t raw = led_sx1502_value(val);
+        if (!s_tca_outputs) {
+            uint8_t off = SX_LED_OFF;
+            esp_err_t r_data = i2c_bus_write_reg(ADDR_TCA6408A, SX1502_REG_DATA, &off, 1);
+            uint8_t all_out = 0x00;
+            esp_err_t r_dir = i2c_bus_write_reg(ADDR_TCA6408A, SX1502_REG_DIR, &all_out, 1);
+            s_tca_outputs = (r_data == ESP_OK && r_dir == ESP_OK);
+            if (!s_tca_outputs) {
+                ESP_LOGW(TAG, "SX1502 LED init failed (data=%s dir=%s)",
+                         esp_err_to_name(r_data), esp_err_to_name(r_dir));
+            }
+        }
+        i2c_bus_write_reg(ADDR_TCA6408A, SX1502_REG_DATA, &raw, 1);
+        return;
+    }
+
+    uint8_t raw = led_tca_value(val);
     if (!s_tca_outputs) {
         // First call: pre-load output latch HIGH, then switch to outputs
-        uint8_t off = LED_OFF;
-        i2c_bus_write_reg(ADDR_TCA6408A, TCA6408A_REG_OUTPUT, &off, 1);
+        uint8_t off = TCA_LED_OFF;
+        esp_err_t r_data = i2c_bus_write_reg(ADDR_TCA6408A, TCA6408A_REG_OUTPUT, &off, 1);
         uint8_t all_out = 0x00;
-        i2c_bus_write_reg(ADDR_TCA6408A, TCA6408A_REG_CONFIG, &all_out, 1);
-        s_tca_outputs = true;
+        esp_err_t r_cfg = i2c_bus_write_reg(ADDR_TCA6408A, TCA6408A_REG_CONFIG, &all_out, 1);
+        s_tca_outputs = (r_data == ESP_OK && r_cfg == ESP_OK);
+        if (!s_tca_outputs) {
+            ESP_LOGW(TAG, "TCA6408A LED init failed (output=%s config=%s)",
+                     esp_err_to_name(r_data), esp_err_to_name(r_cfg));
+        }
     }
     // Config already all-outputs -- just write the output register
-    i2c_bus_write_reg(ADDR_TCA6408A, TCA6408A_REG_OUTPUT, &val, 1);
+    i2c_bus_write_reg(ADDR_TCA6408A, TCA6408A_REG_OUTPUT, &raw, 1);
 }
 
 static void led_blink_task(void *arg)
