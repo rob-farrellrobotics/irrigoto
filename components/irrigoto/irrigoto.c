@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <time.h>        // for scheduler: time(), localtime()
+#include <sys/time.h>    // settimeofday() — b437 web-client clock sync
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -13454,6 +13455,48 @@ static esp_err_t api_theme_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// b437: POST /api/time  body: epoch=<unix UTC seconds>[&tz=<offset minutes>]
+// Lets the phone's browser set the device clock with zero configuration --
+// every web page POSTs its Date.now() on load. This is the standalone /
+// AP-mode time source (no HA, no NTP, no internet): the phone keeps accurate
+// time on its own, and one visit is enough to arm the schedule. Only applies
+// when the device clock is unset or has drifted > 30 s, so it never fights
+// HA's continuous sync when HA is present. The system clock is UTC; local
+// interpretation uses the configured timezone (device_timezone), so tz is
+// accepted but currently informational.
+static esp_err_t api_time_handler(httpd_req_t *req)
+{
+    WEB_TOUCH();
+    HTTP_CONN_CLOSE(req);
+    httpd_resp_set_type(req, "application/json");
+    char body[64] = {0};
+    int len = httpd_req_recv(req, body, sizeof(body) - 1);
+    bool applied = false;
+    long epoch = 0;
+    if (len > 0) {
+        char eps[20] = {0};
+        if (httpd_query_key_value(body, "epoch", eps, sizeof(eps)) == ESP_OK)
+            epoch = atol(eps);
+    }
+    if (epoch > 1700000000L && epoch < 4100000000L) {
+        time_t now = time(NULL);
+        long drift = (now > 1700000000L) ? labs((long)now - epoch) : 1000000L;
+        if (now < 1700000000L || drift > 30) {
+            struct timeval tv = { .tv_sec = (time_t)epoch, .tv_usec = 0 };
+            settimeofday(&tv, NULL);
+            applied = true;
+            INFO("Clock set from web client: epoch %ld (%s, drift %lds)",
+                 epoch, (now < 1700000000L) ? "was unset" : "was valid",
+                 (now < 1700000000L) ? 0L : drift);
+        }
+    }
+    char buf[48];
+    int n = snprintf(buf, sizeof(buf), "{\"ok\":true,\"applied\":%s}",
+                     applied ? "true" : "false");
+    httpd_resp_send(req, buf, n);
+    return ESP_OK;
+}
+
 static esp_err_t api_status_handler(httpd_req_t *req)
 {
     size_t used=0, total=0;
@@ -14527,6 +14570,8 @@ static esp_err_t schedule_page_handler(httpd_req_t *req)
 // the same ';'-separated text format as the HA set_schedule service. We
 // keep both representations in one shape so external callers (HA, scripts)
 // can use whichever they have on hand without a separate API surface.
+static uint32_t sched_fire_armed_info(uint16_t *zone, uint8_t *mode, uint8_t *run_sleep);  // b437
+
 static esp_err_t api_schedule_handler(httpd_req_t *req)
 {
     // The big working buffers (body, encoded, response JSON) are static —
@@ -14658,6 +14703,15 @@ static esp_err_t api_schedule_handler(httpd_req_t *req)
     n += snprintf(buf+n, sizeof(buf)-n,
         "\"delay_until\":%ld,",
         (long)irrigoto_schedule_get_delay_until());
+    // b437: armed run diagnostic — the clock-independent intent the next
+    // timer wake will fire. armed_epoch 0 = nothing armed.
+    {
+        uint16_t a_zone = 0; uint8_t a_mode = 0, a_run = 0;
+        uint32_t a_epoch = sched_fire_armed_info(&a_zone, &a_mode, &a_run);
+        n += snprintf(buf+n, sizeof(buf)-n,
+            "\"armed\":{\"epoch\":%lu,\"zone\":%u,\"mode\":%u,\"run_sleep\":%u},",
+            (unsigned long)a_epoch, a_zone, a_mode, a_run);
+    }
     // Last completed watering — surfaces on the landing schedule card
     // and on the editor status header. Epoch 0 means nothing has run
     // since boot. zone is 1-based; status follows the watering_complete
@@ -15057,6 +15111,7 @@ static void zone_web_start(void)
         {.uri="/api/boot_diag",   .method=HTTP_GET,  .handler=api_boot_diag_handler},  // b347
         {.uri="/api/theme",       .method=HTTP_GET,  .handler=api_theme_handler},
         {.uri="/api/theme",       .method=HTTP_POST, .handler=api_theme_handler},
+        {.uri="/api/time",        .method=HTTP_POST, .handler=api_time_handler},   // b437
         {.uri="/api/zones",       .method=HTTP_GET,  .handler=api_zones_handler},
         {.uri="/schedule",        .method=HTTP_GET,  .handler=schedule_page_handler},
         {.uri="/api/schedule",    .method=HTTP_GET,  .handler=api_schedule_handler},
@@ -15276,6 +15331,7 @@ void app_main(void)
 static void log_wake_cause(void);
 static void pm_nvs_load(void);
 static void schedule_load_nvs(void);
+static void sched_fire_load(void);   // b437
 static void schedule_save_nvs(void);
 static void schedule_delay_load_nvs(void);
 static void last_water_load_nvs(void);
@@ -15356,6 +15412,7 @@ void irrigoto_init(void)
     schedule_load_nvs();
     schedule_delay_load_nvs();   // restore rain/wind delay across reboot/wake
     last_water_load_nvs();       // restore "last completed" tag across deep-sleep wake
+    sched_fire_load();           // b437: armed run + fired-epoch ring (clock-free firing)
     xTaskCreate(schedule_task, "oto_sched", 3072, NULL, 2, NULL);
     INFO("Schedule loaded: %d entries", irrigoto_schedule_count());
 }
@@ -16010,11 +16067,95 @@ void irrigoto_set_mode(int mode)
 // scheduler does nothing.
 
 static schedule_t s_schedule = { .count = 0 };
-// Per-entry "last fire minute" (unix-epoch minute) so a single timestamp
-// matching multiple poll iterations only fires once. RAM-only; on reboot
-// any entry whose hour:minute hasn't changed in the current minute would
-// re-fire, which is fine — that scenario is rare and harmless.
-static uint32_t s_sched_last_fire_min[SCHEDULE_MAX_ENTRIES] = {0};
+
+// b437: schedule-fire persistence (NVS blob "sched_fire"). Decouples firing
+// a scheduled run from having a valid wall clock AT WAKE TIME:
+//   - ARM: when the schedule-aware sleep shortens to land on a run, we record
+//     the run (zone/mode/depth + its scheduled epoch) and mark "the next timer
+//     wake IS for this run". Arming happens with a valid clock (the shortening
+//     is clock-gated), so the epoch is sound.
+//   - FIRE: on a timer wake, if a run is armed for it, water immediately --
+//     no clock needed. The alarm firing is the signal. This is what makes a
+//     scheduled run survive a wake where HA hasn't re-synced the clock yet
+//     (the ba1f88 miss) and lets a fully-standalone unit run schedules with
+//     only an occasional phone-set clock.
+//   - DEDUP: a ring of recently-fired scheduled epochs, shared by the intent
+//     path and the clock-based catch-up path, so a run never double-fires
+//     (the device wakes ~every 20 min and both paths could see the same slot).
+#define SCHED_FIRE_MAGIC  0x53464952u   // 'SFIR'
+#define SCHED_FIRED_RING  8
+typedef struct {
+    uint32_t magic;
+    uint32_t armed_epoch;     // scheduled UTC epoch of the armed run (0 = none)
+    uint16_t armed_zone;      // 1-based
+    uint8_t  armed_mode;      // schedule mode (0..3)
+    uint8_t  armed_depth;     // eighths
+    uint8_t  armed_run_sleep; // 1 = next timer wake is FOR the armed run
+    uint8_t  _pad[3];
+    uint32_t fired[SCHED_FIRED_RING];  // recently-fired scheduled epochs
+    uint8_t  fired_idx;
+    uint8_t  _pad2[3];
+} sched_fire_t;
+static sched_fire_t s_sched_fire;   // RAM mirror of the NVS blob
+
+static void sched_fire_load(void)
+{
+    nvs_handle_t h;
+    memset(&s_sched_fire, 0, sizeof(s_sched_fire));
+    if (nvs_open(CAL_NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+        size_t sz = sizeof(s_sched_fire);
+        if (nvs_get_blob(h, "sched_fire", &s_sched_fire, &sz) != ESP_OK
+                || sz != sizeof(s_sched_fire)
+                || s_sched_fire.magic != SCHED_FIRE_MAGIC) {
+            memset(&s_sched_fire, 0, sizeof(s_sched_fire));
+        }
+        nvs_close(h);
+    }
+    s_sched_fire.magic = SCHED_FIRE_MAGIC;
+}
+
+static void sched_fire_save(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(CAL_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_blob(h, "sched_fire", &s_sched_fire, sizeof(s_sched_fire));
+    nvs_commit(h); nvs_close(h);
+}
+
+static bool sched_fire_already(uint32_t epoch)
+{
+    if (epoch == 0) return true;   // treat unset as "don't fire"
+    for (int i = 0; i < SCHED_FIRED_RING; i++)
+        if (s_sched_fire.fired[i] == epoch) return true;
+    return false;
+}
+
+static void sched_fire_mark(uint32_t epoch)
+{
+    s_sched_fire.fired[s_sched_fire.fired_idx] = epoch;
+    s_sched_fire.fired_idx = (uint8_t)((s_sched_fire.fired_idx + 1) % SCHED_FIRED_RING);
+    sched_fire_save();
+}
+
+// b437: armed-run snapshot for the /api/schedule diagnostic.
+static uint32_t sched_fire_armed_info(uint16_t *zone, uint8_t *mode, uint8_t *run_sleep)
+{
+    if (zone)      *zone      = s_sched_fire.armed_zone;
+    if (mode)      *mode      = s_sched_fire.armed_mode;
+    if (run_sleep) *run_sleep = s_sched_fire.armed_run_sleep;
+    return s_sched_fire.armed_epoch;
+}
+
+// Disarm any pending run (called when the schedule changes -- the armed run
+// may reference a deleted/edited entry). The next sleep re-arms from the
+// current table. Fired-epoch history is kept (harmless dedup).
+static void sched_fire_disarm(void)
+{
+    if (s_sched_fire.armed_epoch == 0 && !s_sched_fire.armed_run_sleep) return;
+    s_sched_fire.armed_epoch    = 0;
+    s_sched_fire.armed_run_sleep = 0;
+    sched_fire_save();
+}
 // Outcome of the most recent set_schedule call, surfaced to HA via
 // text_sensor so you can see at a glance whether a push succeeded or
 // why it was rejected.
@@ -16534,7 +16675,7 @@ bool irrigoto_schedule_set_text(const char *text)
     // Atomic swap + persist
     s_schedule = next;
     s_schedule_version++;
-    memset(s_sched_last_fire_min, 0, sizeof(s_sched_last_fire_min));
+    sched_fire_disarm();   // b437: a changed schedule invalidates the armed run
     schedule_save_nvs();
     snprintf(s_sched_last_status, sizeof(s_sched_last_status),
         "ok (%u entries)", (unsigned)s_schedule.count);
@@ -16752,7 +16893,7 @@ bool irrigoto_schedule_sync_text(const char *text)
     s_schedule = next;
     s_schedule_id_next = id_next_after;
     s_schedule_version++;
-    memset(s_sched_last_fire_min, 0, sizeof(s_sched_last_fire_min));
+    sched_fire_disarm();   // b437: a changed schedule invalidates the armed run
     schedule_save_nvs();
     snprintf(s_sched_last_status, sizeof(s_sched_last_status),
         "sync ok (%u entries, %d applied)",
@@ -16813,7 +16954,7 @@ void irrigoto_schedule_clear(void)
 {
     bool had_entries = (s_schedule.count > 0);
     s_schedule.count = 0;
-    memset(s_sched_last_fire_min, 0, sizeof(s_sched_last_fire_min));
+    sched_fire_disarm();   // b437
     if (had_entries) s_schedule_version++;
     schedule_save_nvs();
     INFO("Schedule cleared (v=%u)", s_schedule_version);
@@ -16867,48 +17008,131 @@ bool irrigoto_schedule_next_run(time_t now, time_t *out_t, int *out_zone)
     return true;
 }
 
-// Background task: poll the schedule once every SCHED_POLL_MS and fire any
-// entry whose hour:minute matches the current local time, hasn't already
-// been fired in this minute, and isn't already running. Runs forever.
-#define SCHED_POLL_MS  5000u   // 5 s — tight enough to reliably catch minute boundary
-#define SCHED_IMMINENT_S 120u  // schedule firing within this many s -> block sleep
+// b437: like irrigoto_schedule_next_run but also returns the winning entry's
+// mode and depth, so the schedule-aware sleep can ARM the full run (not just
+// the zone) for clock-independent firing on wake.
+static bool schedule_next_run_full(time_t now, time_t *out_t,
+                                   uint8_t *out_zone, uint8_t *out_mode,
+                                   uint8_t *out_depth)
+{
+    if (s_schedule.count == 0 || now < 1700000000) return false;
+    time_t delay_until = irrigoto_schedule_get_delay_until();
+    time_t earliest = (delay_until > now) ? delay_until : now;
+    time_t best_t = 0;
+    const schedule_entry_t *best = NULL;
+    for (uint8_t i = 0; i < s_schedule.count; i++) {
+        const schedule_entry_t *e = &s_schedule.entries[i];
+        if (!e->enabled || e->days_mask == 0) continue;
+        for (int d = 0; d < 15; d++) {
+            time_t t = earliest + d * 86400;
+            struct tm lt; localtime_r(&t, &lt);
+            lt.tm_hour = e->hour; lt.tm_min = e->minute; lt.tm_sec = 0;
+            time_t fire_t = mktime(&lt);
+            if (fire_t <= earliest) continue;
+            struct tm flt; localtime_r(&fire_t, &flt);
+            if (!(e->days_mask & (1u << flt.tm_wday))) continue;
+            if (best_t == 0 || fire_t < best_t) { best_t = fire_t; best = e; }
+            break;
+        }
+    }
+    if (best_t == 0 || best == NULL) return false;
+    if (out_t)     *out_t     = best_t;
+    if (out_zone)  *out_zone  = best->zone;
+    if (out_mode)  *out_mode  = best->mode;
+    if (out_depth) *out_depth = best->depth;
+    return true;
+}
+
+// b437: intent-based fire on wake. If a run was armed for THIS timer wake
+// (the schedule-aware sleep landed us here on purpose), water it now without
+// needing a valid wall clock -- the alarm firing is the signal. Called once
+// at schedule_task start, i.e. once per wake (irrigoto_init respawns the
+// task on every deep-sleep wake). Dedup via the shared fired-epoch ring so
+// the clock-based catch-up below never re-fires the same slot.
+static void schedule_fire_check_on_wake(void)
+{
+    if (!s_sched_fire.armed_run_sleep || s_sched_fire.armed_epoch == 0) return;
+    // Only honor the intent on an actual timer wake. A reset (panic/brownout)
+    // didn't come from our alarm, so we can't assume it's time -- let the
+    // clock-based catch-up handle that case once the clock returns.
+    if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER) return;
+
+    uint32_t e = s_sched_fire.armed_epoch;
+    s_sched_fire.armed_run_sleep = 0;   // consume the intent (this wake only)
+    if (sched_fire_already(e)) { sched_fire_save(); return; }   // already ran
+
+    // Honor an active rain/wind delay even on the intent path.
+    time_t now = time(NULL);
+    time_t delay_until = irrigoto_schedule_get_delay_until();
+    if (delay_until > 0 && now > 1700000000 && delay_until > now) {
+        INFO("Scheduled wake for zone %u but rain delay active -- skipping",
+             s_sched_fire.armed_zone);
+        sched_fire_save();
+        return;
+    }
+    if (s_web_water_mode != 0) { sched_fire_save(); return; }  // already running
+
+    INFO("Scheduled wake: firing armed run zone %u mode %u depth %u/8\" "
+         "(epoch %lu) -- clock-independent",
+         s_sched_fire.armed_zone, s_sched_fire.armed_mode,
+         s_sched_fire.armed_depth, (unsigned long)e);
+    sched_fire_mark(e);   // dedup BEFORE starting (saves the ring)
+    start_watering_web_mode(s_sched_fire.armed_zone,
+                            schedule_web_mode(s_sched_fire.armed_mode),
+                            s_sched_fire.armed_depth);
+}
+
+// Background task: fire any entry whose scheduled time has arrived. b437:
+// replaced the exact-minute match with a CATCH-UP WINDOW -- an entry fires
+// if the clock is within SCHED_CATCHUP_S after its scheduled time and the
+// occurrence hasn't already run (shared fired-epoch dedup). This tolerates a
+// wake that lands a few minutes late (clock not yet synced at the exact
+// minute) instead of skipping the run entirely. Runs forever.
+#define SCHED_POLL_MS    5000u   // 5 s
+#define SCHED_IMMINENT_S 120u    // schedule firing within this many s -> block sleep
+#define SCHED_CATCHUP_S  1800u   // fire up to 30 min late, then give up
 
 static void schedule_task(void *arg)
 {
     (void)arg;
-    // Check immediately on task start (i.e. on every wake from deep
-    // sleep, since irrigoto_init() respawns this task) so a wake
-    // timed to fire a scheduled run doesn't waste 15 s waiting for
-    // the first poll. After the first iteration, normal SCHED_POLL_MS
-    // cadence resumes via the delay at the bottom of the loop.
+    // b437: clock-independent intent fire first -- a wake armed for a run
+    // waters even if HA hasn't re-synced the clock yet.
+    schedule_fire_check_on_wake();
+
     while (true) {
         time_t now = time(NULL);
-        if (now < 1700000000) goto sleep_poll;  // time not synced yet
-        // Rain / wind delay active — suppress all firing until expiry.
-        // Cheap check; the getter self-clears expired delays.
+        if (now < 1700000000) goto sleep_poll;  // clock-based path needs time
         time_t delay_until = irrigoto_schedule_get_delay_until();
         if (delay_until > now) goto sleep_poll;
-        struct tm lt; localtime_r(&now, &lt);
-        uint32_t now_min = (uint32_t)(now / 60);
         for (uint8_t i = 0; i < s_schedule.count; i++) {
             const schedule_entry_t *e = &s_schedule.entries[i];
-            if (!e->enabled) continue;
-            if (lt.tm_hour != e->hour || lt.tm_min != e->minute) continue;
-            if (!(e->days_mask & (1u << lt.tm_wday))) continue;
-            if (s_sched_last_fire_min[i] == now_min) continue;  // already fired
-            if (s_web_water_mode != 0) {
-                ESP_LOGW(TAG, "Schedule: entry %u due (zone %u) but watering already "
-                              "active — skipping this slot", i, e->zone);
-                s_sched_last_fire_min[i] = now_min;  // don't retry this minute
-                continue;
+            if (!e->enabled || e->days_mask == 0) continue;
+            // Check today's and yesterday's occurrence so a catch-up window
+            // that straddles midnight still finds a late-night slot.
+            for (int doff = 0; doff >= -1; doff--) {
+                time_t base = now + doff * 86400;
+                struct tm lt; localtime_r(&base, &lt);
+                lt.tm_hour = e->hour; lt.tm_min = e->minute; lt.tm_sec = 0;
+                time_t fire_t = mktime(&lt);
+                struct tm flt; localtime_r(&fire_t, &flt);
+                if (!(e->days_mask & (1u << flt.tm_wday))) continue;
+                if (now < fire_t) continue;                       // not yet due
+                if (now - fire_t >= (time_t)SCHED_CATCHUP_S) continue;  // too stale
+                if (sched_fire_already((uint32_t)fire_t)) continue;     // already ran
+                if (s_web_water_mode != 0) {
+                    ESP_LOGW(TAG, "Schedule: entry %u due (zone %u) but watering "
+                                  "active -- deferring", i, e->zone);
+                    break;  // re-evaluate next poll
+                }
+                int wm = schedule_web_mode(e->mode);
+                INFO("Schedule fires: entry %u -> zone %u mode %u depth %u/8\" "
+                     "(web_mode %d) at %02u:%02u (%lds late)",
+                     i, e->zone, e->mode, e->depth, wm, e->hour, e->minute,
+                     (long)(now - fire_t));
+                sched_fire_mark((uint32_t)fire_t);
+                start_watering_web_mode(e->zone, wm, e->depth);
+                break;
             }
-            int wm = schedule_web_mode(e->mode);
-            INFO("Schedule fires: entry %u -> zone %u mode %u depth %u/8\" "
-                 "(web_mode %d) at %02u:%02u",
-                 i, e->zone, e->mode, e->depth, wm,
-                 e->hour, e->minute);
-            s_sched_last_fire_min[i] = now_min;
-            start_watering_web_mode(e->zone, wm, e->depth);
         }
 sleep_poll:
         vTaskDelay(pdMS_TO_TICKS(SCHED_POLL_MS));
@@ -17092,10 +17316,11 @@ void irrigoto_sleep_now_with_reason(uint32_t duration_s, const char *reason)
     // time. Wake 60 s before the scheduled minute so there's room for
     // WiFi/HA reconnect, time sync, and the scheduler's poll cadence.
     time_t now = time(NULL);
+    bool armed_this_sleep = false;
     if (now > 1700000000) {
-        time_t next_t = 0;
-        int    next_zone = 0;
-        if (irrigoto_schedule_next_run(now, &next_t, &next_zone)) {
+        time_t  next_t = 0;
+        uint8_t next_zone = 0, next_mode = 0, next_depth = 0;
+        if (schedule_next_run_full(now, &next_t, &next_zone, &next_mode, &next_depth)) {
             const uint32_t WAKE_GRACE_S = 60u;
             time_t wake_target = next_t - (time_t)WAKE_GRACE_S;
             if (wake_target > now) {
@@ -17106,9 +17331,28 @@ void irrigoto_sleep_now_with_reason(uint32_t duration_s, const char *reason)
                          (unsigned long)duration_s, (unsigned)until_wake,
                          (unsigned)WAKE_GRACE_S, next_zone);
                     duration_s = until_wake;
+                    // b437: ARM this run. We're sleeping specifically to land
+                    // on it, so the next timer wake fires it directly -- no
+                    // wall clock required at wake. Skip if this exact
+                    // occurrence already ran (dedup ring).
+                    if (!sched_fire_already((uint32_t)next_t)) {
+                        s_sched_fire.armed_epoch     = (uint32_t)next_t;
+                        s_sched_fire.armed_zone      = next_zone;
+                        s_sched_fire.armed_mode      = next_mode;
+                        s_sched_fire.armed_depth     = next_depth;
+                        s_sched_fire.armed_run_sleep = 1;
+                        sched_fire_save();
+                        armed_this_sleep = true;
+                    }
                 }
             }
         }
+    }
+    // b437: any non-arming sleep must clear a stale "wake is for the run"
+    // flag, so a routine 20-min wake doesn't fire yesterday's armed run.
+    if (!armed_this_sleep && s_sched_fire.armed_run_sleep) {
+        s_sched_fire.armed_run_sleep = 0;
+        sched_fire_save();
     }
     INFO("Sleep requested (%lu s, reason=%s) — preparing safe state, handing to ESPHome",
          (unsigned long)duration_s, reason ? reason : "manual");

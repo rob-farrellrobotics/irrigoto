@@ -19,6 +19,13 @@ R"SCHEDHTML(
       try{localStorage.setItem('irrigoto_theme',t2);}catch(e){}}
   }).catch(function(){});
 })();
+// b437: set the device clock from this phone (zero-config; works offline / AP
+// mode, no NTP). Critical for standalone scheduling -- opening this page is
+// what gives the device a clock to arm the schedule from.
+(function(){try{fetch('/api/time',{method:'POST',
+  headers:{'Content-Type':'application/x-www-form-urlencoded'},
+  body:'epoch='+Math.floor(Date.now()/1000)+'&tz='+(-new Date().getTimezoneOffset())
+}).catch(function(){});}catch(e){}})();
 </script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}

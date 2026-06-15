@@ -1,4 +1,4 @@
-/* landing_html.h -- OtO landing page */
+/* Auto-generated from landing.html -- edit the .html, then run regen.py */
 R"LANDHTML(
 <!DOCTYPE html>
 <html lang="en">
@@ -21,6 +21,12 @@ R"LANDHTML(
     if(cb)cb.checked=(t2==='light');
   }).catch(function(){});
 })();
+// b437: set the device clock from this phone (zero-config; works offline / AP
+// mode, no NTP). Lets a standalone unit get time just by opening the web UI.
+(function(){try{fetch('/api/time',{method:'POST',
+  headers:{'Content-Type':'application/x-www-form-urlencoded'},
+  body:'epoch='+Math.floor(Date.now()/1000)+'&tz='+(-new Date().getTimezoneOffset())
+}).catch(function(){});}catch(e){}})();
 </script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}
