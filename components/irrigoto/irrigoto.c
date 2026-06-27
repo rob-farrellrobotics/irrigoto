@@ -20,6 +20,7 @@
 #include "esp_log.h"
 #include "esp_random.h"   // chase mode state-machine PRNG
 #include "esp_sleep.h"
+#include "esp_timer.h"    // b467: esp_timer_get_time() for /api/all uptime_s
 #include "esp_system.h"   // esp_reset_reason() for boot_diag
 #include "driver/uart.h"
 #include "driver/i2c.h"
@@ -185,6 +186,14 @@ static volatile bool s_water_abort   = false; // set by terminal q or web cancel
 // Used by irrigoto_get_pressure_psi() to serve HA / web without competing
 // for the I2C bus mutex during active watering / cal motion control.
 static volatile float s_cached_psi   = 0.0f;
+// b468: flow-recency. Every mprls read at/above the flow floor stamps this tick.
+// The mid-run no-flow check judges "lost flow" by time-since-flow (SUSTAINED),
+// not a lone instantaneous sample -- so a transient dip / air bubble on a
+// variable (shared-well) supply skips-and-retries the ring instead of aborting
+// the whole run. Only flow absent for >= WATER_LOSS_GRACE_MS lets a dry ring
+// count toward the water_loss streak.
+#define WATER_LOSS_GRACE_MS 8000
+static volatile TickType_t s_last_flow_tick = 0;
 static int           s_web_water_mode  = 0;    // 0=idle, 1-4=metered, 5-6=gentle, 7=smooth, 50=chase, 99=demo
 static volatile int  s_water_cleanup_pass = 0; // 0=not in cleanup, N=cleanup pass N
 // b311: chase mode -- entertainment watering for dogs/kids. Lissajous-wander
@@ -432,6 +441,10 @@ static int8_t g_nozzle_motor_dir = +1;
 #define VALVE_CAL_START_DEG (263.0f + g_valve_offset_deg) // pressure begins rising here
 #define VALVE_CAL_STEP_DEG    1.0f   // finer step in active pressure range
 #define WATER_MIN_FLOW_PSI    0.30f  // below this PSI after valve open = no detectable flow, skip ring
+#define WATER_NO_SUPPLY_PSI   2.0f   // b466: 12s supply-check PEAK below this = NO water connected
+                                     // (vs a low/cycling supply, which is tolerated). Dry/disconnected
+                                     // reads ~0.1; any real system -- even a well at pump cut-off --
+                                     // holds tens of PSI, so 2.0 can't false-trip a weak-but-present feed.
 #define CAL_DISC_STEPS       13     // discovery scan steps from closed position
 #define NOZZLE_BACKLASH_DEG  15.0f
 
@@ -897,6 +910,7 @@ static bool mprls_read(float *psi_out)
                ((float)(raw - MPRLS_COUNT_MIN) /
                 (float)(MPRLS_COUNT_MAX - MPRLS_COUNT_MIN));
     s_cached_psi = *psi_out;  // share with HA / web (no extra I2C needed)
+    if (*psi_out >= WATER_MIN_FLOW_PSI) s_last_flow_tick = xTaskGetTickCount();  // b468 flow-recency
     return true;
 }
 
@@ -927,6 +941,7 @@ static bool mprls_read_quiet(float *psi_out)
                ((float)(raw - MPRLS_COUNT_MIN) /
                 (float)(MPRLS_COUNT_MAX - MPRLS_COUNT_MIN));
     s_cached_psi = *psi_out;
+    if (*psi_out >= WATER_MIN_FLOW_PSI) s_last_flow_tick = xTaskGetTickCount();  // b468 flow-recency
     return true;
 }
 
@@ -2988,6 +3003,7 @@ static uint16_t    s_last_water_zone_id = 0;
 #define WATER_STATUS_VALVE_FAULT  2
 #define WATER_STATUS_NOZZLE_FAULT 3
 #define WATER_STATUS_WATER_LOSS   4
+#define WATER_STATUS_NO_SUPPLY    5   // b466: ~0 PSI at supply check = nothing connected
 static int  s_water_status_code      = WATER_STATUS_COMPLETED;
 static int  s_last_water_status_code = WATER_STATUS_COMPLETED;
 // Unix epoch when the last watering ended (set in the same block that
@@ -3040,11 +3056,39 @@ static void last_water_load_nvs(void)
     nvs_close(h);
 }
 static bool s_water_run_had_flow     = false;
+// b450: schedule crash-resilience (delivery_start policy). A scheduled
+// occurrence is stamped "done" in the dedup ring only once water is actually
+// FLOWING -- not when we decide to fire. A WDT/panic before flow leaves the
+// epoch unmarked so the 30-min catch-up re-fires it (never miss a watering);
+// a crash mid-flow keeps the mark so it isn't re-run (no doubles / multiple
+// partials). s_active_sched_epoch = scheduled UTC epoch of the in-progress run
+// (set in start_watering_web_mode); 0 = manual/web run, never auto-marked.
+static uint32_t s_active_sched_epoch = 0;
+static uint16_t s_active_sched_zone  = 0;       // b452: zone (1-based) of that run
+static void sched_fire_mark(uint32_t epoch);    // fwd; defined far below
+static void sched_fire_save(void);              // fwd; defined far below
+static void sched_fire_set_inprogress(uint32_t epoch, uint16_t zone);  // b452 fwd
+static void sched_fire_clear_inprogress(void);  // b452 fwd
+static inline void sched_note_flow_started(void) {
+    if (s_active_sched_epoch) {
+        sched_fire_set_inprogress(s_active_sched_epoch, s_active_sched_zone);  // b452
+        sched_fire_mark(s_active_sched_epoch);
+        sched_fire_save();   // persists fired-mark + in-progress marker together
+        s_active_sched_epoch = 0;
+    }
+}
 // Consecutive-no-flow streak. A single low PSI reading can be transient
 // (water hammer, brief supply dip, sprinkler in friction-pause); require
 // two rings in a row with no flow before declaring water_loss.
 static int  s_water_no_flow_streak   = 0;
-#define WATER_LOSS_STREAK_THRESHOLD 2
+// b468: consecutive SUSTAINED-dry rings that trip a mid-run water_loss abort.
+// Default 4 (was a hardcoded 2); user-tunable over HTTP /api/water_loss_tol,
+// persisted in NVS "wl_streak". Restored from b438/b443 (the b447 bisect revert
+// dropped it). A dry ring only counts toward this once flow has been absent for
+// >= WATER_LOSS_GRACE_MS (see the no-flow check) -- so transient well-contention
+// dips skip-and-retry instead of aborting the run.
+#define WATER_LOSS_STREAK_DEFAULT 4
+static int  s_water_loss_streak_threshold = WATER_LOSS_STREAK_DEFAULT;
 
 // Walk all polygon edges; find the one that straddles ring_throw and whose
 // nozzle_deg crossing is closest to search_b (within search_range_deg).
@@ -5595,6 +5639,13 @@ static void sleep_forever_quiet(const char *reason)
 // b347: diag is optional — if non-NULL, the valve angle observed, the
 // close-attempt outcome, and the post-drive battery sag are recorded
 // into the boot_diag entry so /api/boot_diag can surface them later.
+// b470 DIAGNOSTIC: set 1 to SKIP the boot valve-close DRIVE. The 2026-06-25
+// ba1f88 field failure brownout-LOOPED here -- POWERON_RESET fired the instant
+// this drive engaged (valve sat at ~305 deg). Skipping the drive lets the unit
+// boot through to WiFi so we can probe valve angle + battery-sag-under-load and
+// tell a mechanical jam from a power-path/driver fault. The valve is left
+// wherever it is (safe: water is disconnected for bench eval). REVERT to 0.
+#define DIAG_SKIP_BOOT_VALVE_CLOSE 0
 static void check_valve_closed_on_boot(boot_diag_t *diag)
 {
     motor_rail_on();    // also releases the brake (GPIO_K low)
@@ -5638,6 +5689,16 @@ static void check_valve_closed_on_boot(boot_diag_t *diag)
 
     ESP_LOGW(TAG, "Wake valve check: %.1f deg (err %.1f from closed) -- driving closed",
              cur_valve, err);
+#if DIAG_SKIP_BOOT_VALVE_CLOSE
+    ESP_LOGW(TAG, "b470 DIAG: SKIPPING the valve-close drive (brownout-loop eval). "
+                  "Valve left at %.1f deg; rail stays unloaded so the unit can boot "
+                  "-- use /valve/goto + battery sag to probe for jam vs power fault.",
+             cur_valve);
+    if (diag) { diag->flags |= BOOT_DIAG_FLAG_CLOSE_ATTEMPTED;
+                diag->valve_deg_after_close = cur_valve; }
+    motor_rail_off();
+    return;
+#endif
     bool drove_ok = valve_goto(VALVE_CLOSED_DEG, 2.0f, 10000, false);
 
     // Re-read the sensor to confirm we actually got there. valve_goto's
@@ -8233,6 +8294,7 @@ static bool serpentine_glide_legs(const serpentine_leg_t *legs, int n,
                         break;
                     }
                     s_water_run_had_flow = true;
+                    sched_note_flow_started();  // b450: stamp scheduled run on first flow
                 }
             }
 
@@ -9930,6 +9992,20 @@ static void phase_water_zone(void)
                 INFO("Supply cycling detected (range %.2f PSI / %.0f%% of mean) "
                      "-- smooth-mode per-ring corr will track per-cycle.",
                      range, range / fmaxf(live_psi, 0.1f) * 100.0f);
+            // b466: NO supply (nothing connected, ~0 PSI) is distinct from a
+            // weak/cycling supply (low but present -- handled by pressure_scale
+            // + the per-ring corr). If the 12s PEAK never rose above the
+            // no-supply floor, there's no water at all: abort now with a clear
+            // status instead of grinding every ring across ~20-30 dry adaptive
+            // passes (the ~100-min dry run). water_set_status() also flags
+            // s_water_abort so the run unwinds; the valve is already closed
+            // above. A scheduled run that hits this never flows -> reported
+            // MISSED via the b451 path, so HA can reschedule/abandon.
+            if (_pmax < WATER_NO_SUPPLY_PSI) {
+                INFO("NO water supply: 12s peak %.2f PSI < %.2f -- aborting "
+                     "(nothing connected)", _pmax, WATER_NO_SUPPLY_PSI);
+                water_set_status(WATER_STATUS_NO_SUPPLY);
+            }
         } else {
             INFO("Supply pressure read failed -- using calibrated estimate");
         }
@@ -10890,22 +10966,37 @@ static void phase_water_zone(void)
                 float _nf = 0.0f;
                 if (smooth_mode || gentle_mode)
                     vTaskDelay(pdMS_TO_TICKS(200));
-                mprls_read_quiet(&_nf);
+                mprls_read_quiet(&_nf);  // also stamps s_last_flow_tick if >= floor
                 if (_nf < WATER_MIN_FLOW_PSI) {
-                    INFO("Ring %d: no flow (%.3f PSI < %.2f) -- skipping ring",
-                         ring+1, _nf, WATER_MIN_FLOW_PSI);
+                    // b468: a lone low reading is NOT water-loss on a variable
+                    // (shared-well) supply -- it can be a contention dip or an
+                    // air bubble. Judge by flow-RECENCY across the whole stream:
+                    // if flow was seen within WATER_LOSS_GRACE_MS this is a
+                    // transient -> skip the ring (the adaptive passes retry it)
+                    // but do NOT count it toward an abort. Only a dry ring with
+                    // flow absent for >= grace (genuinely sustained loss) counts.
+                    uint32_t ms_since_flow = (s_last_flow_tick == 0)
+                        ? 0xFFFFFFFFu
+                        : (uint32_t)((xTaskGetTickCount() - s_last_flow_tick) *
+                                     portTICK_PERIOD_MS);
+                    bool sustained = (ms_since_flow >= WATER_LOSS_GRACE_MS);
+                    INFO("Ring %d: low PSI (%.3f < %.2f), %lums since flow -- "
+                         "skipping ring%s", ring+1, _nf, WATER_MIN_FLOW_PSI,
+                         (unsigned long)ms_since_flow,
+                         sustained ? " [SUSTAINED]" : " [transient -- not counted]");
                     valve_goto_ex(VALVE_CLOSED_DEG, 2.0f, 8000, false, -1);
                     s_valve_last_dir = -1;
                     ring_no_flow = true;
-                    // Water-loss detection: needs sustained no-flow after we'd
-                    // already seen good flow earlier. A single dry ring can be
-                    // a transient supply blip; require WATER_LOSS_STREAK_THRESHOLD
-                    // consecutive dry rings to flag the run as water_loss.
-                    if (s_water_run_had_flow) {
+                    // Water-loss only after we'd seen flow earlier AND the loss
+                    // is sustained; require s_water_loss_streak_threshold such
+                    // qualifying dry rings in a row.
+                    if (s_water_run_had_flow && sustained) {
                         s_water_no_flow_streak++;
-                        if (s_water_no_flow_streak >= WATER_LOSS_STREAK_THRESHOLD) {
-                            INFO("  -> Lost flow mid-run (%d consecutive dry rings)",
-                                 s_water_no_flow_streak);
+                        if (s_water_no_flow_streak >= s_water_loss_streak_threshold) {
+                            INFO("  -> Lost flow mid-run (%d sustained dry rings, "
+                                 "no flow for %lums, tol=%d)",
+                                 s_water_no_flow_streak, (unsigned long)ms_since_flow,
+                                 s_water_loss_streak_threshold);
                             water_set_status(WATER_STATUS_WATER_LOSS);
                         }
                     }
@@ -10915,6 +11006,7 @@ static void phase_water_zone(void)
                 // true on first detection) and the dry-streak counter.
                 s_water_run_had_flow   = true;
                 s_water_no_flow_streak = 0;
+                sched_note_flow_started();  // b450: stamp scheduled run on first flow
             }
 
             // Sweep: gentle/smooth use encoder-position-based continuous sweep;
@@ -12871,6 +12963,11 @@ static esp_err_t api_device_name_handler(httpd_req_t *req)
 static void water_task(void *arg) {
     vTaskDelay(pdMS_TO_TICKS(200));  // brief yield so HTTP response can send
     phase_water_zone_mode(s_web_water_mode);
+    // b450 backstop: if the run completed without any flow point firing (a mode
+    // that never set s_water_run_had_flow), still stamp the scheduled epoch so it
+    // can't retry-loop. No-op for gentle/smooth/serpentine (already marked at flow).
+    sched_note_flow_started();
+    sched_fire_clear_inprogress();   // b452: run reached completion -> not a mid-run crash
     s_web_water_mode     = 0;
     s_water_est_min      = 0;
     s_water_cleanup_pass = 0;
@@ -12944,6 +13041,7 @@ static esp_err_t zone_water_handler(httpd_req_t *req)
         s_web_serpentine_dps = (mode == 8) ? strtof(spd_q, NULL) : 0.0f;
         s_web_serpentine_dry = (mode == 8 && dry_q[0] == '1');
     }
+    s_active_sched_epoch = 0;   // b450: /zone/water is a manual run (never auto-marked)
     s_web_water_mode = mode;
     // b294: moved from APP_CPU (core 1) to PRO_CPU (core 0). The original
     // pin-to-core-1 reasoning was "isolate motion control from WiFi/lwIP
@@ -13215,6 +13313,10 @@ static esp_err_t api_all_handler(httpd_req_t *req)
     const char *hostname = "";
     esp_netif_t *_nif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     if (_nif) esp_netif_get_hostname(_nif, &hostname);
+    // b467: diagnostics that were native HA entities until the re-trim, now
+    // surfaced here so HA can poll them as REST sensors (zero ListEntities cost).
+    char sleep_buf[32] = {0};
+    irrigoto_get_last_sleep_reason(sleep_buf, sizeof(sleep_buf));
     n = snprintf(buf, sizeof(buf),
         "{\"fw_build\":%u,\"wifi_rssi\":%d,\"wifi_ip\":\"%s\","
         "\"hostname\":\"%s\","
@@ -13223,6 +13325,8 @@ static esp_err_t api_all_handler(httpd_req_t *req)
         "\"watering\":%s,\"water_mode\":%d,\"water_est_min\":%d,"
         "\"water_zone_id\":%u,\"cleanup_pass\":%d,"
         "\"detail_log\":%s,"
+        "\"valve_open\":%d,\"uptime_s\":%lu,\"last_sleep_reason\":\"%s\","
+        "\"sleep_dur_s\":%lu,\"inact_s\":%lu,"   // b472: expose cadence params
         "\"device_name\":\"%s\",\"zones\":[",
         FW_BUILD, wifi_get_rssi(), s_wifi_ip,
         hostname ? hostname : "",
@@ -13231,6 +13335,10 @@ static esp_err_t api_all_handler(httpd_req_t *req)
         s_web_water_mode?"true":"false",s_web_water_mode,s_water_est_min,
         (unsigned)s_water_zone_id, s_water_cleanup_pass,
         s_water_detail_log?"true":"false",
+        irrigoto_valve_is_open(),
+        (unsigned long)(esp_timer_get_time()/1000000ULL),
+        sleep_buf,
+        (unsigned long)s_sleep_dur_s, (unsigned long)(s_inactivity_ms/1000u),
         s_device_name);
     httpd_resp_send_chunk(req, buf, n);
 
@@ -13289,6 +13397,45 @@ static esp_err_t api_all_handler(httpd_req_t *req)
     }
     httpd_resp_send_chunk(req, "]}", 2);
     httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
+// b468: water-loss tolerance (consecutive sustained-dry rings) restored from
+// b438/b443 -- the b447 bisect revert dropped it. HTTP-only (no ListEntities
+// row, so zero reconnect-burst cost). NVS-persisted under "wl_streak".
+static void pm_nvs_save_u32(const char *key, uint32_t v);  // fwd: defined later
+static uint32_t irrigoto_get_water_loss_tolerance(void)
+{
+    return (uint32_t)s_water_loss_streak_threshold;
+}
+static void irrigoto_set_water_loss_tolerance(uint32_t rings)
+{
+    if (rings < 1u)  rings = 1u;
+    if (rings > 10u) rings = 10u;
+    s_water_loss_streak_threshold = (int)rings;
+    pm_nvs_save_u32("wl_streak", rings);
+    TOUCH_ACTIVITY();  // user-initiated change counts as activity
+    INFO("Water-loss tolerance set to %u consecutive dry rings (persisted)",
+         (unsigned)rings);
+}
+// GET  /api/water_loss_tol         -> {"rings":N}
+// POST /api/water_loss_tol  rings=N -> sets (clamped 1..10), returns {"rings":N}
+static esp_err_t api_water_loss_tol_handler(httpd_req_t *req)
+{
+    HTTP_CONN_CLOSE(req);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    if (req->method == HTTP_POST) {
+        char body[32] = {0};
+        int len = httpd_req_recv(req, body, sizeof(body) - 1);
+        char v[8] = {0};
+        if (len > 0 && httpd_query_key_value(body, "rings", v, sizeof(v)) == ESP_OK)
+            irrigoto_set_water_loss_tolerance((uint32_t)atoi(v));
+    }
+    char buf[48];
+    int n = snprintf(buf, sizeof(buf), "{\"rings\":%u}",
+                     (unsigned)irrigoto_get_water_loss_tolerance());
+    httpd_resp_send(req, buf, n);
     return ESP_OK;
 }
 
@@ -13493,6 +13640,26 @@ static esp_err_t api_time_handler(httpd_req_t *req)
     char buf[48];
     int n = snprintf(buf, sizeof(buf), "{\"ok\":true,\"applied\":%s}",
                      applied ? "true" : "false");
+    httpd_resp_send(req, buf, n);
+    return ESP_OK;
+}
+
+// b447: HTTP auto-sleep toggle. The b437 baseline only exposes auto-sleep via
+// the HA switch; this lets the OTA flow re-enable it without HA. Wake-safe
+// (HTTP handler -- doesn't touch the boot/wake path the regression lives in).
+// GET /api/auto_sleep -> {"auto_sleep":bool}; POST on=0|1 sets it.
+static esp_err_t api_auto_sleep_handler(httpd_req_t *req)
+{
+    HTTP_CONN_CLOSE(req);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    if (req->method == HTTP_POST) {
+        char b[24] = {0}; int n = httpd_req_recv(req, b, sizeof(b) - 1); char v[6] = {0};
+        if (n > 0 && httpd_query_key_value(b, "on", v, sizeof(v)) == ESP_OK)
+            irrigoto_set_auto_sleep_enabled(atoi(v) != 0);
+    }
+    char buf[40]; int n = snprintf(buf, sizeof(buf), "{\"auto_sleep\":%s}",
+                                   irrigoto_get_auto_sleep_enabled() ? "true" : "false");
     httpd_resp_send(req, buf, n);
     return ESP_OK;
 }
@@ -13803,6 +13970,86 @@ static esp_err_t valve_goto_handler(httpd_req_t *req)
         vraw*(360.0f/4096.0f) - target, vagc, vst);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, buf, n);
+    return ESP_OK;
+}
+
+// ── b463: HTTP GET endpoints for the 4 manual motor controls that were removed
+// as HA services in b461 (the arg-heavy ListEntitiesServices rows that overflowed
+// the reconnect heap). These mirror the old service lambdas exactly -- they call
+// the same irrigoto_* API fns, which manage their own motor/sensor rails and
+// refuse while watering. /valve/goto already exists (b372). irrigoto_api.h
+// (included line 39) declares these; redeclared here for locality. ────────────
+bool irrigoto_nozzle_goto(float target_deg);
+bool irrigoto_aim_valve(float bearing_deg, float valve_deg);
+bool irrigoto_aim_throw(float bearing_deg, float throw_mm);
+bool irrigoto_water_arc(float throw_mm, float arc_start_deg, float arc_end_deg,
+                        float speed_dps, const char *direction);
+
+static esp_err_t nozzle_goto_handler(httpd_req_t *req)
+{
+    char qs[48]={0}; httpd_req_get_url_query_str(req, qs, sizeof(qs));
+    char s[16]={0};
+    if (httpd_query_key_value(qs, "deg", s, sizeof(s)) != ESP_OK) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"missing deg (0-360)\"}");
+        return ESP_OK;
+    }
+    bool ok = irrigoto_nozzle_goto(strtof(s, NULL));
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, ok ? "{\"ok\":true}" : "{\"ok\":false}");
+    return ESP_OK;
+}
+
+static esp_err_t aim_valve_handler(httpd_req_t *req)
+{
+    char qs[64]={0}; httpd_req_get_url_query_str(req, qs, sizeof(qs));
+    char b[16]={0}, v[16]={0};
+    if (httpd_query_key_value(qs, "bearing", b, sizeof(b)) != ESP_OK ||
+        httpd_query_key_value(qs, "valve", v, sizeof(v)) != ESP_OK) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"need bearing + valve (deg)\"}");
+        return ESP_OK;
+    }
+    bool ok = irrigoto_aim_valve(strtof(b, NULL), strtof(v, NULL));
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, ok ? "{\"ok\":true}" : "{\"ok\":false}");
+    return ESP_OK;
+}
+
+static esp_err_t aim_throw_handler(httpd_req_t *req)
+{
+    char qs[64]={0}; httpd_req_get_url_query_str(req, qs, sizeof(qs));
+    char b[16]={0}, t[16]={0};
+    if (httpd_query_key_value(qs, "bearing", b, sizeof(b)) != ESP_OK ||
+        httpd_query_key_value(qs, "throw", t, sizeof(t)) != ESP_OK) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"need bearing + throw (mm)\"}");
+        return ESP_OK;
+    }
+    bool ok = irrigoto_aim_throw(strtof(b, NULL), strtof(t, NULL));
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, ok ? "{\"ok\":true}" : "{\"ok\":false}");
+    return ESP_OK;
+}
+
+static esp_err_t water_arc_handler(httpd_req_t *req)
+{
+    char qs[128]={0}; httpd_req_get_url_query_str(req, qs, sizeof(qs));
+    char t[16]={0}, s[16]={0}, e[16]={0}, sp[16]={0}, dir[12]={0};
+    if (httpd_query_key_value(qs, "throw", t, sizeof(t)) != ESP_OK ||
+        httpd_query_key_value(qs, "start", s, sizeof(s)) != ESP_OK ||
+        httpd_query_key_value(qs, "end",   e, sizeof(e)) != ESP_OK ||
+        httpd_query_key_value(qs, "speed", sp, sizeof(sp)) != ESP_OK) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"need throw+start+end+speed (opt dir=cw|ccw|shortest); valve LEFT OPEN at end\"}");
+        return ESP_OK;
+    }
+    if (httpd_query_key_value(qs, "dir", dir, sizeof(dir)) != ESP_OK)
+        strcpy(dir, "shortest");
+    bool ok = irrigoto_water_arc(strtof(t, NULL), strtof(s, NULL), strtof(e, NULL),
+                                 strtof(sp, NULL), dir);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, ok ? "{\"ok\":true}" : "{\"ok\":false}");
     return ESP_OK;
 }
 
@@ -14571,6 +14818,7 @@ static esp_err_t schedule_page_handler(httpd_req_t *req)
 // keep both representations in one shape so external callers (HA, scripts)
 // can use whichever they have on hand without a separate API surface.
 static uint32_t sched_fire_armed_info(uint16_t *zone, uint8_t *mode, uint8_t *run_sleep);  // b437
+static uint32_t sched_fire_last_missed(uint16_t *zone);  // b451
 
 static esp_err_t api_schedule_handler(httpd_req_t *req)
 {
@@ -14711,6 +14959,19 @@ static esp_err_t api_schedule_handler(httpd_req_t *req)
         n += snprintf(buf+n, sizeof(buf)-n,
             "\"armed\":{\"epoch\":%lu,\"zone\":%u,\"mode\":%u,\"run_sleep\":%u},",
             (unsigned long)a_epoch, a_zone, a_mode, a_run);
+    }
+    // b451: last scheduled occurrence whose 5-min catch-up window closed without
+    // ever watering (crash / never got a slot). A HA automation reads this to
+    // reschedule or abandon. null = nothing missed since the blob reset.
+    {
+        uint16_t lm_zone = 0;
+        uint32_t lm_epoch = sched_fire_last_missed(&lm_zone);
+        if (lm_epoch)
+            n += snprintf(buf+n, sizeof(buf)-n,
+                "\"last_missed\":{\"epoch\":%lu,\"zone\":%u},",
+                (unsigned long)lm_epoch, (unsigned)lm_zone);
+        else
+            n += snprintf(buf+n, sizeof(buf)-n, "\"last_missed\":null,");
     }
     // Last completed watering — surfaces on the landing schedule card
     // and on the editor status header. Epoch 0 means nothing has run
@@ -15076,7 +15337,7 @@ static void zone_web_start(void)
     httpd_config_t cfg   = HTTPD_DEFAULT_CONFIG();
     cfg.server_port      = ZONE_WEB_PORT;
     cfg.ctrl_port        = ZONE_WEB_CTRL_PORT;
-    cfg.max_uri_handlers  = 64;  // MUST be set before httpd_start (cfg is copied there);
+    cfg.max_uri_handlers  = 66;  // MUST be set before httpd_start (cfg is copied there);
                                  // headroom over uris[] count -- _Static_assert below guards it.
                                  // (b378: was 40 and silently dropped every handler past #40,
                                  //  including /valve/probe and all /fs/* -- the post-start
@@ -15104,6 +15365,8 @@ static void zone_web_start(void)
         {.uri="/zone/water_trace", .method=HTTP_GET,  .handler=zone_water_trace_handler}, // b283
         {.uri="/zone/last_log",    .method=HTTP_GET,  .handler=zone_last_log_handler},   // b292
         {.uri="/api/all",         .method=HTTP_GET,  .handler=api_all_handler},
+        {.uri="/api/auto_sleep",  .method=HTTP_GET,  .handler=api_auto_sleep_handler},  // b447
+        {.uri="/api/auto_sleep",  .method=HTTP_POST, .handler=api_auto_sleep_handler},  // b447
         {.uri="/api/detail_log",  .method=HTTP_GET,  .handler=api_detail_log_handler},
         {.uri="/api/cal",         .method=HTTP_GET,  .handler=api_cal_handler},
         {.uri="/api/cal/clear",   .method=HTTP_POST, .handler=api_cal_clear_handler},
@@ -15116,6 +15379,8 @@ static void zone_web_start(void)
         {.uri="/schedule",        .method=HTTP_GET,  .handler=schedule_page_handler},
         {.uri="/api/schedule",    .method=HTTP_GET,  .handler=api_schedule_handler},
         {.uri="/api/schedule",    .method=HTTP_POST, .handler=api_schedule_handler},
+        {.uri="/api/water_loss_tol", .method=HTTP_GET,  .handler=api_water_loss_tol_handler}, // b468 (restored)
+        {.uri="/api/water_loss_tol", .method=HTTP_POST, .handler=api_water_loss_tol_handler}, // b468
         {.uri="/api/schedule/clear", .method=HTTP_POST, .handler=api_schedule_clear_handler},
         {.uri="/api/schedule/delay", .method=HTTP_POST, .handler=api_schedule_delay_handler},
         {.uri="/api/zone",        .method=HTTP_GET,  .handler=api_zone_handler},
@@ -15137,6 +15402,10 @@ static void zone_web_start(void)
         {.uri="/valve/open",            .method=HTTP_POST, .handler=valve_open_handler},   // b370
         {.uri="/valve/close",           .method=HTTP_POST, .handler=valve_close_handler},  // b370
         {.uri="/valve/goto",            .method=HTTP_GET,  .handler=valve_goto_handler},   // b372
+        {.uri="/nozzle/goto",           .method=HTTP_GET,  .handler=nozzle_goto_handler},  // b463
+        {.uri="/aim/valve",             .method=HTTP_GET,  .handler=aim_valve_handler},    // b463
+        {.uri="/aim/throw",             .method=HTTP_GET,  .handler=aim_throw_handler},    // b463
+        {.uri="/water/arc",             .method=HTTP_GET,  .handler=water_arc_handler},    // b463
         {.uri="/valve/probe",           .method=HTTP_GET,  .handler=valve_probe_handler}, // b377
         {.uri="/wifi/ap_mode",          .method=HTTP_POST, .handler=wifi_ap_mode_handler},   // b396
         {.uri="/wifi/reconnect",        .method=HTTP_POST, .handler=wifi_reconnect_handler}, // b396
@@ -15599,6 +15868,7 @@ void irrigoto_last_water_status_str(char *buf, size_t len)
         case WATER_STATUS_VALVE_FAULT:  s = "valve_fault";  break;
         case WATER_STATUS_NOZZLE_FAULT: s = "nozzle_fault"; break;
         case WATER_STATUS_WATER_LOSS:   s = "water_loss";   break;
+        case WATER_STATUS_NO_SUPPLY:    s = "no_supply";    break;
         default:                        s = "unknown";      break;
     }
     snprintf(buf, len, "%s", s);
@@ -15987,7 +16257,7 @@ int irrigoto_zone_at(int idx, char *name_buf, size_t name_len)
 // and the scheduler (which encodes mode+depth into a web_mode).
 //   web_mode = style digit: 1=Pulse, 5=Gentle, 7=Smooth, 99=demo.
 //   depth8   = depth target in eighths of an inch (1..8); 0 = legacy default.
-static void start_watering_web_mode(int zone, int web_mode, int depth8)
+static void start_watering_web_mode(int zone, int web_mode, int depth8, uint32_t sched_epoch)
 {
     if (s_web_water_mode != 0) {
         ESP_LOGW(TAG, "start_watering: already running");
@@ -15998,6 +16268,11 @@ static void start_watering_web_mode(int zone, int web_mode, int depth8)
         return;
     }
     if (zone < 1) zone = 1;
+    // b450: remember the scheduled epoch (0 = manual). Stamped "done" only once
+    // water flows (sched_note_flow_started), set here only after the guards so a
+    // refused start never leaves a stale epoch to mis-mark a later run.
+    s_active_sched_epoch = sched_epoch;
+    s_active_sched_zone  = (uint16_t)zone;   // b452: 1-based zone for the in-progress marker
     s_water_abort        = false;
     s_water_status_code  = WATER_STATUS_COMPLETED;
     s_water_run_had_flow = false;
@@ -16028,7 +16303,7 @@ void irrigoto_start_watering(int zone, int mode, int duration_s)
 {
     (void)duration_s;  // TODO: duration override — not wired yet
     // Legacy HA-facing entrypoint: default to 1/8" (1 eighth).
-    start_watering_web_mode(zone, schedule_web_mode((uint8_t)mode), 1);
+    start_watering_web_mode(zone, schedule_web_mode((uint8_t)mode), 1, 0);  // manual
 }
 
 void irrigoto_stop_watering(void)
@@ -16095,6 +16370,18 @@ typedef struct {
     uint32_t fired[SCHED_FIRED_RING];  // recently-fired scheduled epochs
     uint8_t  fired_idx;
     uint8_t  _pad2[3];
+    // b451: last scheduled occurrence whose catch-up window closed without ever
+    // watering (crash / never got a slot) -- reported via /api/schedule so a HA
+    // automation can reschedule or abandon it. 0 = none since the blob reset.
+    uint32_t last_missed_epoch;   // scheduled UTC epoch of the miss
+    uint16_t last_missed_zone;    // 1-based
+    uint8_t  _pad3[2];
+    // b452: set when water starts flowing on a scheduled run, cleared at
+    // completion. If still set on the next boot, the run crashed mid-watering
+    // (under-watered) -> promoted to last_missed so HA sees the incomplete run.
+    uint32_t inprogress_epoch;
+    uint16_t inprogress_zone;
+    uint8_t  _pad4[2];
 } sched_fire_t;
 static sched_fire_t s_sched_fire;   // RAM mirror of the NVS blob
 
@@ -16112,6 +16399,19 @@ static void sched_fire_load(void)
         nvs_close(h);
     }
     s_sched_fire.magic = SCHED_FIRE_MAGIC;
+    // b452: a still-set in-progress marker means the last scheduled run crashed
+    // mid-watering (water_task never reached its completion clear). Promote it to
+    // last_missed (incomplete) so HA sees the under-watered run, then clear it.
+    if (s_sched_fire.inprogress_epoch) {
+        s_sched_fire.last_missed_epoch = s_sched_fire.inprogress_epoch;
+        s_sched_fire.last_missed_zone  = s_sched_fire.inprogress_zone;
+        s_sched_fire.inprogress_epoch  = 0;
+        sched_fire_save();
+        ESP_LOGW(TAG, "Schedule: zone %u run INCOMPLETE -- crashed mid-watering "
+                 "(epoch %lu), reported to HA",
+                 (unsigned)s_sched_fire.last_missed_zone,
+                 (unsigned long)s_sched_fire.last_missed_epoch);
+    }
 }
 
 static void sched_fire_save(void)
@@ -16120,6 +16420,21 @@ static void sched_fire_save(void)
     if (nvs_open(CAL_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return;
     nvs_set_blob(h, "sched_fire", &s_sched_fire, sizeof(s_sched_fire));
     nvs_commit(h); nvs_close(h);
+}
+
+// b452: in-progress marker accessors. sched_note_flow_started() and water_task
+// sit above s_sched_fire's definition, so they reach it through these.
+static void sched_fire_set_inprogress(uint32_t epoch, uint16_t zone)
+{
+    s_sched_fire.inprogress_epoch = epoch;
+    s_sched_fire.inprogress_zone  = zone;
+}
+static void sched_fire_clear_inprogress(void)
+{
+    if (s_sched_fire.inprogress_epoch) {
+        s_sched_fire.inprogress_epoch = 0;
+        sched_fire_save();
+    }
 }
 
 static bool sched_fire_already(uint32_t epoch)
@@ -16144,6 +16459,14 @@ static uint32_t sched_fire_armed_info(uint16_t *zone, uint8_t *mode, uint8_t *ru
     if (mode)      *mode      = s_sched_fire.armed_mode;
     if (run_sleep) *run_sleep = s_sched_fire.armed_run_sleep;
     return s_sched_fire.armed_epoch;
+}
+
+// b451: accessor for the last scheduled occurrence that closed its catch-up
+// window unwatered. Returns the scheduled epoch (0 = none); *zone = 1-based zone.
+static uint32_t sched_fire_last_missed(uint16_t *zone)
+{
+    if (zone) *zone = s_sched_fire.last_missed_zone;
+    return s_sched_fire.last_missed_epoch;
 }
 
 // Disarm any pending run (called when the schedule changes -- the armed run
@@ -17076,10 +17399,12 @@ static void schedule_fire_check_on_wake(void)
          "(epoch %lu) -- clock-independent",
          s_sched_fire.armed_zone, s_sched_fire.armed_mode,
          s_sched_fire.armed_depth, (unsigned long)e);
-    sched_fire_mark(e);   // dedup BEFORE starting (saves the ring)
+    // b450: do NOT mark fired here. The dedup ring is stamped only once water is
+    // flowing (sched_note_flow_started), so a WDT/panic before flow re-fires via
+    // the catch-up window instead of silently skipping the watering.
     start_watering_web_mode(s_sched_fire.armed_zone,
                             schedule_web_mode(s_sched_fire.armed_mode),
-                            s_sched_fire.armed_depth);
+                            s_sched_fire.armed_depth, e);
 }
 
 // Background task: fire any entry whose scheduled time has arrived. b437:
@@ -17090,7 +17415,19 @@ static void schedule_fire_check_on_wake(void)
 // minute) instead of skipping the run entirely. Runs forever.
 #define SCHED_POLL_MS    5000u   // 5 s
 #define SCHED_IMMINENT_S 120u    // schedule firing within this many s -> block sleep
-#define SCHED_CATCHUP_S  1800u   // fire up to 30 min late, then give up
+#define SCHED_CATCHUP_S  1800u   // b471: fire up to 30 min late, then give up.
+                                 // MUST be comfortably > s_sleep_dur_s (300s) so
+                                 // the first wake AFTER the scheduled time lands
+                                 // inside the window. At 5min it equaled the sleep
+                                 // cycle, so a single sleep straddled the window and
+                                 // the run was marked missed (f9e994 missed 6am
+                                 // 6/25+6/26 this way -- clock was fine, arm fine).
+                                 // Keep it short so a re-fire can't run into the
+                                 // next back-to-back zone; HA reschedules beyond
+                                 // this. Covers a quick reboot-retry + clock-sync.
+#define SCHED_MISS_HORIZON_S 21600u  // b451: only report a closed-window miss if
+                                     // it expired within the last 6 h (ignore
+                                     // ancient/yesterday occurrences).
 
 static void schedule_task(void *arg)
 {
@@ -17117,7 +17454,23 @@ static void schedule_task(void *arg)
                 struct tm flt; localtime_r(&fire_t, &flt);
                 if (!(e->days_mask & (1u << flt.tm_wday))) continue;
                 if (now < fire_t) continue;                       // not yet due
-                if (now - fire_t >= (time_t)SCHED_CATCHUP_S) continue;  // too stale
+                if (now - fire_t >= (time_t)SCHED_CATCHUP_S) {
+                    // b451: window closed without ever watering -> record the miss
+                    // ONCE (mark it resolved so it isn't re-reported) so a HA
+                    // automation can reschedule/abandon. Only for recently-expired
+                    // occurrences, not ancient/yesterday ones.
+                    if (now - fire_t < (time_t)SCHED_MISS_HORIZON_S
+                            && !sched_fire_already((uint32_t)fire_t)) {
+                        s_sched_fire.last_missed_epoch = (uint32_t)fire_t;
+                        s_sched_fire.last_missed_zone  = e->zone;
+                        sched_fire_mark((uint32_t)fire_t);
+                        sched_fire_save();
+                        ESP_LOGW(TAG, "Schedule: zone %u %02u:%02u MISSED -- window "
+                                 "closed unwatered (HA may reschedule)",
+                                 e->zone, e->hour, e->minute);
+                    }
+                    continue;  // too stale
+                }
                 if (sched_fire_already((uint32_t)fire_t)) continue;     // already ran
                 if (s_web_water_mode != 0) {
                     ESP_LOGW(TAG, "Schedule: entry %u due (zone %u) but watering "
@@ -17129,8 +17482,8 @@ static void schedule_task(void *arg)
                      "(web_mode %d) at %02u:%02u (%lds late)",
                      i, e->zone, e->mode, e->depth, wm, e->hour, e->minute,
                      (long)(now - fire_t));
-                sched_fire_mark((uint32_t)fire_t);
-                start_watering_web_mode(e->zone, wm, e->depth);
+                // b450: mark on flow, not here (see schedule_fire_check_on_wake)
+                start_watering_web_mode(e->zone, wm, e->depth, (uint32_t)fire_t);
                 break;
             }
         }
@@ -17171,6 +17524,8 @@ static void pm_nvs_load(void)
         s_sleep_dur_s = v;
     if (nvs_get_u32(h, "pm_dwell_s",  &v)   == ESP_OK && v >= 10 && v <= 300)
         s_dwell_timeout_ms = v * 1000u;
+    if (nvs_get_u32(h, "wl_streak",   &v)   == ESP_OK && v >= 1 && v <= 10)
+        s_water_loss_streak_threshold = (int)v;   // b468 (restored from b443)
     size_t sz = sizeof(s_last_sleep_reason);
     if (nvs_get_str(h, "pm_reason", s_last_sleep_reason, &sz) != ESP_OK)
         s_last_sleep_reason[0] = '\0';
@@ -17323,13 +17678,24 @@ void irrigoto_sleep_now_with_reason(uint32_t duration_s, const char *reason)
         if (schedule_next_run_full(now, &next_t, &next_zone, &next_mode, &next_depth)) {
             const uint32_t WAKE_GRACE_S = 60u;
             time_t wake_target = next_t - (time_t)WAKE_GRACE_S;
-            if (wake_target > now) {
-                uint32_t until_wake = (uint32_t)(wake_target - now);
+            // b472: pick the wake we must not sleep past. Normally that's
+            // WAKE_GRACE_S before the run (room to reconnect). But if we're
+            // ALREADY inside that grace window (about to sleep in the final
+            // 60 s before the run -- happens when a short awake period lets the
+            // device re-sleep just before the minute), don't sleep a full base
+            // OVER the run: cap the sleep to land on the run itself. Either way
+            // we only ever SHORTEN, never extend.
+            time_t cap_t = (wake_target > now) ? wake_target
+                         : (next_t > now)      ? next_t
+                         : 0;
+            if (cap_t > now) {
+                uint32_t until_wake = (uint32_t)(cap_t - now);
+                if (until_wake < 1u) until_wake = 1u;
                 if (until_wake < duration_s) {
                     INFO("Schedule-aware sleep: shortening %lu s -> %u s "
-                         "(wake %u s before zone %d at scheduled time)",
+                         "(wake for zone %d at scheduled time%s)",
                          (unsigned long)duration_s, (unsigned)until_wake,
-                         (unsigned)WAKE_GRACE_S, next_zone);
+                         next_zone, (wake_target > now) ? "" : " -- imminent");
                     duration_s = until_wake;
                     // b437: ARM this run. We're sleeping specifically to land
                     // on it, so the next timer wake fires it directly -- no

@@ -464,6 +464,68 @@ template:
         unique_id: <<DEV_USC>>_zone_8_exists
         default_entity_id: binary_sensor.<<DEV_USC>>_zone_8_exists
         state: "{{ 7 in (state_attr('sensor.<<DEV_USC>>_schedule_rest', 'zones') | map(attribute='id') | map('int') | list) }}"
+    # Per-zone-id display name, looked up by device zone id from the live zone
+    # list. Drives the chase button labels so they read the zone name (e.g.
+    # "Combined") instead of "Chase Zone #N". Same trigger/guard as the
+    # _exists flags above, so names retain across device sleep / HA restart.
+    # Falls back to "Zone #<id>" if the name is empty or the zone is missing.
+    sensor:
+      - name: "<<DEV_DASH>> zone id0 name"
+        unique_id: <<DEV_USC>>_zone_id0_name
+        default_entity_id: sensor.<<DEV_USC>>_zone_id0_name
+        state: >-
+          {{ (state_attr('sensor.<<DEV_USC>>_schedule_rest', 'zones') | default([], true)
+              | selectattr('id','in',[0, '0']) | map(attribute='name')
+              | select('string') | list | first) | default('Zone #0', true) }}
+      - name: "<<DEV_DASH>> zone id1 name"
+        unique_id: <<DEV_USC>>_zone_id1_name
+        default_entity_id: sensor.<<DEV_USC>>_zone_id1_name
+        state: >-
+          {{ (state_attr('sensor.<<DEV_USC>>_schedule_rest', 'zones') | default([], true)
+              | selectattr('id','in',[1, '1']) | map(attribute='name')
+              | select('string') | list | first) | default('Zone #1', true) }}
+      - name: "<<DEV_DASH>> zone id2 name"
+        unique_id: <<DEV_USC>>_zone_id2_name
+        default_entity_id: sensor.<<DEV_USC>>_zone_id2_name
+        state: >-
+          {{ (state_attr('sensor.<<DEV_USC>>_schedule_rest', 'zones') | default([], true)
+              | selectattr('id','in',[2, '2']) | map(attribute='name')
+              | select('string') | list | first) | default('Zone #2', true) }}
+      - name: "<<DEV_DASH>> zone id3 name"
+        unique_id: <<DEV_USC>>_zone_id3_name
+        default_entity_id: sensor.<<DEV_USC>>_zone_id3_name
+        state: >-
+          {{ (state_attr('sensor.<<DEV_USC>>_schedule_rest', 'zones') | default([], true)
+              | selectattr('id','in',[3, '3']) | map(attribute='name')
+              | select('string') | list | first) | default('Zone #3', true) }}
+      - name: "<<DEV_DASH>> zone id4 name"
+        unique_id: <<DEV_USC>>_zone_id4_name
+        default_entity_id: sensor.<<DEV_USC>>_zone_id4_name
+        state: >-
+          {{ (state_attr('sensor.<<DEV_USC>>_schedule_rest', 'zones') | default([], true)
+              | selectattr('id','in',[4, '4']) | map(attribute='name')
+              | select('string') | list | first) | default('Zone #4', true) }}
+      - name: "<<DEV_DASH>> zone id5 name"
+        unique_id: <<DEV_USC>>_zone_id5_name
+        default_entity_id: sensor.<<DEV_USC>>_zone_id5_name
+        state: >-
+          {{ (state_attr('sensor.<<DEV_USC>>_schedule_rest', 'zones') | default([], true)
+              | selectattr('id','in',[5, '5']) | map(attribute='name')
+              | select('string') | list | first) | default('Zone #5', true) }}
+      - name: "<<DEV_DASH>> zone id6 name"
+        unique_id: <<DEV_USC>>_zone_id6_name
+        default_entity_id: sensor.<<DEV_USC>>_zone_id6_name
+        state: >-
+          {{ (state_attr('sensor.<<DEV_USC>>_schedule_rest', 'zones') | default([], true)
+              | selectattr('id','in',[6, '6']) | map(attribute='name')
+              | select('string') | list | first) | default('Zone #6', true) }}
+      - name: "<<DEV_DASH>> zone id7 name"
+        unique_id: <<DEV_USC>>_zone_id7_name
+        default_entity_id: sensor.<<DEV_USC>>_zone_id7_name
+        state: >-
+          {{ (state_attr('sensor.<<DEV_USC>>_schedule_rest', 'zones') | default([], true)
+              | selectattr('id','in',[7, '7']) | map(attribute='name')
+              | select('string') | list | first) | default('Zone #7', true) }}
   - sensor:
       - name: <<DEV_DASH>> watering log
         unique_id: <<DEV_USC>>_watering_log_v2
@@ -1690,6 +1752,82 @@ template:
           last_seen_version: >-
             {{ states('input_text.<<DEV_USC>>_last_seen_schedule_version') }}
 
+  # ── b467: restored diagnostic tiles (value-retained through sleep) ──
+  # Six diagnostics that were trimmed from native ESPHome entities (to
+  # fix the cold-wake reconnect/send-buffer panic) are rebuilt here from
+  # the HTTP REST sensors above (_all_rest, _cal_rest, _schedule_rest).
+  # Because they poll plain HTTP and not the ESPHome native API, they
+  # cost ZERO ListEntities budget and can't re-trigger the crash.
+  # Each block is trigger-based with a `not_to: [unavailable,...]` guard:
+  # when the device deep-sleeps and the source REST sensor goes
+  # `unavailable`, the trigger does NOT fire, so these template entities
+  # RETAIN their last good value instead of reading unavailable. The
+  # homeassistant-start trigger re-evaluates them on HA restart.
+  - trigger:
+      - trigger: state
+        entity_id: sensor.<<DEV_USC>>_all_rest
+        not_to: ["unavailable", "unknown", "none"]
+      - trigger: homeassistant
+        event: start
+    binary_sensor:
+      - name: "<<DEV_DASH>> Valve Open"
+        unique_id: <<DEV_USC>>_irrigoto_valve_open
+        default_entity_id: binary_sensor.<<DEV_USC>>_irrigoto_valve_open
+        device_class: opening
+        state: "{{ state_attr('sensor.<<DEV_USC>>_all_rest','valve_open') | int(-1) == 1 }}"
+    sensor:
+      - name: "<<DEV_DASH>> Active Zone"
+        unique_id: <<DEV_USC>>_irrigoto_active_zone
+        default_entity_id: sensor.<<DEV_USC>>_irrigoto_active_zone
+        icon: mdi:select-marker
+        state: >-
+          {%- set zid = state_attr('sensor.<<DEV_USC>>_all_rest','water_zone_id') | int(-1) -%}
+          {%- set zs = state_attr('sensor.<<DEV_USC>>_all_rest','zones') or [] -%}
+          {%- set m = zs | selectattr('id','equalto',zid) | map(attribute='name') | list -%}
+          {{ m[0] if m else 'Zone #' ~ zid }}
+      - name: "<<DEV_DASH>> Last Sleep Reason"
+        unique_id: <<DEV_USC>>_irrigoto_last_sleep_reason
+        default_entity_id: sensor.<<DEV_USC>>_irrigoto_last_sleep_reason
+        icon: mdi:sleep
+        state: "{{ state_attr('sensor.<<DEV_USC>>_all_rest','last_sleep_reason') }}"
+
+  - trigger:
+      - trigger: state
+        entity_id: sensor.<<DEV_USC>>_cal_rest
+        not_to: ["unavailable", "unknown", "none"]
+      - trigger: homeassistant
+        event: start
+    sensor:
+      - name: "<<DEV_DASH>> Calibration State"
+        unique_id: <<DEV_USC>>_irrigoto_calibration_state
+        default_entity_id: sensor.<<DEV_USC>>_irrigoto_calibration_state
+        state: >-
+          {%- set s = state_attr('sensor.<<DEV_USC>>_cal_rest','state') | int(-1) -%}
+          {%- set names = {0:'Idle',1:'Pressure scanning',2:'Awaiting throw measurement',3:'Nozzle calibration',4:'Done'} -%}
+          {%- set base = names.get(s,'Unknown') -%}
+          {%- set msg = state_attr('sensor.<<DEV_USC>>_cal_rest','msg') -%}
+          {{ base ~ (' — ' ~ msg if msg else '') }}
+
+  - trigger:
+      - trigger: state
+        entity_id: sensor.<<DEV_USC>>_schedule_rest
+        not_to: ["unavailable", "unknown", "none"]
+      - trigger: homeassistant
+        event: start
+    sensor:
+      - name: "<<DEV_DASH>> Last Schedule Update"
+        unique_id: <<DEV_USC>>_irrigoto_last_schedule_update
+        default_entity_id: sensor.<<DEV_USC>>_irrigoto_last_schedule_update
+        icon: mdi:calendar-check-outline
+        state: "{{ state_attr('sensor.<<DEV_USC>>_schedule_rest','last_status') }}"
+      - name: "<<DEV_DASH>> Schedule Delay"
+        unique_id: <<DEV_USC>>_irrigoto_schedule_delay
+        default_entity_id: sensor.<<DEV_USC>>_irrigoto_schedule_delay
+        icon: mdi:weather-pouring
+        state: >-
+          {%- set du = state_attr('sensor.<<DEV_USC>>_schedule_rest','delay_until') | int(0) -%}
+          {%- if du > as_timestamp(now()) | int -%}until {{ du | timestamp_custom('%Y-%m-%d %H:%M') }}{%- else -%}off{%- endif -%}
+
 # ── HTTP-PULL: mirror device schedule into HA slots ────────────────
 # b359: REST sensor that periodically fetches the device's structured
 # schedule (with IDs and last_modified) via its HTTP /api/schedule
@@ -1728,11 +1866,53 @@ sensor:
       - schedule_version
       - max_entries
       - last_status
+      # b451: last scheduled occurrence that closed its 5-min window without ever
+      # watering (crash / no slot). {epoch, zone} or null. A HA automation can
+      # watch this and reschedule or abandon the missed zone.
+      - last_missed
       # b359: the device's configured zone list, used to populate the
       # Compose form's Zone dropdown with friendly names instead of raw
       # 1..8. Each entry: {id, name}. id is 1-based; "Zone" is the
       # placeholder for unconfigured slot 0 (we filter it out).
       - zones
+      # b467: epoch of a scheduled rain/manual delay; 0 = no delay.
+      # Drives the Schedule Delay diagnostic tile (restored via HTTP).
+      - delay_until
+
+  # ── b467: restored diagnostic tiles via HTTP REST ──────────────────
+  # Six diagnostic entities (Valve Open, Active Zone, Last Sleep Reason,
+  # Calibration State, Last Schedule Update, Schedule Delay) used to be
+  # native ESPHome entities. They were trimmed to `internal: true` in
+  # firmware to fix a cold-wake reconnect/send-buffer panic, which made
+  # them vanish from HA. These two REST sensors poll the device's plain
+  # HTTP API (/api/all and /cal/status) — invisible to the device's
+  # ESPHome ListEntities, so they cost ZERO native-entity send-buffer
+  # budget and cannot re-trigger the crash. The trigger-based template
+  # entities below (in the `template:` block) convert these into the
+  # restored diagnostic tiles AND retain their last value through deep
+  # sleep (when these REST sources go `unavailable`).
+  - platform: rest
+    name: <<DEV_USC>>_all_rest
+    resource: <<DEV_URL>>/api/all
+    method: GET
+    scan_interval: 30
+    timeout: 8
+    value_template: "{{ value_json.fw_build | default(0) }}"
+    json_attributes:
+      - valve_open
+      - water_zone_id
+      - last_sleep_reason
+      - zones
+  - platform: rest
+    name: <<DEV_USC>>_cal_rest
+    resource: <<DEV_URL>>/cal/status
+    method: GET
+    scan_interval: 30
+    timeout: 8
+    value_template: "{{ value_json.state | default(0) }}"
+    json_attributes:
+      - state
+      - msg
 
 # ── Automations ──────────────────────────────────────────────────────
 automation:

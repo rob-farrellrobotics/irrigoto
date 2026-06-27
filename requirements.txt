@@ -17,7 +17,13 @@
 # this file, re-pin all three lines, compile, OTA, watch for ~5 min,
 # then commit the bump as its own change.
 
-esphome==2026.4.5
-# Let pip resolve aioesphomeapi + zeroconf transitively to the versions
-# compatible with this esphome release. Re-pin here once the install is
-# verified working.
+# 2026-06-21: moved off the 2026.4.5 pin. HA Core updated to 2026.6.2, which
+# bundles the 2026.6.x ESPHome *integration* (the native-API client). Firmware
+# left at 2026.4.5 created a 2-minor API skew spanning the known-bad 2026.5.x
+# reconnect-handshake changes -> ~30% cold-wake reconnect panics on both units
+# (b437 baseline was 0/259 in mid-June, ~30% after the HA update). Matching the
+# firmware to the integration (2026.6.2) closes the skew. Under test on f9e994;
+# ba1f88 held on its running 2026.4.5 binary as the control.
+esphome==2026.6.2
+# pip resolved (verified installing 2026.6.2): aioesphomeapi 45.3.1,
+# esptool 5.3.0, zeroconf 0.149.16.

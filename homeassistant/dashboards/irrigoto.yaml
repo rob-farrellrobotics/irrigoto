@@ -556,7 +556,9 @@ views:
                 state: 'on'
             card:
               type: button
-              name: 'Chase Zone #0'
+              entity: sensor.<<DEV_USC>>_zone_id0_name
+              show_name: false
+              show_state: true
               icon: mdi:dog
               tap_action:
                 action: call-service
@@ -568,7 +570,9 @@ views:
                 state: 'on'
             card:
               type: button
-              name: 'Chase Zone #1'
+              entity: sensor.<<DEV_USC>>_zone_id1_name
+              show_name: false
+              show_state: true
               icon: mdi:dog
               tap_action:
                 action: call-service
@@ -580,7 +584,9 @@ views:
                 state: 'on'
             card:
               type: button
-              name: 'Chase Zone #2'
+              entity: sensor.<<DEV_USC>>_zone_id2_name
+              show_name: false
+              show_state: true
               icon: mdi:dog
               tap_action:
                 action: call-service
@@ -592,7 +598,9 @@ views:
                 state: 'on'
             card:
               type: button
-              name: 'Chase Zone #3'
+              entity: sensor.<<DEV_USC>>_zone_id3_name
+              show_name: false
+              show_state: true
               icon: mdi:dog
               tap_action:
                 action: call-service
@@ -604,7 +612,9 @@ views:
                 state: 'on'
             card:
               type: button
-              name: 'Chase Zone #4'
+              entity: sensor.<<DEV_USC>>_zone_id4_name
+              show_name: false
+              show_state: true
               icon: mdi:dog
               tap_action:
                 action: call-service
@@ -616,7 +626,9 @@ views:
                 state: 'on'
             card:
               type: button
-              name: 'Chase Zone #5'
+              entity: sensor.<<DEV_USC>>_zone_id5_name
+              show_name: false
+              show_state: true
               icon: mdi:dog
               tap_action:
                 action: call-service
@@ -628,7 +640,9 @@ views:
                 state: 'on'
             card:
               type: button
-              name: 'Chase Zone #6'
+              entity: sensor.<<DEV_USC>>_zone_id6_name
+              show_name: false
+              show_state: true
               icon: mdi:dog
               tap_action:
                 action: call-service
@@ -640,7 +654,9 @@ views:
                 state: 'on'
             card:
               type: button
-              name: 'Chase Zone #7'
+              entity: sensor.<<DEV_USC>>_zone_id7_name
+              show_name: false
+              show_state: true
               icon: mdi:dog
               tap_action:
                 action: call-service

@@ -230,6 +230,31 @@ rest_command:
     url: "http://{{ ip }}/zone/trace?id={{ zone_id }}&speed={{ speed }}&loop={{ wrap }}"
     method: POST
     timeout: 10
+  # b463: the 5 manual motor controls. These were ESPHome HA services until
+  # b461 removed them (their arg-heavy ListEntitiesServices rows overflowed the
+  # device heap at HA reconnect -> the ~30% cold-wake crash). Restored as HTTP
+  # GET endpoints (firmware b463) so they no longer touch the native-API path.
+  # Caller passes ip (+ the per-endpoint args).
+  irrigoto_valve_goto:
+    url: "http://{{ ip }}/valve/goto?deg={{ deg }}"
+    method: GET
+    timeout: 12
+  irrigoto_nozzle_goto:
+    url: "http://{{ ip }}/nozzle/goto?deg={{ deg }}"
+    method: GET
+    timeout: 12
+  irrigoto_aim_valve:
+    url: "http://{{ ip }}/aim/valve?bearing={{ bearing }}&valve={{ valve }}"
+    method: GET
+    timeout: 12
+  irrigoto_aim_throw:
+    url: "http://{{ ip }}/aim/throw?bearing={{ bearing }}&throw={{ throw_mm }}"
+    method: GET
+    timeout: 12
+  irrigoto_water_arc:
+    url: "http://{{ ip }}/water/arc?throw={{ throw_mm }}&start={{ start }}&end={{ end }}&speed={{ speed }}{% if dir is defined %}&dir={{ dir }}{% endif %}"
+    method: GET
+    timeout: 12
 
 # ── Trace a zone's perimeter ─────────────────────────────────────────
 # Drives the stream around the selected zone's stored perimeter points
@@ -314,9 +339,12 @@ script:
           - repeat:
               for_each: "{{ pts }}"
               sequence:
-                - action: "esphome.{{ usc }}_aim_throw"
+                # b463: was esphome.{{ usc }}_aim_throw (service removed b461);
+                # now the /aim/throw HTTP endpoint via rest_command.
+                - action: rest_command.irrigoto_aim_throw
                   data:
-                    bearing_deg: "{{ repeat.item.nozzle_deg | float(0) }}"
+                    ip: "{{ ip }}"
+                    bearing: "{{ repeat.item.nozzle_deg | float(0) }}"
                     throw_mm: "{{ repeat.item.throw_mm | float(0) }}"
                 - delay: "{{ settle }}"
         else:

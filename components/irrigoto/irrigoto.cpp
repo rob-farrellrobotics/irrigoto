@@ -147,7 +147,17 @@ void IrrigotoComponent::loop() {
         }
     }
 
-    // ── Text sensors ──────────────────────────────────────────────────────────
+    // ── Text sensors ── (b469: throttled to ~2s) ───────────────────────────────
+    // get_status / get_zone_name hit LittleFS (opendir/load) on EVERY call.
+    // Running them every loop floods the API log-forward path: LittleFS log ->
+    // ESPHome forwards to HA's log subscription -> APIOverflowBuffer alloc fails
+    // on a weak link -> abort(). That is the decoded root cause of BOTH the
+    // cold-wake and the mid-watering crashes. These texts change slowly and
+    // publish_state dedups, so ~2s is plenty and removes the per-loop flood.
+    static uint32_t s_text_pub_ms = 0;
+    const uint32_t now_ms = millis();
+    if (now_ms - s_text_pub_ms >= 2000) {
+      s_text_pub_ms = now_ms;
     if (status_sensor_ != nullptr) {
         char buf[64];
         irrigoto_get_status(buf, sizeof(buf));
@@ -211,6 +221,7 @@ void IrrigotoComponent::loop() {
         irrigoto_schedule_get_last_status(buf, sizeof(buf));
         schedule_status_sensor_->publish_state(buf);
     }
+    }  // b469: end ~2s text-sensor throttle gate
 
     // ── Schedule text mirror + change-event ──────────────────────────────────
     // Detects edits from any source — HA set_schedule, /api/schedule web UI,
