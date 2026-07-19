@@ -66,6 +66,13 @@ batch.) On pull, HA likewise re-adopts the device id by matching `client_tag`.
 A `client_tag` of `0` (device-web-created or pre-b403 entries) falls back to
 id/tuple matching.
 
+The device web UI's replace-all save (`/schedule` → `set_text`) **preserves
+`client_tag`** on every entry it tuple-matches to the prior schedule, alongside
+`id`/`source`/`last_modified`. (It used to zero the tag of every entry, which
+stranded any not-yet-id-adopted HA slot with no usable match key — the next
+edited-time push then inserted a duplicate.) Entries with no tuple match are
+new device-side creations and keep `client_tag = 0`.
+
 ### Zone encoding (important)
 
 The firmware uses **two zone conventions**:
@@ -139,6 +146,14 @@ input_text holds the slot, so there is no device prefix. Each device's entries
 are numbered 1..N within its own namespace — devices cannot collide, and slot
 numbers are always sequential and present.
 
+The slot declarations deliberately **omit `initial:`** so HA **restores** them
+across a restart (HA core input_text resets to `initial` on every restart when
+it is set — with the old `initial: ""` a restart silently emptied every slot
+while the device slept, and the next compose "edit" saved into an empty slot as
+`id=0` + fresh `client_tag`, duplicating the entry on the device at the next
+wake). A per-device startup automation (`<dev>_init_sched_slots`) normalizes
+fresh-install `unknown` slots to `""` so empty-slot checks keep working.
+
 `input_text.<dev>_last_seen_schedule_version` holds HA's last-acknowledged
 device version, for the inbound-pending indicator.
 
@@ -160,6 +175,12 @@ Two guards protect in-flight HA edits:
   cleared only if it holds a real (`id>0`) entry the device dropped. An `id=0`
   slot is a pending HA add the device hasn't seen yet, so it is preserved (and
   pushed) instead of being wiped the instant the device wakes.
+- **lm-guarded duplicate-slot collapse.** When the same device id ends up bound
+  to two slots (an id-adoption race), the mirror clears the later slot so HA
+  shows the entry once — but **only if that slot is not newer** than the
+  device's entry. A strictly-newer duplicate slot holds a pending user edit; it
+  is preserved until the reconciler pushes it, and collapses on the next mirror
+  pass once the push has landed (lm's equal).
 
 It triggers on the device's REST-sensor change, the `schedule_changed` event,
 the **online edge**, and **HA start**. On the event/online/start paths it forces
@@ -185,7 +206,11 @@ partial, and "absent from HA" must never silently delete live device entries.
 Targets the **active device's** slots. The Slot selector (1–8) picks a slot for
 that device; Save writes `<dev>_sched_<slot>` preserving the existing `id` **and
 `client_tag`** (so an edit updates the same device entry; an empty slot saves
-`id=0` and mints a fresh `client_tag`, and the device allocates the id). The
+`id=0` and mints a fresh `client_tag`, and the device allocates the id). Both
+`prev_id` and `prev_tag` force the re-read slot through `| string` before
+splitting — HA's native-type result parsing renders a populated all-numeric CSV
+as a tuple, and a bare `',' in prev_raw` membership test silently dropped
+`prev_id` to 0 on every edit of an existing entry. The
 Zone dropdown lists the device's zones as `"Name (#id)"`; that list is cached in
 `input_text.<dev>_zone_cache` so it survives device sleep and HA restarts, and
 the form falls back to the cache when the device is asleep. Save **refuses to

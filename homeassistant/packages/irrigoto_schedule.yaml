@@ -196,8 +196,14 @@ script:
           # Prior id (first CSV field) so editing a slot UPDATES the same device
           # entry rather than allocating a new one. 0 = empty/new -> device
           # allocates an id on first sync.
+          # Force `| string` (b358 hardening, same as prev_tag below): HA's
+          # native-type result parsing renders a populated all-numeric CSV as
+          # a TupleWrapper, so a bare `',' in prev_raw` was a tuple-MEMBERSHIP
+          # test -> always False -> prev_id fell to 0 on EVERY edit of an
+          # existing entry (double_edit_same_slot_asleep identity corruption).
           prev_id: >-
-            {%- if ',' in prev_raw -%}{{ prev_raw.split(',')[0] | int(0) }}{%- else -%}0{%- endif -%}
+            {%- set pf = (prev_raw | string).split(',') -%}
+            {%- if pf | length > 1 -%}{{ pf[0] | int(0) }}{%- else -%}0{%- endif -%}
           # b403: stable client_tag (10th CSV field). Preserved across edits like
           # prev_id; generated once (= creation epoch, a unique-enough uint32)
           # when the slot is empty/legacy. The device dedups id=0 re-pushes by

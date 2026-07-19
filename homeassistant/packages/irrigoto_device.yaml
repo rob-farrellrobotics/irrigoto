@@ -55,35 +55,60 @@ input_text:
   # against the device's current value to decide whether to pull in
   # device-side edits. Stored as a string so we can use input_text
   # (input_number has step / precision quirks for a monotonic counter).
+  # NO `initial:` (restart_slot_wipe fix, same as the sched slots below):
+  # with `initial: "0"` every HA restart reset this to 0, showing a spurious
+  # "inbound pending" indicator until the mirror's HA-start pull ran. Fresh
+  # installs start 'unknown'; <<DEV_USC>>_init_sched_slots normalizes to "0".
   <<DEV_USC>>_last_seen_schedule_version:
     name: "irrigoto <<DEV_DASH>> last seen schedule_version"
     icon: mdi:counter
     max: 16
-    initial: "0"
   # Durable cache of this device's zone-picker options ("<name> (#<id>)" JSON),
   # refreshed whenever the device is awake. input_text values are restored
   # across HA restarts, whereas input_select.set_options is NOT -- so this is
   # what lets the zone pickers (overview + schedule compose) still show a
   # device's zones while it's asleep, even right after a restart.
+  # NO `initial:` (restart_slot_wipe fix, same as the sched slots below):
+  # with `initial: "[]"` every HA restart wiped the cache, so the compose
+  # Save guard refused to save while the device slept. Fresh installs start
+  # 'unknown'; <<DEV_USC>>_init_sched_slots normalizes to "[]".
   <<DEV_USC>>_zone_cache:
     name: "irrigoto <<DEV_DASH>> zone cache"
     icon: mdi:playlist-check
     max: 255
-    initial: "[]"
   # Per-device schedule slots. Each device owns its OWN sequential slots 1..8
   # (replacing the old 10 globally-shared input_text.irrigoto_sched_N slots,
   # which collided across devices and left entries with no slot number). Value
   # format is a flat CSV: id,lm,zone,mode,depth,hour,minute,days_mask,enabled
   # (empty string = unused). The device is implied by which input_text holds it,
   # so there is no "dev|" prefix anymore.
-  <<DEV_USC>>_sched_1: {name: "<<DEV_DASH>> sched slot 1", max: 96, initial: ""}
-  <<DEV_USC>>_sched_2: {name: "<<DEV_DASH>> sched slot 2", max: 96, initial: ""}
-  <<DEV_USC>>_sched_3: {name: "<<DEV_DASH>> sched slot 3", max: 96, initial: ""}
-  <<DEV_USC>>_sched_4: {name: "<<DEV_DASH>> sched slot 4", max: 96, initial: ""}
-  <<DEV_USC>>_sched_5: {name: "<<DEV_DASH>> sched slot 5", max: 96, initial: ""}
-  <<DEV_USC>>_sched_6: {name: "<<DEV_DASH>> sched slot 6", max: 96, initial: ""}
-  <<DEV_USC>>_sched_7: {name: "<<DEV_DASH>> sched slot 7", max: 96, initial: ""}
-  <<DEV_USC>>_sched_8: {name: "<<DEV_DASH>> sched slot 8", max: 96, initial: ""}
+  #
+  # NO `initial:` here, on purpose (restart_slot_wipe fix): HA core input_text
+  # only RESTORES its previous state across a restart when `initial` is
+  # OMITTED. With `initial: ""` every HA restart silently reset all 8 slots to
+  # empty; while the device slept, the mirror's offline guard (correctly)
+  # couldn't refill them, so a compose "edit" then saved into an empty slot as
+  # id=0 with a freshly-minted client_tag — the entry's identity was lost and
+  # the next wake push INSERTED a duplicate on the device (upsert-only push
+  # never removes the stale original). Fresh installs (nothing to restore)
+  # start as 'unknown'; the <<DEV_USC>>_init_sched_slots automation below
+  # normalizes those to "" at startup.
+  <<DEV_USC>>_sched_1: {name: "<<DEV_DASH>> sched slot 1", max: 96}
+  <<DEV_USC>>_sched_2: {name: "<<DEV_DASH>> sched slot 2", max: 96}
+  <<DEV_USC>>_sched_3: {name: "<<DEV_DASH>> sched slot 3", max: 96}
+  <<DEV_USC>>_sched_4: {name: "<<DEV_DASH>> sched slot 4", max: 96}
+  <<DEV_USC>>_sched_5: {name: "<<DEV_DASH>> sched slot 5", max: 96}
+  <<DEV_USC>>_sched_6: {name: "<<DEV_DASH>> sched slot 6", max: 96}
+  <<DEV_USC>>_sched_7: {name: "<<DEV_DASH>> sched slot 7", max: 96}
+  <<DEV_USC>>_sched_8: {name: "<<DEV_DASH>> sched slot 8", max: 96}
+  # b479: finish_epoch of the last run the completion notice fired for.
+  # Dedup guard between the live watering_complete event and the polled
+  # last_run recovery path — whichever arrives first wins, the other is a
+  # no-op. NO `initial:` — HA only restores input_text across restarts
+  # when initial is omitted (the b476 restart_slot_wipe lesson).
+  <<DEV_USC>>_last_notified_run:
+    name: "<<DEV_DASH>> last notified run"
+    max: 20
 
 # b311: chase-mode duration shared across all zones. 1..10 minutes,
 # 1-minute steps. The chase scripts read this and pass it to the
@@ -1878,6 +1903,11 @@ sensor:
       # b467: epoch of a scheduled rain/manual delay; 0 = no delay.
       # Drives the Schedule Delay diagnostic tile (restored via HTTP).
       - delay_until
+      # b479: the device's persisted last-completed-run record, incl. the
+      # rich stats (duration/volume/score/...) and finish_epoch. Basis of
+      # the self-healing completion notice: survives sleep on the device,
+      # so a dropped watering_complete event is recovered on the next poll.
+      - last_run
 
   # ── b467: restored diagnostic tiles via HTTP REST ──────────────────
   # Six diagnostic entities (Valve Open, Active Zone, Last Sleep Reason,
@@ -1958,22 +1988,54 @@ automation:
     description: >-
       Append a Logbook entry every time a zone finishes watering, with
       mode, duration, volume, area, score, and status all in one line.
-    mode: parallel
+      b479 self-healing: fires from the live watering_complete event when
+      HA is connected at that instant, OR from the schedule_rest sensor's
+      polled last_run attribute when the event was dropped (the device
+      persists the record across sleep). Both sources carry the same
+      finish_epoch and field names; the input_text epoch guard makes the
+      notice fire exactly once per run whichever path wins.
+    mode: queued
+    max: 5
     triggers:
       - trigger: event
         event_type: esphome.<<DEV_DASH>>_watering_complete
+        id: live
+      - trigger: state
+        entity_id: sensor.<<DEV_USC>>_schedule_rest
+        attribute: last_run
+        id: poll
+    variables:
+      run: >-
+        {{ trigger.event.data if trigger.id == 'live'
+           else (trigger.to_state.attributes.last_run or {}) }}
+      run_epoch: "{{ run.get('finish_epoch', 0) | int(0) }}"
+    conditions:
+      # Valid epoch + not already notified. Pre-b479 firmware (no
+      # finish_epoch) yields run_epoch 0 -> the poll path stays silent.
+      - condition: template
+        value_template: >-
+          {{ run_epoch > 1700000000 and
+             states('input_text.<<DEV_USC>>_last_notified_run') | int(0) != run_epoch }}
     actions:
+      # Claim the epoch FIRST so the losing path (queued behind us) is a
+      # no-op; only then write the logbook line.
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.<<DEV_USC>>_last_notified_run
+        data:
+          value: "{{ run_epoch }}"
       - action: logbook.log
         data:
           name: irrigoto
           message: >-
-            {{ trigger.event.data.zone_name }}
-            ({{ trigger.event.data.mode_label }})
-            {{ '%.1f' | format(trigger.event.data.duration_s | float / 60.0) }} min,
-            {{ trigger.event.data.volume_l }} L over
-            {{ trigger.event.data.area_m2 }} m² —
-            score {{ trigger.event.data.score }}/5 —
-            {{ trigger.event.data.status }}
+            {{ run.zone_name | default('?') }}
+            ({{ run.mode_label | default('?') }})
+            {{ '%.1f' | format(run.duration_s | float(0) / 60.0) }} min,
+            {{ run.volume_l | default('?') }} L over
+            {{ run.area_m2 | default('?') }} m² —
+            score {{ run.score | default('?') }}/5 —
+            {{ run.status | default('?') }}
+            {{ '' if trigger.id == 'live' else '(recovered — live event was missed)' }}
           domain: sensor
           entity_id: sensor.<<DEV_USC>>_watering_completions
 
@@ -2504,6 +2566,61 @@ automation:
   # last_modified against the device's entry: if the slot is NEWER
   # than the device's view, we leave it (the reconciler PUSH will
   # then sync the slot to the device on its next fire).
+  # Fresh-install bootstrap for the sched slots. `initial:` is omitted from
+  # the slot declarations so they RESTORE across HA restarts (see the
+  # restart_slot_wipe note at the input_text block); the flip side is that a
+  # brand-new install has no state to restore and each slot starts 'unknown'.
+  # Normalize those to "" once at startup so the empty-slot idioms keep
+  # working (compose load's empty check, the mirror phase-2 first-empty
+  # placement, the desired-schedule entry count). Restored slots are left
+  # untouched — the template condition re-checks each slot at write time.
+  # Also normalizes the other two restore-across-restart input_texts
+  # (zone_cache -> "[]", last_seen_schedule_version -> "0"), which dropped
+  # their `initial:` for the same restart_slot_wipe reason.
+  - id: <<DEV_USC>>_init_sched_slots
+    alias: "irrigoto <<DEV_DASH>>: init unknown sched slots to empty"
+    mode: single
+    triggers:
+      - trigger: homeassistant
+        event: start
+    actions:
+      - repeat:
+          for_each: [1, 2, 3, 4, 5, 6, 7, 8]
+          sequence:
+            - if:
+                - condition: template
+                  value_template: >-
+                    {{ states('input_text.<<DEV_USC>>_sched_' ~ repeat.item)
+                       in ['unknown', 'unavailable'] }}
+              then:
+                - action: input_text.set_value
+                  target:
+                    entity_id: "input_text.<<DEV_USC>>_sched_{{ repeat.item }}"
+                  data:
+                    value: ""
+      - if:
+          - condition: template
+            value_template: >-
+              {{ states('input_text.<<DEV_USC>>_zone_cache')
+                 in ['unknown', 'unavailable'] }}
+        then:
+          - action: input_text.set_value
+            target:
+              entity_id: input_text.<<DEV_USC>>_zone_cache
+            data:
+              value: "[]"
+      - if:
+          - condition: template
+            value_template: >-
+              {{ states('input_text.<<DEV_USC>>_last_seen_schedule_version')
+                 in ['unknown', 'unavailable'] }}
+        then:
+          - action: input_text.set_value
+            target:
+              entity_id: input_text.<<DEV_USC>>_last_seen_schedule_version
+            data:
+              value: "0"
+
   - id: <<DEV_USC>>_mirror_device_schedule_to_slots
     alias: "irrigoto <<DEV_DASH>>: mirror device schedule into HA slots"
     description: >-
@@ -2653,7 +2770,18 @@ automation:
                 #     an earlier slot -> clear it so HA shows the entry once. The
                 #     device de-dups by id on push, but two HA rows look like the
                 #     duplicate bug; collapse them here. (Sandbox repro R11.)
-                - conditions: "{{ dev_e is not none and earlier_dup }}"
+                #     lm-GUARDED like branch (1): a slot strictly NEWER than the
+                #     device's entry holds a pending user edit — clearing it here
+                #     (at mirror time, ~1s into the wake) destroyed the edit
+                #     BEFORE the reconciler's 3s-debounced push could render it,
+                #     and the user's re-save then landed as id=0 + fresh tag ->
+                #     duplicate on the device (dup_clear_branch0_lost_edit).
+                #     The newer slot falls through to branch (1)'s else (kept,
+                #     pushed) and collapses on the next mirror pass, once the
+                #     push has landed and the lm's are equal.
+                - conditions: >-
+                    {{ dev_e is not none and earlier_dup
+                       and (slot_lm | int(0)) <= (dev_e.last_modified | int(0)) }}
                   sequence:
                     - action: input_text.set_value
                       target:

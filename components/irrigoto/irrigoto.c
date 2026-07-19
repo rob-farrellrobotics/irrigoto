@@ -3076,31 +3076,81 @@ static time_t s_last_water_finish_epoch = 0;
 
 // NVS-backed metadata so the "last completed zone" tag survives a
 // deep-sleep wake. Persisted in lockstep with the in-RAM snapshot
-// (zone_id / status_code / finish_epoch) at the end of every
-// watering run, and restored once at irrigoto_init. Stored as a
-// fixed-size blob under key "last_water" in the OtO namespace.
-// The full s_last_water_run struct is NOT persisted here — it's
-// big (rings, areas, throws) and only needed at the moment of
-// completion to fire the HA event; after that, dashboards only
-// care about zone+status+time, which fit in 16 bytes.
+// at the end of every watering run, and restored once at
+// irrigoto_init. Stored as a fixed-size blob under key "last_water"
+// in the OtO namespace.
+// b479: grew from the 12-byte trio (zone/status/epoch) to also snapshot
+// the watering_complete event's headline numbers. Rationale: the HA
+// completion notice is now self-healing — when the live event drops
+// (API disconnected at that instant), HA recovers the notice from
+// /api/schedule's last_run, which must therefore carry the same rich
+// fields ACROSS A SLEEP-WAKE. The full s_last_water_run (rings) stays
+// unpersisted; these are the 30s-poll-safe scalars only — serving them
+// from this RAM/NVS cache avoids per-poll LittleFS reads (the b469
+// lesson: per-poll storage access is how we got the log-forward OOM).
 typedef struct {
     uint16_t zone_id;       // 0-based zone id, matches s_last_water_zone_id
     uint8_t  status_code;   // 0=completed,1=cancelled,...
-    uint8_t  reserved;
+    uint8_t  mode;          // b479: watering mode code (was reserved; 0=unknown)
     int64_t  finish_epoch;  // unix time when the run ended
+    // b479 rich completion summary (v2 blob starts here). Field set
+    // mirrors fire_watering_complete_event_()'s payload.
+    float    duration_s;
+    uint16_t num_rings;
+    uint16_t rings_supply_limited;
+    float    avg_psi;
+    float    max_throw_mm;
+    float    total_depth_mm;
+    float    volume_l;
+    float    area_m2;
+    float    zone_area_m2;
+    float    target_depth_mm;
+    float    actual_avg_depth_mm;
+    float    score;
+    float    polygon_coverage_pct;
+    float    supply_psi_min;
+    float    supply_psi_max;
+    float    supply_psi_avg;
 } __attribute__((packed)) last_water_meta_t;
+#define LAST_WATER_META_V1_SIZE 12   // legacy trio-only blob (pre-b479)
+
+// RAM cache of the persisted record, what /api/schedule's last_run is
+// served from. rich_valid=false when only a legacy v1 blob could be
+// restored (rich fields would read as zeros) — the JSON then omits them.
+static last_water_meta_t s_last_water_meta = {0};
+static bool s_last_water_rich_valid = false;
 
 static void last_water_save_nvs(void)
 {
+    // Fill the RAM cache from the same getters the HA event uses, then
+    // persist. Runs once per watering completion — the area/score getters
+    // read the zone polygon off LittleFS, which is fine here and NOT fine
+    // on the 30 s HA poll path (which reads only this cache).
+    last_water_meta_t *m = &s_last_water_meta;
+    m->zone_id      = s_last_water_zone_id;
+    m->status_code  = (uint8_t)s_last_water_status_code;
+    m->mode         = (uint8_t)s_last_water_mode;
+    m->finish_epoch = (int64_t)s_last_water_finish_epoch;
+    m->duration_s   = irrigoto_last_water_duration_s();
+    m->num_rings    = (uint16_t)irrigoto_last_water_num_rings();
+    m->rings_supply_limited = (uint16_t)irrigoto_last_water_rings_supply_limited();
+    m->avg_psi      = irrigoto_last_water_avg_psi();
+    m->max_throw_mm = irrigoto_last_water_max_throw_mm();
+    m->total_depth_mm = irrigoto_last_water_total_depth_mm();
+    m->volume_l     = irrigoto_last_water_volume_l();
+    m->area_m2      = irrigoto_last_water_area_m2();
+    m->zone_area_m2 = irrigoto_last_water_zone_area_m2();
+    m->target_depth_mm     = irrigoto_last_water_target_depth_mm();
+    m->actual_avg_depth_mm = irrigoto_last_water_actual_avg_depth_mm();
+    m->score        = irrigoto_last_water_score();
+    m->polygon_coverage_pct = irrigoto_last_water_polygon_coverage_pct();
+    m->supply_psi_min = irrigoto_last_water_supply_psi_min();
+    m->supply_psi_max = irrigoto_last_water_supply_psi_max();
+    m->supply_psi_avg = irrigoto_last_water_supply_psi_avg();
+    s_last_water_rich_valid = true;
     nvs_handle_t h;
     if (nvs_open(CAL_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return;
-    last_water_meta_t m = {
-        .zone_id      = s_last_water_zone_id,
-        .status_code  = (uint8_t)s_last_water_status_code,
-        .reserved     = 0,
-        .finish_epoch = (int64_t)s_last_water_finish_epoch,
-    };
-    nvs_set_blob(h, "last_water", &m, sizeof(m));
+    nvs_set_blob(h, "last_water", m, sizeof(*m));
     nvs_commit(h);
     nvs_close(h);
 }
@@ -3111,12 +3161,22 @@ static void last_water_load_nvs(void)
     if (nvs_open(CAL_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return;
     last_water_meta_t m = {0};
     size_t sz = sizeof(m);
-    if (nvs_get_blob(h, "last_water", &m, &sz) == ESP_OK && sz == sizeof(m)) {
-        s_last_water_zone_id      = m.zone_id;
-        s_last_water_status_code  = (int)m.status_code;
-        s_last_water_finish_epoch = (time_t)m.finish_epoch;
-    }
+    esp_err_t r = nvs_get_blob(h, "last_water", &m, &sz);
     nvs_close(h);
+    if (r != ESP_OK) return;
+    if (sz == sizeof(m)) {                        // v2 (b479): full record
+        s_last_water_meta = m;
+        s_last_water_rich_valid = true;
+    } else if (sz >= LAST_WATER_META_V1_SIZE) {   // v1 legacy: trio+mode only
+        memcpy(&s_last_water_meta, &m, LAST_WATER_META_V1_SIZE);
+        s_last_water_rich_valid = false;
+    } else {
+        return;
+    }
+    s_last_water_zone_id      = s_last_water_meta.zone_id;
+    s_last_water_status_code  = (int)s_last_water_meta.status_code;
+    s_last_water_finish_epoch = (time_t)s_last_water_meta.finish_epoch;
+    s_last_water_mode         = (int)s_last_water_meta.mode;
 }
 static bool s_water_run_had_flow     = false;
 // b450: schedule crash-resilience (delivery_start policy). A scheduled
@@ -5655,6 +5715,112 @@ static void boot_diag_append_and_save(const boot_diag_t *entry)
     nvs_close(h);
 }
 
+// b477: nozzle-fault forensics. The /zone/last_log RAM buffer dies with the
+// next sleep, so by the time anyone inspects a faulted run the fault SUBTYPE
+// (jam vs open winding vs dwell watchdog) is gone — and that's the datum that
+// separates "stiff mechanism on a cold morning" from "broken motor wire".
+// Persist a small NVS ring of fault records; GET /api/fault_log to read.
+#define FAULT_DIAG_RING_N 4
+#define FAULT_CAUSE_JAM         1   // no motion + current >= STALL_CURRENT_MA
+#define FAULT_CAUSE_OPEN        2   // no motion + current <= OPEN_CURRENT_MA
+#define FAULT_CAUSE_DWELL       3   // sweep dwell watchdog (valve open)
+#define FAULT_CAUSE_SERP_DWELL  4   // serpentine dwell watchdog (valve open)
+
+typedef struct {
+    uint32_t seq;            // monotonic across faults
+    int64_t  epoch;          // unix time at fault; ~0 if clock not synced
+    uint16_t fw_build;
+    uint8_t  cause;          // FAULT_CAUSE_*
+    uint8_t  zone_id;        // 0-based zone being watered
+    uint8_t  ring;           // 1-based sweep ring / serpentine leg; 0 unknown
+    uint8_t  kicks_used;     // recovery kicks spent before faulting (sweep only)
+    uint16_t duty;           // PWM compare value driving the nozzle at fault
+    uint16_t bat_mv;
+    uint32_t run_ms;         // ms since the watering run started
+    uint32_t stuck_ms;       // no-motion / dwell duration that tripped the check
+    float    nozzle_deg;     // absolute nozzle bearing at fault
+    float    current_ma;     // NCUR at fault; -1 = not sampled
+    float    valve_deg;      // cached valve angle; -1 = unknown
+} __attribute__((packed)) fault_diag_t;
+
+typedef struct {
+    uint16_t version;        // 1
+    uint16_t count;          // 0..FAULT_DIAG_RING_N
+    uint16_t next_idx;       // next slot to write (mod N)
+    uint16_t reserved;
+    fault_diag_t ring[FAULT_DIAG_RING_N];
+} __attribute__((packed)) fault_diag_blob_t;
+
+static void fault_diag_load_all(fault_diag_blob_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->version = 1;
+    nvs_handle_t h;
+    if (nvs_open(CAL_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return;
+    size_t sz = sizeof(*out);
+    esp_err_t r = nvs_get_blob(h, "fault_diag", out, &sz);
+    nvs_close(h);
+    if (r != ESP_OK || sz != sizeof(*out) || out->version != 1) {
+        memset(out, 0, sizeof(*out));
+        out->version = 1;
+    }
+}
+
+static const char *fault_diag_cause_str(int c)
+{
+    switch (c) {
+        case FAULT_CAUSE_JAM:        return "jam";
+        case FAULT_CAUSE_OPEN:       return "open";
+        case FAULT_CAUSE_DWELL:      return "dwell";
+        case FAULT_CAUSE_SERP_DWELL: return "serp_dwell";
+        default:                     return "unknown";
+    }
+}
+
+// Called from the fault sites AFTER nozzle drive is cut but BEFORE the (slow)
+// valve-close/unwind, so the NVS write (~tens of ms) never delays cutting
+// power to a stuck motor, yet still lands even if the close then hangs.
+static void fault_diag_record(uint8_t cause, int ring, uint16_t duty,
+                              int kicks, uint32_t run_ms, uint32_t stuck_ms,
+                              float nozzle_deg, float current_ma)
+{
+    fault_diag_blob_t blob;
+    fault_diag_load_all(&blob);
+    uint32_t mx = 0;
+    for (int i = 0; i < blob.count; i++)
+        if (blob.ring[i].seq > mx) mx = blob.ring[i].seq;
+    fault_diag_t e = {0};
+    e.seq        = mx + 1;
+    e.epoch      = (int64_t)time(NULL);
+    e.fw_build   = (uint16_t)FW_BUILD;
+    e.cause      = cause;
+    e.zone_id    = (uint8_t)s_water_zone_id;
+    e.ring       = (uint8_t)((ring < 0) ? 0 : (ring > 255 ? 255 : ring));
+    e.kicks_used = (uint8_t)((kicks < 0) ? 0 : (kicks > 255 ? 255 : kicks));
+    e.duty       = duty;
+    e.bat_mv     = (uint16_t)irrigoto_get_battery_mv();
+    e.run_ms     = run_ms;
+    e.stuck_ms   = stuck_ms;
+    e.nozzle_deg = nozzle_deg;
+    e.current_ma = current_ma;
+    e.valve_deg  = s_valve_deg_cached;
+    if (blob.next_idx >= FAULT_DIAG_RING_N) blob.next_idx = 0;
+    blob.ring[blob.next_idx] = e;
+    blob.next_idx = (blob.next_idx + 1) % FAULT_DIAG_RING_N;
+    if (blob.count < FAULT_DIAG_RING_N) blob.count++;
+    nvs_handle_t h;
+    if (nvs_open(CAL_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_blob(h, "fault_diag", &blob, sizeof(blob));
+    nvs_commit(h);
+    nvs_close(h);
+    INFO("Fault forensics #%lu saved: %s zone=%u ring=%d duty=%u kicks=%d "
+         "run=%lums stuck=%lums noz=%.1fdeg %.0fmA bat=%umV",
+         (unsigned long)e.seq, fault_diag_cause_str(cause),
+         (unsigned)e.zone_id, ring, (unsigned)duty, kicks,
+         (unsigned long)run_ms, (unsigned long)stuck_ms,
+         nozzle_deg, current_ma, (unsigned)e.bat_mv);
+}
+
 // Reset reason → short string (mirrors the names used by the reset_reason
 // text_sensor in esphome/irrigoto-core.yaml so HA users see the same labels).
 static const char *boot_diag_reset_reason_str(int r)
@@ -6924,6 +7090,15 @@ static bool nozzle_sweep_encoder_gentle(
     float      last_dwell_pos       = sweep_origin;  // post-kickstart baseline
     const uint32_t DWELL_TIMEOUT_MS  = s_dwell_timeout_ms;
     const float    DWELL_MOVE_DEG    = 3.0f;    // min motion to reset
+    // b478: dwell-path recovery kicks. A nozzle stuck AT an arc start never
+    // trips stall detection — progress_cleared_start (b360) gates it off to
+    // reject encoder noise, and the dps refit needs 6 deg of progress — so
+    // NO rescue mechanism ever escalated the duty (ba1f88's 08:00 dwell
+    // fault on 2026-07-15 recorded kicks_used=0 at duty 70). Kick at 1/4,
+    // 2/4 and 3/4 of the dwell timeout, escalating duty each time; only
+    // declare the fault at 4/4 if none of them produced motion.
+    int            dwell_kicks_used   = 0;
+    const int      DWELL_MAX_KICKS    = 3;
     // Adaptive recovery: when stall detection fires with current in the
     // normal-running range (motor not jammed, not open, just stuck at
     // very low duty), briefly boost PWM to unstick before resetting the
@@ -7035,18 +7210,43 @@ static bool nozzle_sweep_encoder_gentle(
             if (dwell_delta > DWELL_MOVE_DEG) {
                 last_dwell_move_tick = xTaskGetTickCount();
                 last_dwell_pos       = cur_deg;
+                dwell_kicks_used     = 0;   // b478: motion resumed, fresh episode
             } else {
                 uint32_t dwell_ms = (uint32_t)((xTaskGetTickCount() - last_dwell_move_tick)
                                                * portTICK_PERIOD_MS);
-                if (dwell_ms > DWELL_TIMEOUT_MS) {
+                // b478: escalating rescue kicks before the fault (see the
+                // declaration comment). Duty steps +100 per kick from
+                // run_duty, capped at 480 (mcpwm period_ticks=500). The
+                // dwell clock is NOT reset by a kick — only real motion
+                // (> DWELL_MOVE_DEG, handled above) clears the episode.
+                if (dwell_kicks_used < DWELL_MAX_KICKS
+                        && dwell_ms > (DWELL_TIMEOUT_MS / 4u) * (uint32_t)(dwell_kicks_used + 1)) {
+                    uint32_t kick32 = (uint32_t)run_duty + 100u * (uint32_t)(dwell_kicks_used + 1);
+                    uint16_t kick_d = (kick32 > 480u) ? 480u : (uint16_t)kick32;
+                    ESP_LOGW(TAG, "Nozzle dwell %lu ms at ~%.1f deg -- dwell kick "
+                                  "%d/%d at duty %u (run_duty %u)",
+                             (unsigned long)dwell_ms, cur_deg,
+                             dwell_kicks_used + 1, DWELL_MAX_KICKS,
+                             (unsigned)kick_d, (unsigned)run_duty);
+                    mcpwm_comparator_set_compare_value(n_cmpr, kick_d);
+                    vTaskDelay(pdMS_TO_TICKS(150));
+                    mcpwm_comparator_set_compare_value(n_cmpr, run_duty);
+                    dwell_kicks_used++;
+                } else if (dwell_ms > DWELL_TIMEOUT_MS) {
                     ESP_LOGW(TAG, "Nozzle dwell watchdog: %u ms at ~%.1f deg "
                                   "with valve open — slamming valve closed",
                              (unsigned)dwell_ms, cur_deg);
                     water_set_status(WATER_STATUS_NOZZLE_FAULT);
+                    // NCUR only means something while the drive is still on.
+                    float fault_ma = CURRENT_MA(adc_mv(ADC_CH_NCUR));
                     // Stop nozzle drive immediately and close the valve from
                     // within this function so water flow ends ASAP, before
                     // the caller's abort-label unwind reaches valve_goto.
                     mcpwm_comparator_set_compare_value(n_cmpr, 0);
+                    fault_diag_record(FAULT_CAUSE_DWELL, ring, run_duty,
+                                      recovery_kicks_used + dwell_kicks_used,
+                                      (uint32_t)pdTICKS_TO_MS(xTaskGetTickCount() - t_start),
+                                      dwell_ms, cur_deg, fault_ma);
                     valve_goto(VALVE_CLOSED_DEG, 2.0f, 5000, false);
                     ok = false;
                     break;
@@ -7088,6 +7288,10 @@ static bool nozzle_sweep_encoder_gentle(
                                       "current %.0f mA",
                                  progress, arc_deg, (unsigned)stall_ms, ma);
                         water_set_status(WATER_STATUS_NOZZLE_FAULT);
+                        fault_diag_record(FAULT_CAUSE_JAM, ring, run_duty,
+                                          recovery_kicks_used,
+                                          (uint32_t)pdTICKS_TO_MS(xTaskGetTickCount() - t_start),
+                                          stall_ms, cur_deg, ma);
                         ok = false;
                         break;
                     } else if (ma <= OPEN_CURRENT_MA
@@ -7097,6 +7301,10 @@ static bool nozzle_sweep_encoder_gentle(
                                       "(driving but no current path)",
                                  (unsigned)stall_ms, progress, ma, (unsigned)run_duty);
                         water_set_status(WATER_STATUS_NOZZLE_FAULT);
+                        fault_diag_record(FAULT_CAUSE_OPEN, ring, run_duty,
+                                          recovery_kicks_used,
+                                          (uint32_t)pdTICKS_TO_MS(xTaskGetTickCount() - t_start),
+                                          stall_ms, cur_deg, ma);
                         ok = false;
                         break;
                     } else {
@@ -8233,8 +8441,15 @@ static bool serpentine_glide_legs(const serpentine_leg_t *legs, int n,
                     ESP_LOGW(TAG, "serpentine: dwell watchdog at ~%.1f deg with valve "
                                   "open -- slamming valve closed", cur_b);
                     water_set_status(WATER_STATUS_NOZZLE_FAULT);
+                    // NCUR only means something while the drive is still on.
+                    float fault_ma = CURRENT_MA(adc_mv(ADC_CH_NCUR));
                     chase_motor_apply(&nm, 0, 0);
                     chase_motor_apply(&vm, 0, 0);
+                    fault_diag_record(FAULT_CAUSE_SERP_DWELL, leg + 1, leg_duty,
+                                      kicks_used,   // b478: was hardcoded 0
+                                      (uint32_t)pdTICKS_TO_MS(xTaskGetTickCount() - t_run),
+                                      (uint32_t)pdTICKS_TO_MS(xTaskGetTickCount() - last_dwell_tick),
+                                      cur_b, fault_ma);
                     valve_goto(VALVE_CLOSED_DEG, 2.0f, 8000, false);
                     ok = false;
                     break;
@@ -13572,6 +13787,66 @@ static esp_err_t api_boot_diag_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// b477: snapshot the nozzle-fault forensics ring as JSON, latest-first
+// (same layout conventions as /api/boot_diag above). Each entry is ~290
+// bytes and the ring holds FAULT_DIAG_RING_N(4), so 2048 is a provable
+// upper bound.
+static esp_err_t api_fault_log_handler(httpd_req_t *req)
+{
+    HTTP_CONN_CLOSE(req);
+    fault_diag_blob_t blob;
+    fault_diag_load_all(&blob);
+
+    static char buf[2048]; int n = 0;
+    n += snprintf(buf+n, sizeof(buf)-n,
+        "{\"count\":%u,\"fw_build\":%u,\"entries\":[",
+        blob.count, (unsigned)FW_BUILD);
+    for (int i = 0; i < blob.count; i++) {
+        int slot = ((int)blob.next_idx - 1 - i + 2 * FAULT_DIAG_RING_N) % FAULT_DIAG_RING_N;
+        const fault_diag_t *e = &blob.ring[slot];
+        n += snprintf(buf+n, sizeof(buf)-n,
+            "%s{"
+              "\"seq\":%u,"
+              "\"epoch\":%lld,"
+              "\"fw_build\":%u,"
+              "\"cause\":\"%s\","
+              "\"cause_code\":%u,"
+              "\"zone\":%u,"
+              "\"ring\":%u,"
+              "\"kicks_used\":%u,"
+              "\"duty\":%u,"
+              "\"bat_mv\":%u,"
+              "\"run_ms\":%lu,"
+              "\"stuck_ms\":%lu,"
+              "\"nozzle_deg\":%.2f,"
+              "\"current_ma\":%.1f,"
+              "\"valve_deg\":%.2f"
+            "}",
+            i ? "," : "",
+            (unsigned)e->seq,
+            (long long)e->epoch,
+            (unsigned)e->fw_build,
+            fault_diag_cause_str(e->cause),
+            (unsigned)e->cause,
+            (unsigned)e->zone_id,
+            (unsigned)e->ring,
+            (unsigned)e->kicks_used,
+            (unsigned)e->duty,
+            (unsigned)e->bat_mv,
+            (unsigned long)e->run_ms,
+            (unsigned long)e->stuck_ms,
+            e->nozzle_deg,
+            e->current_ma,
+            e->valve_deg);
+    }
+    n += snprintf(buf+n, sizeof(buf)-n, "]}");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    httpd_resp_send(req, buf, n);
+    return ESP_OK;
+}
+
 // Toggle or set s_water_detail_log.  GET /api/detail_log         → toggle.
 // GET /api/detail_log?on=1  → enable.  GET /api/detail_log?on=0 → disable.
 static esp_err_t api_detail_log_handler(httpd_req_t *req)
@@ -15105,6 +15380,7 @@ static esp_err_t api_schedule_handler(httpd_req_t *req)
     // event's vocabulary (completed / cancelled / valve_fault / ...).
     time_t lw_epoch = irrigoto_last_water_finish_epoch();
     if (lw_epoch > 1700000000) {
+        SCHED_FLUSH_IF_FULL();   // b479: last_run grew to ~600 B; start on slack
         char lw_zname[32] = {0};
         char lw_status[24] = {0};
         irrigoto_last_water_zone_name(lw_zname, sizeof(lw_zname));
@@ -15118,8 +15394,44 @@ static esp_err_t api_schedule_handler(httpd_req_t *req)
             else if (c >= 0x20)         { buf[n++] = c; }
         }
         n += snprintf(buf+n, sizeof(buf)-n,
-            "\",\"epoch\":%ld,\"status\":\"%s\"},",
+            "\",\"epoch\":%ld,\"status\":\"%s\"",
             (long)lw_epoch, lw_status);
+        // b479: rich completion summary for the HA self-healing notice.
+        // Field names mirror fire_watering_complete_event_()'s payload so
+        // one HA template consumes either source. Served entirely from the
+        // NVS-backed RAM cache — no LittleFS reads on this 30 s poll path.
+        // Omitted when only a legacy pre-b479 blob was restored (zeros).
+        if (s_last_water_rich_valid) {
+            const last_water_meta_t *m = &s_last_water_meta;
+            char lw_mode[24] = {0};
+            irrigoto_last_water_mode_label(lw_mode, sizeof(lw_mode));
+            n += snprintf(buf+n, sizeof(buf)-n, ",\"zone_name\":\"");
+            for (const char *p = lw_zname; *p && n < (int)sizeof(buf)-8; p++) {
+                unsigned char c = (unsigned char)*p;
+                if (c == '"' || c == '\\') { buf[n++] = '\\'; buf[n++] = c; }
+                else if (c >= 0x20)         { buf[n++] = c; }
+            }
+            n += snprintf(buf+n, sizeof(buf)-n,
+                "\",\"finish_epoch\":%lld,"
+                "\"mode\":%u,\"mode_label\":\"%s\","
+                "\"duration_s\":%.1f,\"num_rings\":%u,\"avg_psi\":%.2f,"
+                "\"max_throw_mm\":%.0f,\"total_depth_mm\":%.2f,"
+                "\"volume_l\":%.2f,\"area_m2\":%.2f,\"zone_area_m2\":%.2f,"
+                "\"target_depth_mm\":%.3f,\"actual_avg_depth_mm\":%.3f,"
+                "\"score\":%.2f,\"polygon_coverage_pct\":%.1f,"
+                "\"supply_psi_min\":%.2f,\"supply_psi_max\":%.2f,"
+                "\"supply_psi_avg\":%.2f,\"rings_supply_limited\":%u",
+                (long long)m->finish_epoch,
+                (unsigned)m->mode, lw_mode,
+                m->duration_s, (unsigned)m->num_rings, m->avg_psi,
+                m->max_throw_mm, m->total_depth_mm,
+                m->volume_l, m->area_m2, m->zone_area_m2,
+                m->target_depth_mm, m->actual_avg_depth_mm,
+                m->score, m->polygon_coverage_pct,
+                m->supply_psi_min, m->supply_psi_max,
+                m->supply_psi_avg, (unsigned)m->rings_supply_limited);
+        }
+        n += snprintf(buf+n, sizeof(buf)-n, "},");
     } else {
         n += snprintf(buf+n, sizeof(buf)-n, "\"last_run\":null,");
     }
@@ -15498,6 +15810,7 @@ static void zone_web_start(void)
         {.uri="/api/cal/clear",   .method=HTTP_POST, .handler=api_cal_clear_handler},
         {.uri="/api/status",      .method=HTTP_GET,  .handler=api_status_handler},
         {.uri="/api/boot_diag",   .method=HTTP_GET,  .handler=api_boot_diag_handler},  // b347
+        {.uri="/api/fault_log",   .method=HTTP_GET,  .handler=api_fault_log_handler},  // b477
         {.uri="/api/theme",       .method=HTTP_GET,  .handler=api_theme_handler},
         {.uri="/api/theme",       .method=HTTP_POST, .handler=api_theme_handler},
         {.uri="/api/time",        .method=HTTP_POST, .handler=api_time_handler},   // b437
@@ -17116,6 +17429,13 @@ bool irrigoto_schedule_set_text(const char *text)
             ne->id            = old->id ? old->id : s_schedule_id_next++;
             ne->source        = changed ? 0 : old->source;
             ne->last_modified = changed ? lm_default : old->last_modified;
+            // Keep the HA-minted identity tag across a web-UI re-save. The
+            // parse loop zero-inits client_tag, so without this ONE save from
+            // the device schedule page wiped the tag of EVERY entry — and a
+            // pending id=0 HA slot (missed id-adoption ack) whose ONLY match
+            // key was that tag then duplicated on the next edited-time push
+            // (webui_settext_tag_wipe). Entries with no match keep tag 0.
+            ne->client_tag    = old->client_tag;
         } else {
             ne->id            = s_schedule_id_next++;
             ne->last_modified = lm_default;

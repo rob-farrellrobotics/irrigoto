@@ -622,6 +622,16 @@ void IrrigotoComponent::fire_watering_complete_event_() {
     irrigoto_last_water_status_str(status_buf, sizeof(status_buf));
     data["status"]          = status_buf;
     data["fw_build"]        = i2s(FW_BUILD);
+    // b479: dedup key for the HA self-healing completion notice. The same
+    // value is served in /api/schedule's last_run.finish_epoch, so whichever
+    // path (live event vs poll of the persisted record) reaches HA first
+    // sends the notice and the other stays silent.
+    {
+        char eb[24];
+        snprintf(eb, sizeof(eb), "%lld",
+                 (long long)irrigoto_last_water_finish_epoch());
+        data["finish_epoch"] = eb;
+    }
 
     std::string event_name = "esphome." + App.get_name() + "_watering_complete";
     ESP_LOGI(TAG, "Firing HA event: %s (zone=%s status=%s)",
