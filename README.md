@@ -222,7 +222,7 @@ when modifying the firmware's GPIO usage or wiring new sensors.
 | Address | Device | Function |
 |---------|--------|---------|
 | 0x18 | MPRLS | Water pressure |
-| 0x20 | TCA6408A | GPIO expander / LEDs |
+| 0x20 | TCA6408A or SX1502 | GPIO expander / LEDs (part varies between units; firmware auto-detects since Build 483) |
 | 0x36 | AS5600 | Nozzle position |
 | 0x40 | AS5600L | Valve position |
 
