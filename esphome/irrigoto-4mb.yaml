@@ -1,7 +1,7 @@
 # Irrigoto — local dev wrapper, 4 MB flash variant.
 #
 # Same as irrigoto.yaml but targets OtO units with a 4 MB flash chip
-# (newer hardware revisions — `python -m esptool flash_id` to check):
+# (flash size varies between units — `python -m esptool flash_id` to check):
 #
 #   python -m esphome compile esphome/irrigoto-4mb.yaml
 #   python -m esphome run     esphome/irrigoto-4mb.yaml --device COM4

@@ -20,8 +20,9 @@
 substitutions:
   device_name: irrigoto
   friendly_name: Irrigoto
-  # OtO units ship with either an 8 MB or a 4 MB flash chip (newer
-  # hardware revisions use 4 MB). Defaults below are the 8 MB variant;
+  # OtO units ship with either an 8 MB or a 4 MB flash chip; the size
+  # varies between units, so check rather than assume. Defaults below
+  # are the 8 MB variant;
   # a wrapper overrides BOTH to target 4 MB hardware:
   #   flash_size: 4MB
   #   partitions_csv: irrigoto-partitions-4mb.csv

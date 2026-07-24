@@ -6,8 +6,8 @@
 #      your HA host:
 #        - example.yaml                         (this file)
 #        - esphome/irrigoto-partitions.csv      (8 MB OTA partition table)
-#      OtO units ship with either an 8 MB or a 4 MB flash chip (newer
-#      hardware revisions use 4 MB — check yours with
+#      OtO units ship with either an 8 MB or a 4 MB flash chip — the
+#      size varies between units, so check yours with
 #      `python -m esptool flash_id`, or see the flash-size step in
 #      docs/new_device_flashing.md). If yours is 4 MB, copy
 #      esphome/irrigoto-partitions-4mb.csv instead and uncomment the

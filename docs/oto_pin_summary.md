@@ -2,7 +2,7 @@
 
 _ESP32 Pin & Hardware Summary_
 
-_MCU: ESP32-WROOM-32UE (8 MB flash; newer hardware revisions ship 4 MB —
+_MCU: ESP32-WROOM-32UE (8 MB or 4 MB flash depending on the unit —
 check with `esptool flash_id`)_
 
 ## Digital Outputs — Power Control

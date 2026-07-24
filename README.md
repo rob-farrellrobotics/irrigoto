@@ -40,9 +40,9 @@ will compile and flash the firmware entirely from the HA UI.
    - [`irrigoto-partitions.csv`](esphome/irrigoto-partitions.csv) — the 8 MB
      OTA partition table; must sit next to the device yaml
 
-   OtO units ship with either an **8 MB or a 4 MB flash chip** (newer
-   hardware revisions use 4 MB; `python -m esptool flash_id` over the
-   UART cable tells you which — see
+   OtO units ship with either an **8 MB or a 4 MB flash chip** — the
+   size varies between units with no known pattern, so always check
+   yours (`python -m esptool flash_id` over the UART cable — see
    [`docs/new_device_flashing.md`](docs/new_device_flashing.md)). For a
    4 MB unit, copy
    [`irrigoto-partitions-4mb.csv`](esphome/irrigoto-partitions-4mb.csv)
@@ -147,7 +147,7 @@ C:\esphome-env\Scripts\esphome run     esphome\irrigoto.yaml
 (resolved by mDNS). For the very first flash to a brand-new device,
 ESPHome falls back to USB and prompts for a serial port.
 
-For units with a **4 MB flash chip** (newer hardware revisions), use
+For units with a **4 MB flash chip**, use
 `esphome\irrigoto-4mb.yaml` in the commands above instead — it is the
 same config with the 4 MB flash size and partition table substituted
 in.

@@ -71,8 +71,9 @@ the device exits bootloader mode.
 
 ## Step 4: Check the flash size
 
-OtO units ship with either an **8 MB** or a **4 MB** flash chip (newer
-hardware revisions use 4 MB). Everything downstream — the backup size,
+OtO units ship with either an **8 MB** or a **4 MB** flash chip — the
+size varies between units with no known correlation to production
+date, so never assume. Everything downstream — the backup size,
 the partition CSV, and which yaml/substitutions you compile with —
 depends on which one this unit has, so check first:
 
@@ -205,7 +206,7 @@ The same commands work for both flash sizes — the backup file itself
 carries the size. Before erasing anything, sanity-check that the
 backup matches this unit: **8388608 bytes** for an 8 MB chip,
 **4194304 bytes** for a 4 MB chip (a 4 MB file is a complete backup of
-a 4 MB unit, not a truncated one — newer revisions ship 4 MB flash).
+a 4 MB unit, not a truncated one — some units simply ship 4 MB flash).
 Any other size means the read was incomplete; don't restore from it.
 
 The factory backup is for THIS unit specifically (it contains MAC-tied
