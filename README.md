@@ -40,6 +40,15 @@ will compile and flash the firmware entirely from the HA UI.
    - [`irrigoto-partitions.csv`](esphome/irrigoto-partitions.csv) — the 8 MB
      OTA partition table; must sit next to the device yaml
 
+   OtO units ship with either an **8 MB or a 4 MB flash chip** (newer
+   hardware revisions use 4 MB; `python -m esptool flash_id` over the
+   UART cable tells you which — see
+   [`docs/new_device_flashing.md`](docs/new_device_flashing.md)). For a
+   4 MB unit, copy
+   [`irrigoto-partitions-4mb.csv`](esphome/irrigoto-partitions-4mb.csv)
+   instead and uncomment the 4 MB substitutions block in your copy of
+   `example.yaml` (instructions in the file).
+
 2. **Add the secrets to `/config/esphome/secrets.yaml`** (create the file
    if it doesn't exist):
    ```yaml
@@ -50,7 +59,12 @@ will compile and flash the firmware entirely from the HA UI.
    ap_password:    "<8+ chars>"                  # Fallback hotspot pwd
    ```
 
-3. **Open the device yaml in ESPHome Builder and click Install.** The
+3. **Back up the stock OtO firmware first.** The first flash erases it,
+   and your own backup is the only way to ever return the unit to
+   stock — see the backup and restore steps in
+   [`docs/new_device_flashing.md`](docs/new_device_flashing.md).
+
+4. **Open the device yaml in ESPHome Builder and click Install.** The
    first flash needs a USB-UART adapter (Builder prompts for the port);
    subsequent flashes go over WiFi automatically via OTA.
 
@@ -90,9 +104,11 @@ For modifying the firmware itself rather than just deploying a release.
 irrigoto/
 ├── example.yaml                       <- end-user device wrapper (type: git)
 ├── esphome/
-│   ├── irrigoto.yaml                  <- dev wrapper (type: local)
-│   ├── irrigoto-core.yaml             <- canonical config, shared by both
-│   └── irrigoto-partitions.csv        <- custom 8 MB OTA partition table
+│   ├── irrigoto.yaml                  <- dev wrapper (type: local, 8 MB flash)
+│   ├── irrigoto-4mb.yaml              <- dev wrapper for 4 MB-flash units
+│   ├── irrigoto-core.yaml             <- canonical config, shared by all
+│   ├── irrigoto-partitions.csv        <- custom OTA partition table (8 MB)
+│   └── irrigoto-partitions-4mb.csv    <- same layout scaled to 4 MB flash
 ├── components/
 │   └── irrigoto/                      <- ESPHome external component
 │       ├── irrigoto.c                 <- main firmware
@@ -130,6 +146,17 @@ C:\esphome-env\Scripts\esphome run     esphome\irrigoto.yaml
 `esphome run` compiles if needed and then OTA-pushes to the device
 (resolved by mDNS). For the very first flash to a brand-new device,
 ESPHome falls back to USB and prompts for a serial port.
+
+For units with a **4 MB flash chip** (newer hardware revisions), use
+`esphome\irrigoto-4mb.yaml` in the commands above instead — it is the
+same config with the 4 MB flash size and partition table substituted
+in.
+
+Before a unit's very first flash, follow
+[`docs/new_device_flashing.md`](docs/new_device_flashing.md): it covers
+telling which flash chip the unit has, and **backing up the stock OtO
+firmware** — the flash erases it, and your backup is the only way back
+to stock.
 
 The dev wrapper uses `external_components: type: local` pointing at
 the sibling `components/` directory, so local edits compile without a

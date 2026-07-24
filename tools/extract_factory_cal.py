@@ -45,7 +45,17 @@ REF_PEAK_DEG = 306.7
 VALVE_ANCHORS = [
     (3777, 306.7),   # ba1f88 (reference; peak = hardcoded VALVE_PEAK_DEG)
     (17022, 256.0),  # f9e994 (measured settled peak)
+    (34623, 267.38), # b62944 (measured /cal/valve peak 2026-07-20)
 ]
+# CAUTION (2026-07-20, b62944): the linear home->peak model is now known-bad.
+# These three anchors are NOT collinear (the fit predicted peak 188.6 for
+# b62944; measured 267.4 -- 79 deg off, and the pushed offset put "closed" ON
+# the flow window). The mapping likely wraps mod 360 and the ball's two flow
+# windows alias mod 180, so a linear fit through raw home values can't
+# extrapolate. Treat the prediction as a HINT ONLY; always confirm with
+# POST /cal/valve (water on) before trusting closed positions, and remember a
+# sweep that starts past/inside a flow window latches its own start angle as
+# "best" (boundary artifact, see b62944's first sweep).
 
 
 def find_nvs_partition(image):

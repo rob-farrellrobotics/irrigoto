@@ -2,7 +2,8 @@
 
 _ESP32 Pin & Hardware Summary_
 
-_MCU: ESP32-WROOM-32UE (8MB flash)_
+_MCU: ESP32-WROOM-32UE (8 MB flash; newer hardware revisions ship 4 MB —
+check with `esptool flash_id`)_
 
 ## Digital Outputs — Power Control
 
@@ -52,7 +53,7 @@ Bus: I2C_NUM_0, 400kHz, powered by 3V3Sen rail (GPIO4).
 | GPIO35 | 7 | CH7 | NCur | Nozzle motor current sense | INA4180A3, 50mΩ, gain 100 |
 
 Current conversion: I(mA) = V(mV) × 0.2
-Note: Idle baseline ~142mV = ~28mA (INA4180A3 zero-current offset). Battery must be connected for stable operation — external supply alone causes brownout on TCA6408A switching.
+Note: Idle baseline ~142mV = ~28mA (INA4180A3 zero-current offset). A well-charged battery must be connected for stable operation — an external supply alone may not cover current transients (first observed on TCA6408A LED-sink switching), and the sag causes brownout resets.
 
 ## Wake / Interrupt
 

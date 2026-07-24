@@ -13,13 +13,23 @@
 # external_components source. Anything you change here flows to both.
 #
 # Partition path is a sibling-relative reference, so end users must
-# drop irrigoto-partitions.csv next to their wrapper yaml in
-# /config/esphome/. The dev wrapper sits next to its own copy in
-# esphome/irrigoto-partitions.csv.
+# drop the partition CSV named by ${partitions_csv} next to their
+# wrapper yaml in /config/esphome/. The dev wrappers sit next to their
+# own copies in esphome/.
 
 substitutions:
   device_name: irrigoto
   friendly_name: Irrigoto
+  # OtO units ship with either an 8 MB or a 4 MB flash chip (newer
+  # hardware revisions use 4 MB). Defaults below are the 8 MB variant;
+  # a wrapper overrides BOTH to target 4 MB hardware:
+  #   flash_size: 4MB
+  #   partitions_csv: irrigoto-partitions-4mb.csv
+  # Check your chip with `python -m esptool flash_id` ("Detected flash
+  # size"). Flashing the 8 MB layout onto a 4 MB chip fails at first
+  # boot: the littlefs partition lies beyond the end of flash.
+  flash_size: 8MB
+  partitions_csv: irrigoto-partitions.csv
   # IANA timezone — used by ESPHome's own time formatting (display,
   # automation triggers). Pre-parsed to a POSIX struct at codegen.
   device_timezone: "America/New_York"
@@ -83,18 +93,18 @@ esp32:
   # message, it shouldn't WDT." 15s is well inside the IDF int-WDT and the
   # safe_mode boot_is_good_after window. Sets CONFIG_ESP_TASK_WDT_TIMEOUT_S.
   watchdog_timeout: 15s
-  # 8 MB matches the physical chip and the partition layout in
-  # irrigoto-partitions.csv (littlefs partition lives at
-  # 0x3E0000-0x460000). ESPHome sets both the platformio
-  # board_upload.flash_size and the IDF CONFIG_ESPTOOLPY_FLASHSIZE_*
-  # sdkconfig option from this.
-  flash_size: 8MB
+  # Must match the physical chip AND the partition CSV chosen below —
+  # see the flash_size/partitions_csv substitutions at the top of this
+  # file for the 8 MB vs 4 MB variant story. ESPHome sets both the
+  # platformio board_upload.flash_size and the IDF
+  # CONFIG_ESPTOOLPY_FLASHSIZE_* sdkconfig option from this.
+  flash_size: ${flash_size}
   # Custom partition layout (nvs / otadata / ota_0 / ota_1 / littlefs).
   # ESPHome's `partitions:` key copies the file into the build dir and
   # sets the IDF sdkconfig options. Sibling-relative path — resolves
   # to the directory of the wrapper yaml that packages:-includes this
   # file, so the partition CSV must sit next to the wrapper.
-  partitions: irrigoto-partitions.csv
+  partitions: ${partitions_csv}
   framework:
     type: esp-idf
     # Omit version → ESPHome uses its recommended IDF (5.5.4 as of 2026.4.5).

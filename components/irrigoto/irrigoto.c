@@ -83,11 +83,32 @@ static const char *TAG = "irrigoto";
 #define MPRLS_COUNT_MIN         0x19999Au
 #define MPRLS_COUNT_MAX         0xE66666u
 
-// ── TCA6408A registers ────────────────────────────────────────────────────────
+// ── GPIO expander / LED registers ─────────────────────────────────────────────
 #define TCA6408A_REG_OUTPUT     0x01
 #define TCA6408A_REG_CONFIG     0x03
+#define SX1502_REG_DATA         0x00
+#define SX1502_REG_DIR          0x01       // 1=input, 0=output
+#define SX1502_REG_ADVANCED     0xAB       // factory FW probes this register
 
-// TCA6408A LED bit mapping (confirmed from LED test menu):
+typedef enum {
+    LED_EXP_UNKNOWN = 0,
+    LED_EXP_TCA6408A,
+    LED_EXP_SX1502,
+} led_expander_t;
+
+// Logical LED states. tca_led_set() maps these to the detected expander's
+// physical register values.
+#define LED_OFF         0
+#define LED_RED         1
+#define LED_GREEN       2
+#define LED_BLUE        3
+#define LED_YELLOW      4
+#define LED_CYAN        5
+#define LED_PURPLE      6
+#define LED_WHITE       7
+
+// TCA6408A LED bit mapping (existing/default path, confirmed from LED
+// test menu):
 //
 //   Bit 0 = Red   (active LOW  -- 0=on, 1=off)
 //   Bit 1 = Blue  (active HIGH -- 1=on, 0=off)
@@ -103,21 +124,34 @@ static const char *TAG = "irrigoto";
 //   2. TCA6408A bit 0 (active LOW) -- firmware-controllable.
 //      Can be used for error states, low battery warnings, etc.
 //   Either path alone lights the LED; both active = same result.
-//   Before sleep, set TCA to LED_OFF (0xF9) so bit0=HIGH, releasing
+//   Before sleep, set TCA to TCA_LED_OFF (0xF9) so bit0=HIGH, releasing
 //   red LED control to the BQ25504 charger exclusively.
 //
 //   Green and Blue are firmware-only (TCA6408A bits 1 and 2).
 //
 // Base "off" state: bit0=HIGH, bit1=LOW, bit2=LOW = 0xF9
 // To add a colour: set its bit (HIGH for B/G, LOW for R)
-#define LED_OFF         0xF9   // R=off(HIGH) G=off(LOW)  B=off(LOW)
-#define LED_RED         0xF8   // R=on(LOW)   G=off(LOW)  B=off(LOW)
-#define LED_GREEN       0xFD   // R=off(HIGH) G=on(HIGH)  B=off(LOW)
-#define LED_BLUE        0xFB   // R=off(HIGH) G=off(LOW)  B=on(HIGH)
-#define LED_YELLOW      0xFC   // R=on(LOW)   G=on(HIGH)  B=off(LOW)
-#define LED_CYAN        0xFF   // R=off(HIGH) G=on(HIGH)  B=on(HIGH)
-#define LED_PURPLE      0xFA   // R=on(LOW)   G=off(LOW)  B=on(HIGH)
-#define LED_WHITE       0xFE   // R=on(LOW)   G=on(HIGH)  B=on(HIGH)
+#define TCA_LED_OFF     0xF9   // R=off(HIGH) G=off(LOW)  B=off(LOW)
+#define TCA_LED_RED     0xF8   // R=on(LOW)   G=off(LOW)  B=off(LOW)
+#define TCA_LED_GREEN   0xFD   // R=off(HIGH) G=on(HIGH)  B=off(LOW)
+#define TCA_LED_BLUE    0xFB   // R=off(HIGH) G=off(LOW)  B=on(HIGH)
+#define TCA_LED_YELLOW  0xFC   // R=on(LOW)   G=on(HIGH)  B=off(LOW)
+#define TCA_LED_CYAN    0xFF   // R=off(HIGH) G=on(HIGH)  B=on(HIGH)
+#define TCA_LED_PURPLE  0xFA   // R=on(LOW)   G=off(LOW)  B=on(HIGH)
+#define TCA_LED_WHITE   0xFE   // R=on(LOW)   G=on(HIGH)  B=on(HIGH)
+
+// SX1502 LED map observed on this OtO via diagnostic page (2026-06-13).
+// Keep upper bits high when driving normal firmware states; the diagnostic raw
+// walk saw 0x00 as red, but bits 4-7 are not needed for the LED colours and
+// may be routed differently on future board variants.
+#define SX_LED_OFF      0xFE
+#define SX_LED_RED      0xF0
+#define SX_LED_GREEN    0xFB
+#define SX_LED_BLUE     0xFD
+#define SX_LED_YELLOW   0xF7   // no clean yellow observed; use visible white
+#define SX_LED_CYAN     0xFF   // observed light blue
+#define SX_LED_PURPLE   0xF7   // no clean purple observed; use visible white
+#define SX_LED_WHITE    0xF7
 
 // ── ADC / battery ─────────────────────────────────────────────────────────────
 #define VBATT_DIVIDER_RATIO     2.0f    // adjust after measuring resistors near J5
@@ -133,12 +167,14 @@ static const char *TAG = "irrigoto";
 // ── State ─────────────────────────────────────────────────────────────────────
 // Forward declarations
 static void tca_led_set(uint8_t val);
+static void led_expander_detect(void);
 
 static int s_pass = 0;
 static int s_fail = 0;
 static bool s_sensor_rail = false;
 static bool s_motor_rail  = false;
-static bool s_tca_outputs  = false;  // true once TCA6408A config set to outputs
+static bool s_tca_outputs  = false;  // true once LED expander pins are configured as outputs
+static led_expander_t s_led_expander = LED_EXP_UNKNOWN;
 static TickType_t          s_last_activity     = 0;  // tick count of last user input
 static volatile TickType_t s_last_web_req_tick = 0;  // tick of last zone web HTTP request
 static volatile bool s_ota_in_progress = false;  // true during OTA -- suppress sleep
@@ -422,6 +458,22 @@ static float g_valve_offset_deg = 0.0f;
 // 263 == reference frame, so a unit with no "cstart" key stored (e.g. f9e994,
 // unchanged) behaves exactly as before. POST /cal/valve auto-measures it.
 static float g_valve_cal_start_frame = 263.0f;
+// b480: "off is always off." Every closed-position claim is verified against
+// the pressure sensor; flow at believed-closed marks the frame SUSPECT. While
+// suspect, scheduled watering is refused (manual/HA runs still allowed -- a
+// human is present to see the water). Cleared only by a successful frame
+// measurement (/cal/valve sweep, /cal/valve/set, or a pressure cal whose scan
+// verified dry-at-closed). Persisted in "vframe"/"suspect" so a reboot can't
+// silently re-enable the schedule on a unit that can't close its valve.
+static bool g_frame_suspect = false;
+// b480: true once a frame offset has EVER been stored on this unit ("off" key
+// present in NVS, any value incl. 0). A unit with no stored frame is running
+// the reference frame on hardware whose magnet mounts at a random rotation --
+// the first pressure cal must measure the frame before trusting any angle.
+static bool g_valve_frame_calibrated = false;
+// b480/b481: pressure-verified closure ("off is always off"); defined with the
+// fault-forensics helpers, called from cal teardowns + sleep paths above it.
+static bool valve_verify_closed_dry(const char *ctx, bool allow_motor);
 // b418: per-unit valve motor polarity. +1 = reference wiring (driving the
 // physical VFWD pin DECREASES encoder angle / closes), -1 = motor leads
 // swapped. Probed open-loop at the start of POST /cal/valve (before any
@@ -449,6 +501,10 @@ static int8_t g_nozzle_motor_dir = +1;
 #define VALVE_CAL_START_DEG (g_valve_cal_start_frame + g_valve_offset_deg) // pressure begins rising here (b474: per-unit, default 263)
 #define VALVE_CAL_STEP_DEG    1.0f   // finer step in active pressure range
 #define WATER_MIN_FLOW_PSI    0.30f  // below this PSI after valve open = no detectable flow, skip ring
+// b480: flow threshold for "off is always off" closure verification and the
+// scan's dry-at-closed invariant. Sits at ONSET_PSI -- just above the no-flow
+// floor -- so sensor noise can't cry leak. See valve_verify_closed_dry().
+#define LEAK_CLOSED_PSI       0.45f
 #define WATER_NO_SUPPLY_PSI   2.0f   // b466: 12s supply-check PEAK below this = NO water connected
                                      // (vs a low/cycling supply, which is tolerated). Dry/disconnected
                                      // reads ~0.1; any real system -- even a well at pump cut-off --
@@ -683,6 +739,10 @@ static void sensor_rail_off(void)
     i2c_bus_deinit();
     gpio_set_level(GPIO_3V3SEN, 0);
     s_sensor_rail = false;
+    // The LED expander lives on the sensor rail. If that rail is power-cycled,
+    // its direction/output registers return to reset defaults and must be
+    // initialized again on the next LED write.
+    s_tca_outputs = false;
     INFO("Sensor rail OFF");
 }
 
@@ -980,15 +1040,35 @@ static void phase_pressure(void)
 // ─────────────────────────────────────────────────────────────────────────────
 static void phase_tca6408a(void)
 {
-    STEP("TCA6408A GPIO Expander (0x20) / RGB LEDs");
+    STEP("GPIO Expander (0x20) / RGB LEDs");
     sensor_rail_on();
 
-    // Force bus reset to clear any stuck state from a prior crash mid-transaction
+    // Force bus reset to clear any stuck state from a prior crash mid-transaction.
+    // Clear the cached output-configured flag because the expander may have reset.
     i2c_bus_deinit();
     vTaskDelay(pdMS_TO_TICKS(20));
     i2c_bus_init();
     s_sensor_rail = true;
+    s_tca_outputs = false;
     vTaskDelay(pdMS_TO_TICKS(100));
+
+    led_expander_detect();
+    result(s_led_expander != LED_EXP_UNKNOWN, "LED expander detected");
+
+    if (s_led_expander == LED_EXP_SX1502) {
+        INFO("Detected SX1502 LED expander; cycling logical colours.");
+        const struct { uint8_t logical; const char *name; } colors[] = {
+            {LED_BLUE, "Blue"}, {LED_GREEN, "Green"}, {LED_WHITE, "White"},
+            {LED_RED, "Red"}, {LED_OFF, "Off"},
+        };
+        for (int i = 0; i < (int)(sizeof(colors) / sizeof(colors[0])); i++) {
+            tca_led_set(colors[i].logical);
+            INFO("  %s", colors[i].name);
+            vTaskDelay(pdMS_TO_TICKS(1500));
+        }
+        result(true, "SX1502 LED colour scan complete");
+        return;
+    }
 
     uint8_t cfg = 0xFF;
     esp_err_t r = i2c_bus_read_reg(ADDR_TCA6408A, TCA6408A_REG_CONFIG, &cfg, 1);
@@ -1013,6 +1093,7 @@ static void phase_tca6408a(void)
     i2c_bus_write_reg(ADDR_TCA6408A, TCA6408A_REG_OUTPUT, &val, 1);
     uint8_t all_out = 0x00;
     i2c_bus_write_reg(ADDR_TCA6408A, TCA6408A_REG_CONFIG, &all_out, 1);
+    s_tca_outputs = true;
     vTaskDelay(pdMS_TO_TICKS(50));
 
     INFO("Cycling bits LOW one at a time (5s each, all pins as outputs):");
@@ -1756,6 +1837,26 @@ static void valve_offset_nvs_save(float off)
     nvs_set_blob(h, "off", &off, sizeof(off));
     nvs_commit(h);
     nvs_close(h);
+    g_valve_frame_calibrated = true;   // b480: this unit now has a measured/pushed frame
+}
+
+// b480: persist + flip the frame-suspect flag (see g_frame_suspect). Set on
+// any leak-at-closed detection; cleared only by a successful frame cal.
+static void valve_frame_suspect_set(bool on)
+{
+    if (g_frame_suspect == on) return;
+    g_frame_suspect = on;
+    nvs_handle_t h;
+    if (nvs_open("vframe", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, "suspect", on ? 1 : 0);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    if (on)
+        ESP_LOGW(TAG, "VALVE FRAME SUSPECT: flow detected at believed-closed. "
+                      "Scheduled watering REFUSED until recalibrated (/cal/valve).");
+    else
+        INFO("Valve frame suspect flag cleared (frame verified)");
 }
 
 // b474: per-unit flow-onset (FRAME deg). Same namespace as the offset so it
@@ -1788,12 +1889,21 @@ static void valve_offset_nvs_load(void)
     float off = 0.0f;
     size_t sz = sizeof(off);
     if (nvs_get_blob(h, "off", &off, &sz) == ESP_OK && sz == sizeof(off)) {
+        g_valve_frame_calibrated = true;   // b480: a frame was stored at some point
         if (off > -120.0f && off < 120.0f) {   // b473: ±60 -> ±120 (ba1f88 motor swap re-clocked the magnet ~78 deg)
             g_valve_offset_deg = off;
             INFO("Valve frame offset loaded: %.2f deg", off);
         } else {
             ESP_LOGW(TAG, "Valve frame offset %.2f out of range -- ignoring", off);
         }
+    }
+    // b480: frame-suspect survives reboots -- a unit that couldn't close its
+    // valve must not silently resume scheduled watering after a power cycle.
+    uint8_t susp = 0;
+    if (nvs_get_u8(h, "suspect", &susp) == ESP_OK && susp) {
+        g_frame_suspect = true;
+        ESP_LOGW(TAG, "Valve frame SUSPECT flag loaded from NVS -- scheduled "
+                      "watering refused until recalibrated");
     }
     // b474: per-unit flow-onset (frame deg). Plausibility-gated to 30-70 deg
     // before the peak (frame 306.7) so a garbage read can't lower the floor
@@ -2079,6 +2189,17 @@ static int cal_do_pressure_scan(pressure_map_t *map, bool is_web)
         disc_psi[di] = cal_read_pressure_avg();
         valve_brake_release();
         INFO("  %5.1f deg: %.4f PSI", disc_act[di], disc_psi[di]);
+        // b480: the scan's first point IS the closed position -- a valid scan
+        // always starts dry ("the scan always has zero-pressure points"). Flow
+        // here means the frame's idea of closed sits inside the flow window;
+        // every angle downstream would be garbage. Bail so the caller can
+        // self-correct with a frame sweep instead of plowing on (the b62944
+        // 1-point-scan-with-water-running failure).
+        if (di == 0 && disc_psi[0] >= LEAK_CLOSED_PSI) {
+            INFO("*** Flow at CLOSED (%.2f PSI) -- valve frame suspect. ***", disc_psi[0]);
+            valve_frame_suspect_set(true);
+            return -2;
+        }
     }
     float baseline = disc_psi[0];
     for (int di = 1; di < CAL_DISC_STEPS; di++)
@@ -2296,6 +2417,16 @@ static int cal_do_pressure_scan(pressure_map_t *map, bool is_web)
     map->num_points = n;
     n = cal_post_process_scan(map);
     INFO("Scan complete: %d calibration points.", n);
+
+    // b480: a healthy scan yields dozens of points; a curve that collapsed to
+    // fewer than 3 means the sweep window barely intersected the real flow
+    // window -- a frame problem, not a supply problem (supply-off already
+    // returned -1 above). Don't proceed to throw measurement on garbage.
+    if (n < 3) {
+        INFO("*** Scan collapsed (%d pts) -- valve frame suspect. ***", n);
+        valve_frame_suspect_set(true);
+        return -2;
+    }
 
     // b474/b475: learn the per-unit flow-onset from the finished map so the
     // NORMAL (web) pressure-cal path calibrates VALVE_CAL_START_DEG too -- not
@@ -3968,7 +4099,12 @@ static void wcal_jog_task(void *arg)
     if (cnt > 0) avg_dpp /= cnt;
     INFO("Average deg/pulse: %.3f", avg_dpp);
 
-    valve_goto(VALVE_CLOSED_DEG, 2.0f, 10000, false);
+    // b481: this close ran unverified and (2026-07-21, b62944) left the valve
+    // at the flow-onset position with "Done" on the status -- water trickling
+    // with nothing watching. Verify + rescue before declaring done.
+    if (!valve_goto(VALVE_CLOSED_DEG, 2.0f, 10000, false))
+        ESP_LOGW(TAG, "jog cal: close drive timed out");
+    valve_verify_closed_dry("jog-cal end", true);
     motor_rail_off();
 
     if (have_spd && avg_dpp > 0.05f) {
@@ -4649,33 +4785,20 @@ static void phase_led_test(void)
 {
     STEP("LED Colour Test");
     sensor_rail_on();
-
-    // Ensure TCA is in output mode
-    if (!s_tca_outputs) {
-        uint8_t off = LED_OFF;
-        i2c_bus_write_reg(ADDR_TCA6408A, TCA6408A_REG_OUTPUT, &off, 1);
-        uint8_t all_out = 0x00;
-        i2c_bus_write_reg(ADDR_TCA6408A, TCA6408A_REG_CONFIG, &all_out, 1);
-        s_tca_outputs = true;
-    }
+    led_expander_detect();
 
     INFO("LED test -- press key to cycle:");
-    INFO("  0=Off  1=Bit0(0xFE)  2=Bit1(0xFD)  3=Bit2(0xFB)");
-    INFO("  4=Bits0+1(0xFC)  5=Bits0+2(0xFA)  6=Bits1+2(0xF9)  7=All(0xF8)");
-    INFO("  g=Green(0xFD)  b=Blue(0xFB)  c=Cyan(0xF9)  q=Quit");
+    INFO("  0=Off  r=Red  g=Green  b=Blue  w=White  c=Cyan  y=Yellow  p=Purple  q=Quit");
 
-    const struct { char key; uint8_t val; const char *name; } entries[] = {
-        {'0', 0xFF, "Off"},
-        {'1', 0xFE, "Bit0 only"},
-        {'2', 0xFD, "Bit1 only"},
-        {'3', 0xFB, "Bit2 only"},
-        {'4', 0xFC, "Bits 0+1"},
-        {'5', 0xFA, "Bits 0+2"},
-        {'6', 0xF9, "Bits 1+2"},
-        {'7', 0xF8, "All bits 0-2"},
-        {'g', LED_GREEN, "GREEN"},
-        {'b', LED_BLUE,  "BLUE"},
-        {'c', LED_CYAN,  "CYAN"},
+    const struct { char key; uint8_t logical; const char *name; } entries[] = {
+        {'0', LED_OFF,    "OFF"},
+        {'r', LED_RED,    "RED"},
+        {'g', LED_GREEN,  "GREEN"},
+        {'b', LED_BLUE,   "BLUE"},
+        {'w', LED_WHITE,  "WHITE"},
+        {'c', LED_CYAN,   "CYAN"},
+        {'y', LED_YELLOW, "YELLOW"},
+        {'p', LED_PURPLE, "PURPLE"},
     };
 
     while (true) {
@@ -4683,20 +4806,18 @@ static void phase_led_test(void)
         if (ch == 'q' || ch == 'Q' || ch == 0) break;
         bool found = false;
         for (int i = 0; i < (int)(sizeof(entries)/sizeof(entries[0])); i++) {
-            if (ch == entries[i].key) {
-                i2c_bus_write_reg(ADDR_TCA6408A, TCA6408A_REG_OUTPUT,
-                                  &entries[i].val, 1);
-                INFO("  %c -> 0x%02x [%s]", ch, entries[i].val, entries[i].name);
+            if (ch == entries[i].key || ch == (entries[i].key - 32)) {
+                tca_led_set(entries[i].logical);
+                INFO("  %c -> %s", ch, entries[i].name);
                 found = true;
                 break;
             }
         }
-        if (!found) INFO("  Unknown key '%c' -- 0=off g=green b=blue c=cyan q=quit", ch);
+        if (!found) INFO("  Unknown key '%c' -- 0=off r/g/b/w/c/y/p q=quit", ch);
     }
 
-    // Leave LEDs off
-    uint8_t off = LED_OFF;
-    i2c_bus_write_reg(ADDR_TCA6408A, TCA6408A_REG_OUTPUT, &off, 1);
+    // Leave LEDs off through the detected controller path.
+    tca_led_set(LED_OFF);
     INFO("LEDs off.");
 }
 
@@ -5299,19 +5420,106 @@ static void tcp_server_task(void *arg)
 // ─────────────────────────────────────────────────────────────────────────────
 // WiFi + Blue LED + OTA
 // ─────────────────────────────────────────────────────────────────────────────
+static uint8_t led_tca_value(uint8_t logical)
+{
+    switch (logical) {
+        case LED_RED:    return TCA_LED_RED;
+        case LED_GREEN:  return TCA_LED_GREEN;
+        case LED_BLUE:   return TCA_LED_BLUE;
+        case LED_YELLOW: return TCA_LED_YELLOW;
+        case LED_CYAN:   return TCA_LED_CYAN;
+        case LED_PURPLE: return TCA_LED_PURPLE;
+        case LED_WHITE:  return TCA_LED_WHITE;
+        case LED_OFF:
+        default:         return TCA_LED_OFF;
+    }
+}
+
+static uint8_t led_sx1502_value(uint8_t logical)
+{
+    switch (logical) {
+        case LED_RED:    return SX_LED_RED;
+        case LED_GREEN:  return SX_LED_GREEN;
+        case LED_BLUE:   return SX_LED_BLUE;
+        case LED_YELLOW: return SX_LED_YELLOW;
+        case LED_CYAN:   return SX_LED_CYAN;
+        case LED_PURPLE: return SX_LED_PURPLE;
+        case LED_WHITE:  return SX_LED_WHITE;
+        case LED_OFF:
+        default:         return SX_LED_OFF;
+    }
+}
+
+static void led_expander_detect(void)
+{
+    if (s_led_expander != LED_EXP_UNKNOWN) return;
+
+    sensor_rail_on();
+
+    uint8_t cfg = 0xFF;
+    esp_err_t r_tca = i2c_bus_read_reg(ADDR_TCA6408A, TCA6408A_REG_CONFIG, &cfg, 1);
+
+    // Factory OtO firmware probes the SX1502 advanced settings register.
+    // Be conservative: some GPIO expanders may ACK reserved command bytes, so
+    // only classify as SX1502 when the read succeeds AND the advanced register
+    // has its documented reset value (0x00). Otherwise preserve the existing
+    // TCA6408A-compatible default path.
+    uint8_t advanced = 0xFF;
+    esp_err_t r_sx = i2c_bus_read_reg(ADDR_TCA6408A, SX1502_REG_ADVANCED, &advanced, 1);
+    if (r_sx == ESP_OK && advanced == 0x00) {
+        s_led_expander = LED_EXP_SX1502;
+        INFO("LED expander detected: SX1502 (advanced=0x%02X, tca_cfg=0x%02X)", advanced, cfg);
+        return;
+    }
+
+    if (r_tca == ESP_OK) {
+        s_led_expander = LED_EXP_TCA6408A;
+        INFO("LED expander detected: TCA6408A-compatible (config=0x%02X)", cfg);
+        return;
+    }
+
+    s_led_expander = LED_EXP_TCA6408A;
+    ESP_LOGW(TAG, "LED expander detection failed (sx=%s tca=%s); using TCA6408A path",
+             esp_err_to_name(r_sx), esp_err_to_name(r_tca));
+}
+
 static void tca_led_set(uint8_t val)
 {
     sensor_rail_on();
+    led_expander_detect();
+
+    if (s_led_expander == LED_EXP_SX1502) {
+        uint8_t raw = led_sx1502_value(val);
+        if (!s_tca_outputs) {
+            uint8_t off = SX_LED_OFF;
+            esp_err_t r_data = i2c_bus_write_reg(ADDR_TCA6408A, SX1502_REG_DATA, &off, 1);
+            uint8_t all_out = 0x00;
+            esp_err_t r_dir = i2c_bus_write_reg(ADDR_TCA6408A, SX1502_REG_DIR, &all_out, 1);
+            s_tca_outputs = (r_data == ESP_OK && r_dir == ESP_OK);
+            if (!s_tca_outputs) {
+                ESP_LOGW(TAG, "SX1502 LED init failed (data=%s dir=%s)",
+                         esp_err_to_name(r_data), esp_err_to_name(r_dir));
+            }
+        }
+        i2c_bus_write_reg(ADDR_TCA6408A, SX1502_REG_DATA, &raw, 1);
+        return;
+    }
+
+    uint8_t raw = led_tca_value(val);
     if (!s_tca_outputs) {
         // First call: pre-load output latch HIGH, then switch to outputs
-        uint8_t off = LED_OFF;
-        i2c_bus_write_reg(ADDR_TCA6408A, TCA6408A_REG_OUTPUT, &off, 1);
+        uint8_t off = TCA_LED_OFF;
+        esp_err_t r_data = i2c_bus_write_reg(ADDR_TCA6408A, TCA6408A_REG_OUTPUT, &off, 1);
         uint8_t all_out = 0x00;
-        i2c_bus_write_reg(ADDR_TCA6408A, TCA6408A_REG_CONFIG, &all_out, 1);
-        s_tca_outputs = true;
+        esp_err_t r_cfg = i2c_bus_write_reg(ADDR_TCA6408A, TCA6408A_REG_CONFIG, &all_out, 1);
+        s_tca_outputs = (r_data == ESP_OK && r_cfg == ESP_OK);
+        if (!s_tca_outputs) {
+            ESP_LOGW(TAG, "TCA6408A LED init failed (output=%s config=%s)",
+                     esp_err_to_name(r_data), esp_err_to_name(r_cfg));
+        }
     }
     // Config already all-outputs -- just write the output register
-    i2c_bus_write_reg(ADDR_TCA6408A, TCA6408A_REG_OUTPUT, &val, 1);
+    i2c_bus_write_reg(ADDR_TCA6408A, TCA6408A_REG_OUTPUT, &raw, 1);
 }
 
 static void led_blink_task(void *arg)
@@ -5620,6 +5828,12 @@ static void prepare_for_sleep(void)
     motor_rail_on();
     sensor_rail_on();
     valve_goto(VALVE_CLOSED_DEG, 2.0f, 10000, false);
+    // b480: last-line "off is always off" chokepoint. EVERY sleep path funnels
+    // through here, so any code path that left water running -- crashed run,
+    // aborted cal, frame drift, anything -- gets caught before the device
+    // stops paying attention for sleep_dur_s. Verify + rescue (battery-gated
+    // inside) BEFORE the rails drop.
+    valve_verify_closed_dry("pre-sleep", true);
     tca_led_set(LED_OFF);
     sensor_rail_off();
     motor_rail_off();
@@ -5725,6 +5939,9 @@ static void boot_diag_append_and_save(const boot_diag_t *entry)
 #define FAULT_CAUSE_OPEN        2   // no motion + current <= OPEN_CURRENT_MA
 #define FAULT_CAUSE_DWELL       3   // sweep dwell watchdog (valve open)
 #define FAULT_CAUSE_SERP_DWELL  4   // serpentine dwell watchdog (valve open)
+#define FAULT_CAUSE_LEAK_CLOSED 5   // b480: flow detected with valve believed closed
+                                    //   (kicks_used: 1 = seek-dry recovered, 0 = still wet
+                                    //    or motor not allowed; stuck_ms = milli-PSI seen)
 
 typedef struct {
     uint32_t seq;            // monotonic across faults
@@ -5773,6 +5990,7 @@ static const char *fault_diag_cause_str(int c)
         case FAULT_CAUSE_OPEN:       return "open";
         case FAULT_CAUSE_DWELL:      return "dwell";
         case FAULT_CAUSE_SERP_DWELL: return "serp_dwell";
+        case FAULT_CAUSE_LEAK_CLOSED:return "leak_at_closed";
         default:                     return "unknown";
     }
 }
@@ -5819,6 +6037,89 @@ static void fault_diag_record(uint8_t cause, int ring, uint16_t duty,
          (unsigned)e.zone_id, ring, (unsigned)duty, kicks,
          (unsigned long)run_ms, (unsigned long)stuck_ms,
          nozzle_deg, current_ma, (unsigned)e.bat_mv);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// b480: "off is always off" -- pressure-verified closure
+// ─────────────────────────────────────────────────────────────────────────────
+// The valve has no hard stop and the frame is only as good as its calibration,
+// so "I drove to the closed angle" is a BELIEF, not a fact. These helpers turn
+// it into a fact: read the pressure sensor after every close that matters, and
+// if water is still moving, (a) blindly walk the valve until it stops (needs
+// no frame knowledge -- a sealed angle is at most ~90 deg away on a ball
+// valve), (b) record a leak_at_closed fault, (c) mark the frame SUSPECT which
+// refuses scheduled watering until a real frame cal clears it.
+//
+// Threshold LEAK_CLOSED_PSI (0.45, defined with the flow constants) sits just
+// above the no-flow floor (0.30) so sensor noise can't trip it. A dead/
+// unreadable sensor returns "can't judge" rather than a false alarm; the
+// pressure cal separately proves the sensor works (a scan that never sees
+// pressure refuses to complete).
+
+// Blind leak rescue: walk the valve in 15 deg steps until flow stops. Chooses
+// direction from the first step's pressure response (wrong way -> pressure
+// rises -> reverse). Motor rail must be ON; battery gating is the CALLER's
+// job. Raw encoder space on purpose -- the frame is exactly what we don't
+// trust here.
+static bool valve_seek_dry(float *final_psi)
+{
+    uint16_t raw = 0;
+    if (!as5600_read(ADDR_AS5600L, &raw, NULL, NULL)) return false;
+    float cur  = raw * (360.0f / 4096.0f);
+    float dir  = -1.0f;                 // closing direction on reference wiring
+    float prev = cal_pressure_settled_median(3);   // baseline at current angle
+    float psi  = prev;
+    for (int i = 0; i < 12; i++) {      // 12 x 15 = 180 deg budget (seal is <=90
+                                        // away + up to 2 wasted wrong-way steps)
+        cur += dir * 15.0f;
+        valve_goto_direct(cur, 2.0f, 6000, false);
+        vTaskDelay(pdMS_TO_TICKS(500)); // let water hammer settle
+        psi = cal_pressure_settled_median(3);
+        ESP_LOGW(TAG, "  seek-dry: %.1f deg raw -> %.2f PSI", cur, psi);
+        if (psi >= 0.0f && psi < LEAK_CLOSED_PSI) {
+            if (final_psi) *final_psi = psi;
+            return true;
+        }
+        // First step made it clearly WORSE -> we're walking toward max-flow;
+        // reverse once and keep going the other way.
+        if (i == 0 && prev >= 0.0f && psi > prev + 0.2f) dir = -dir;
+        prev = psi;
+    }
+    if (final_psi) *final_psi = psi;
+    return false;
+}
+
+// Verify a believed-closed valve is actually dry. Sensor rail must be ON.
+// allow_motor gates the seek-dry rescue -- pass false when battery headroom
+// is not proven (reads are always safe; motor pulls are not). Returns true
+// if the valve is dry (immediately or after rescue). On ANY detected leak the
+// frame goes SUSPECT and a fault is recorded, even if the rescue succeeded --
+// a frame that closes wet is miscalibrated regardless of the save.
+static bool valve_verify_closed_dry(const char *ctx, bool allow_motor)
+{
+    float psi = cal_pressure_settled_median(3);
+    if (psi < 0.0f) return true;                 // sensor unreadable -- can't judge
+    if (psi < LEAK_CLOSED_PSI) return true;      // dry: off is off
+    ESP_LOGW(TAG, "LEAK at believed-closed (%s): %.2f PSI", ctx, psi);
+    bool dry = false;
+    float fpsi = psi;
+    if (allow_motor) {
+        float bv = irrigoto_get_battery_mv() / 1000.0f;
+        if (bv >= BATT_VALVE_SAFE_VOLTAGE_V) {
+            motor_rail_on();
+            vTaskDelay(pdMS_TO_TICKS(100));
+            dry = valve_seek_dry(&fpsi);
+            motor_rail_off();
+            ESP_LOGW(TAG, "  seek-dry %s (final %.2f PSI)", dry ? "OK" : "FAILED", fpsi);
+        } else {
+            ESP_LOGW(TAG, "  battery %.2fV < %.1fV -- no seek-dry motor pull; "
+                          "leaving valve untouched", bv, BATT_VALVE_SAFE_VOLTAGE_V);
+        }
+    }
+    fault_diag_record(FAULT_CAUSE_LEAK_CLOSED, 0, 0, dry ? 1 : 0,
+                      0, (uint32_t)(fpsi * 1000.0f), -1.0f, -1.0f);
+    valve_frame_suspect_set(true);
+    return dry;
 }
 
 // Reset reason → short string (mirrors the names used by the reset_reason
@@ -5913,6 +6214,9 @@ static void check_valve_closed_on_boot(boot_diag_t *diag)
         ESP_LOGI(TAG, "Wake valve check: %.1f deg (closed, err %.1f) -- ok",
                  cur_valve, err);
         motor_rail_off();
+        // b480: angle agreeing is a belief; pressure is the fact. This branch
+        // only runs at safe battery (caller gates), so the rescue may move.
+        valve_verify_closed_dry("boot angle-ok", true);
         return;
     }
 
@@ -5961,6 +6265,8 @@ static void check_valve_closed_on_boot(boot_diag_t *diag)
     motor_rail_off();
     ESP_LOGI(TAG, "Wake valve check: post-drive %.1f deg (err %.1f), batt %.2fV%s",
              cur_valve2, err2, v_after, drove_ok ? "" : " [drive timed out]");
+    // b480: pressure-verify the close we just drove (safe-battery branch only).
+    valve_verify_closed_dry("boot post-drive", true);
 }
 
 static void check_battery_on_boot(void)
@@ -5996,6 +6302,11 @@ static void check_battery_on_boot(void)
         ESP_LOGW(TAG, "Battery %.2fV below %.1fV threshold -- quiet sleep, no motor activity",
                  batt_v, BATT_MIN_VOLTAGE_V);
         diag.flags |= BOOT_DIAG_FLAG_BATT_TOO_LOW;
+        // b480: sensor-only leak check (reads are safe at any battery; motor
+        // pulls are not). If water is escaping we can't stop it on this
+        // battery, but we CAN persist the fault + suspect flag so HA and the
+        // fault log scream about it instead of the yard silently flooding.
+        valve_verify_closed_dry("boot batt-too-low", false);
         boot_diag_append_and_save(&diag);
         sleep_forever_quiet("low battery");
     }
@@ -6012,6 +6323,9 @@ static void check_battery_on_boot(void)
         ESP_LOGI(TAG, "Battery %.2fV between %.1fV and %.1fV -- skipping wake-time valve check",
                  batt_v, BATT_MIN_VOLTAGE_V, BATT_VALVE_SAFE_VOLTAGE_V);
         diag.flags |= BOOT_DIAG_FLAG_BATT_SKIPPED_VALVE;
+        // b480: the motor check is skipped for battery headroom, but a
+        // pressure READ costs nothing -- still verify no water is escaping.
+        valve_verify_closed_dry("boot batt-marginal", false);
     }
 
     boot_diag_append_and_save(&diag);
@@ -13381,6 +13695,14 @@ static esp_err_t exp_lash_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// b480: sweep the valve frame from the web cal path (see valve_frame_sweep,
+// defined with the /cal/valve handler below).
+typedef struct {
+    float peak, offset, closed, max_psi, flow_start;
+    bool  cstart_stored;
+} vframe_sweep_result_t;
+static int valve_frame_sweep(vframe_sweep_result_t *out);
+
 static void wcal_pressure_task(void *arg)
 {
     s_wcal.state    = WCAL_PRESSURE_SCANNING;
@@ -13392,8 +13714,68 @@ static void wcal_pressure_task(void *arg)
     motor_rail_on();
     vTaskDelay(pdMS_TO_TICKS(300));
 
+    // b480 SELF-CORRECTION. Two triggers, one response:
+    //  (a) first-ever cal on this unit (no frame ever stored) -- the magnet
+    //      mounts at a random rotation per unit, so measure the frame FIRST,
+    //      unconditionally, before trusting any angle;
+    //  (b) the scan itself reports the frame is suspect (-2: flow at closed,
+    //      or a collapsed curve) -- run the frame sweep, then rescan once.
+    // Water is already on and a user is present (they started this cal), so
+    // the frame sweep's water use is legitimate here -- unlike at boot, where
+    // we only self-protect (see check_valve_closed_on_boot).
+    bool frame_swept = false;
+    if (!g_valve_frame_calibrated || g_frame_suspect) {
+        snprintf(s_wcal.msg, sizeof(s_wcal.msg),
+                 "%s -- measuring valve frame first (water will run)...",
+                 g_valve_frame_calibrated ? "Frame suspect" : "First cal on this unit");
+        vframe_sweep_result_t fr;
+        int frc = valve_frame_sweep(&fr);
+        frame_swept = true;
+        if (frc != 0) {
+            if (frc == -1)
+                snprintf(s_wcal.msg, sizeof(s_wcal.msg),
+                    "Frame cal failed: valve never moved -- check motor power/wiring.");
+            else if (frc == -2)
+                snprintf(s_wcal.msg, sizeof(s_wcal.msg),
+                    "Frame cal found no flow -- turn the water supply ON and retry.");
+            else
+                snprintf(s_wcal.msg, sizeof(s_wcal.msg),
+                    "Frame cal failed: implausible offset %.1f (peak %.1f). Retry or /cal/valve/set.",
+                    fr.offset, fr.peak);
+            s_wcal.state = WCAL_ERROR;
+            motor_rail_off(); sensor_rail_off();
+            vTaskDelete(NULL); return;
+        }
+        INFO("Web cal: frame measured (offset %.2f, peak %.1f) -- proceeding to scan",
+             fr.offset, fr.peak);
+        motor_rail_on();   // sweep released the rail; scan needs it back
+        vTaskDelay(pdMS_TO_TICKS(150));
+    }
+
     pressure_map_t map = {0};
     int n = cal_do_pressure_scan(&map, true);
+    if (n == -2 && !frame_swept) {
+        // Scan says the frame is off and we haven't corrected yet this run --
+        // sweep, then rescan ONCE (no retry loop: a second -2 means something
+        // beyond the frame is wrong and a human should look).
+        snprintf(s_wcal.msg, sizeof(s_wcal.msg),
+                 "Frame suspect mid-scan -- measuring valve frame, then rescanning...");
+        vframe_sweep_result_t fr;
+        if (valve_frame_sweep(&fr) == 0) {
+            frame_swept = true;
+            motor_rail_on();
+            vTaskDelay(pdMS_TO_TICKS(150));
+            n = cal_do_pressure_scan(&map, true);
+        }
+    }
+    if (n == -2) {
+        snprintf(s_wcal.msg, sizeof(s_wcal.msg),
+            "Valve frame looks wrong (flow at closed / collapsed scan) and "
+            "auto-correction failed. Check water supply; then POST /cal/valve.");
+        s_wcal.state = WCAL_ERROR;
+        motor_rail_off(); sensor_rail_off();
+        vTaskDelete(NULL); return;
+    }
     if (n < 0) {
         snprintf(s_wcal.msg, sizeof(s_wcal.msg),
             "No pressure found. Check water supply is connected.");
@@ -13401,6 +13783,10 @@ static void wcal_pressure_task(void *arg)
         motor_rail_off(); sensor_rail_off();
         vTaskDelete(NULL); return;
     }
+    // A completed scan STARTED dry at closed (enforced in phase 0) and walked
+    // a real curve -- that is exactly the frame verification the suspect flag
+    // asks for.
+    valve_frame_suspect_set(false);
 
     s_wcal.pmap = map;
     s_wcal.progress = 100;
@@ -13552,7 +13938,10 @@ static void wcal_nozzle_task(void *arg)
     map.num_points_ccw = nccw;
 
     spd_save_primary(&map);
-    valve_goto(VALVE_CLOSED_DEG, 2.0f, 10000, false);
+    // b481: verify the terminal close (see jog-cal note -- same blind-close class).
+    if (!valve_goto(VALVE_CLOSED_DEG, 2.0f, 10000, false))
+        ESP_LOGW(TAG, "nozzle speed cal: close drive timed out");
+    valve_verify_closed_dry("nozzle-cal end", true);
     motor_rail_off(); sensor_rail_off();
     s_wcal.progress = 100;
     snprintf(s_wcal.msg, sizeof(s_wcal.msg),
@@ -13605,6 +13994,7 @@ static esp_err_t api_all_handler(httpd_req_t *req)
         "\"detail_log\":%s,"
         "\"valve_open\":%d,\"uptime_s\":%lu,\"last_sleep_reason\":\"%s\","
         "\"sleep_dur_s\":%lu,\"inact_s\":%lu,"   // b472: expose cadence params
+        "\"frame_suspect\":%s,\"frame_calibrated\":%s,"   // b480: closure-verify state
         "\"device_name\":\"%s\",\"zones\":[",
         FW_BUILD, wifi_get_rssi(), s_wifi_ip,
         hostname ? hostname : "",
@@ -13617,6 +14007,7 @@ static esp_err_t api_all_handler(httpd_req_t *req)
         (unsigned long)(esp_timer_get_time()/1000000ULL),
         sleep_buf,
         (unsigned long)s_sleep_dur_s, (unsigned long)(s_inactivity_ms/1000u),
+        g_frame_suspect?"true":"false", g_valve_frame_calibrated?"true":"false",
         s_device_name);
     httpd_resp_send_chunk(req, buf, n);
 
@@ -14192,7 +14583,10 @@ static esp_err_t cal_pressure_throw_handler(httpd_req_t *req)
     ESP_LOGI(TAG, "cal two-anchor: lo(%.3fPSI,%.0fmm) hi(%.3fPSI,%.0fmm)",
         s_wcal.pmap_low_psi, s_wcal.pmap_low_throw, psi_now, throw_mm);
     esp_err_t _save_err = cal_save_primary(pm);
-    valve_goto(VALVE_CLOSED_DEG, 2.0f, 10000, false);
+    // b481: terminal close of the whole pressure/throw cal -- verify it sealed.
+    if (!valve_goto(VALVE_CLOSED_DEG, 2.0f, 10000, false))
+        ESP_LOGW(TAG, "pressure cal: final close drive timed out");
+    valve_verify_closed_dry("pressure-cal end", true);
     motor_rail_off();
     sensor_rail_off();
     if (_save_err == ESP_OK) {
@@ -14221,7 +14615,11 @@ static esp_err_t cal_pressure_throw_handler(httpd_req_t *req)
 static esp_err_t cal_pressure_cancel_handler(httpd_req_t *req)
 {
     s_wcal.state = WCAL_IDLE;
-    valve_goto(VALVE_CLOSED_DEG, 2.0f, 10000, false);
+    // b481: a cancel mid-cal frequently lands with the valve at some open
+    // sample position -- verify the abort close actually sealed.
+    if (!valve_goto(VALVE_CLOSED_DEG, 2.0f, 10000, false))
+        ESP_LOGW(TAG, "pressure cal cancel: close drive timed out");
+    valve_verify_closed_dry("pressure-cal cancel", true);
     motor_rail_off(); sensor_rail_off();
     snprintf(s_wcal.msg, sizeof(s_wcal.msg), "Cancelled.");
     httpd_resp_set_type(req, "application/json");
@@ -14474,9 +14872,19 @@ static esp_err_t cal_encoder_handler(httpd_req_t *req)
 // water-hammer transients can't latch the argmax (the b390 mean-based sweep
 // overshot ba1f88's peak by ~6 deg off one spike). Sets g_valve_offset_deg =
 // peak - 306.7, persists to NVS, parks the valve closed (peak - 90, geometry).
-static esp_err_t cal_valve_handler(httpd_req_t *req)
+//
+// b480: body extracted from the HTTP handler into valve_frame_sweep() so the
+// web pressure cal can SELF-CORRECT a suspect/uncalibrated frame -- the user
+// never needs to know the /cal/valve endpoint exists. Success clears the
+// frame-suspect flag (the sweep measured, stored, and re-sealed the frame).
+// Returns 0 ok, -1 polarity probe fail, -2 no flow, -3 implausible offset
+// (not stored; valve still parked closed by ball geometry). Typedef + forward
+// declaration live above wcal_pressure_task, which calls this from earlier in
+// the file.
+static int valve_frame_sweep(vframe_sweep_result_t *out)
 {
-    httpd_resp_set_type(req, "application/json");
+    memset(out, 0, sizeof(*out));
+    out->flow_start = -1.0f;
 
     sensor_rail_on();
     motor_rail_on();
@@ -14486,9 +14894,7 @@ static esp_err_t cal_valve_handler(httpd_req_t *req)
     int sense = motor_dir_probe(GPIO_VFWD, GPIO_VREV, ADDR_AS5600L, NULL);
     if (sense == 0) {
         motor_rail_off();
-        httpd_resp_sendstr(req,
-            "{\"error\":\"polarity probe: valve never moved -- check motor power/wiring, then retry\"}");
-        return ESP_OK;
+        return -1;
     }
     int mdir = -sense;   // reference wiring: VFWD DECREASES angle (closes)
     if (mdir != g_valve_motor_dir)
@@ -14539,12 +14945,8 @@ static esp_err_t cal_valve_handler(httpd_req_t *req)
     if (best_psi < 1.0f) {
         valve_goto_direct(start, 2.0f, 8000, false);
         motor_rail_off();
-        char ebuf[150];
-        int en = snprintf(ebuf, sizeof(ebuf),
-            "{\"error\":\"no flow (max %.2f PSI) -- turn the water supply ON, then retry\"}",
-            best_psi);
-        httpd_resp_send(req, ebuf, en);
-        return ESP_OK;
+        out->max_psi = best_psi;
+        return -2;
     }
 
     // Phase 2 -- refine. Re-probe a fine window around the coarse peak with a
@@ -14562,14 +14964,14 @@ static esp_err_t cal_valve_handler(httpd_req_t *req)
     float offset = peak - 306.7f;
     if (offset <= -120.0f || offset >= 120.0f) {   // b473: ±60 -> ±120 (motor swap can re-clock the magnet, e.g. ba1f88 ~-78 deg)
         // Implausible -- don't store, but still park closed by ball geometry.
+        // b62944 lesson: a sweep that starts inside/past a flow window can
+        // latch its own start as "best" and land here -- the mirrored (mod
+        // 180) window is often the real one. Not auto-applied: the caller /
+        // user decides (see tools/extract_factory_cal.py caution block).
         valve_goto_direct(peak - 90.0f, 2.0f, 10000, false);
         motor_rail_off();
-        char ebuf[180];
-        int en = snprintf(ebuf, sizeof(ebuf),
-            "{\"error\":\"implausible offset %.2f (peak %.2f, max %.3f PSI) -- not stored\"}",
-            offset, peak, best_psi);
-        httpd_resp_send(req, ebuf, en);
-        return ESP_OK;
+        out->peak = peak; out->offset = offset; out->max_psi = best_psi;
+        return -3;
     }
 
     g_valve_offset_deg = offset;
@@ -14594,15 +14996,55 @@ static esp_err_t cal_valve_handler(httpd_req_t *req)
     // Park fully closed: 90 deg back from the pressure peak (ball geometry).
     float closed = peak - 90.0f;
     valve_goto_direct(closed, 2.0f, 10000, true);
+    // b480: "off is always off" -- prove the park sealed before declaring
+    // success. Deliberately NOT valve_verify_closed_dry() first: a park that
+    // only seals after a seek-dry rescue is still a MISCALIBRATED frame and
+    // must not clear the suspect flag.
+    float park_psi = cal_pressure_settled_median(3);
+    bool sealed_clean = (park_psi < 0.0f) || (park_psi < LEAK_CLOSED_PSI);
+    if (!sealed_clean)
+        valve_verify_closed_dry("frame-sweep park", true);  // rescue + fault + suspect
     motor_rail_off();
 
-    char buf[280];
-    int n = snprintf(buf, sizeof(buf),
-        "{\"ok\":true,\"peak_deg\":%.2f,\"offset\":%.2f,\"closed_deg\":%.2f,"
-        "\"max_psi\":%.3f,\"motor_dir\":%d,\"flow_start_deg\":%.2f,"
-        "\"cal_start_frame\":%.2f,\"cal_start_stored\":%s}",
-        peak, offset, closed, best_psi, (int)g_valve_motor_dir,
-        flow_start, g_valve_cal_start_frame, cstart_stored ? "true" : "false");
+    out->peak = peak; out->offset = offset; out->closed = closed;
+    out->max_psi = best_psi; out->flow_start = flow_start;
+    out->cstart_stored = cstart_stored;
+    if (!sealed_clean) return -3;
+    valve_frame_suspect_set(false);   // measured, stored, and verified sealed
+    return 0;
+}
+
+static esp_err_t cal_valve_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/json");
+    vframe_sweep_result_t r;
+    int rc = valve_frame_sweep(&r);
+    char buf[300];
+    int n;
+    switch (rc) {
+    case 0:
+        n = snprintf(buf, sizeof(buf),
+            "{\"ok\":true,\"peak_deg\":%.2f,\"offset\":%.2f,\"closed_deg\":%.2f,"
+            "\"max_psi\":%.3f,\"motor_dir\":%d,\"flow_start_deg\":%.2f,"
+            "\"cal_start_frame\":%.2f,\"cal_start_stored\":%s}",
+            r.peak, r.offset, r.closed, r.max_psi, (int)g_valve_motor_dir,
+            r.flow_start, g_valve_cal_start_frame, r.cstart_stored ? "true" : "false");
+        break;
+    case -1:
+        n = snprintf(buf, sizeof(buf),
+            "{\"error\":\"polarity probe: valve never moved -- check motor power/wiring, then retry\"}");
+        break;
+    case -2:
+        n = snprintf(buf, sizeof(buf),
+            "{\"error\":\"no flow (max %.2f PSI) -- turn the water supply ON, then retry\"}",
+            r.max_psi);
+        break;
+    default:
+        n = snprintf(buf, sizeof(buf),
+            "{\"error\":\"implausible offset %.2f (peak %.2f, max %.3f PSI) -- not stored\"}",
+            r.offset, r.peak, r.max_psi);
+        break;
+    }
     httpd_resp_send(req, buf, n);
     return ESP_OK;
 }
@@ -14626,6 +15068,11 @@ static esp_err_t cal_valve_set_handler(httpd_req_t *req)
     }
     g_valve_offset_deg = off;
     valve_offset_nvs_save(off);
+    // b480: an explicitly pushed offset counts as a human vouching for the
+    // frame -- clear the suspect flag. The very next verified close will
+    // re-flag it if the pushed value is wrong (b62944: a bad factory-decode
+    // push put "closed" ON the flow window; the leak check caught it).
+    valve_frame_suspect_set(false);
     char buf[140];
     int n = snprintf(buf, sizeof(buf),
         "{\"ok\":true,\"offset\":%.2f,\"closed_deg\":%.2f,\"open_deg\":%.2f,\"peak_deg\":%.2f}",
@@ -17842,6 +18289,17 @@ static void schedule_fire_check_on_wake(void)
     }
     if (s_web_water_mode != 0) { sched_fire_save(); return; }  // already running
 
+    // b480: a suspect frame cannot reliably CLOSE the valve afterwards --
+    // refuse unattended watering. The catch-up window will expire and mark
+    // the run missed, which HA surfaces. Manual runs remain allowed.
+    if (g_frame_suspect) {
+        ESP_LOGW(TAG, "Scheduled wake: zone %u due but valve frame SUSPECT -- "
+                      "refusing unattended run (recalibrate to clear)",
+                 s_sched_fire.armed_zone);
+        sched_fire_save();
+        return;
+    }
+
     INFO("Scheduled wake: firing armed run zone %u mode %u depth %u/8\" "
          "(epoch %lu) -- clock-independent",
          s_sched_fire.armed_zone, s_sched_fire.armed_mode,
@@ -17919,6 +18377,13 @@ static void schedule_task(void *arg)
                     continue;  // too stale
                 }
                 if (sched_fire_already((uint32_t)fire_t)) continue;     // already ran
+                // b480: refuse unattended watering on a suspect valve frame
+                // (can't trust the close). Window expires -> reported missed.
+                if (g_frame_suspect) {
+                    ESP_LOGW(TAG, "Schedule: entry %u due (zone %u) but valve frame "
+                                  "SUSPECT -- refusing unattended run", i, e->zone);
+                    break;
+                }
                 if (s_web_water_mode != 0) {
                     ESP_LOGW(TAG, "Schedule: entry %u due (zone %u) but watering "
                                   "active -- deferring", i, e->zone);
@@ -19041,6 +19506,7 @@ void irrigoto_stop_and_close(void)
     sensor_rail_on();
     motor_rail_on();
     valve_goto(VALVE_CLOSED_DEG, 2.0f, 10000, true);
+    valve_verify_closed_dry("stop_and_close", true);   // b480
     motor_rail_off();
     sensor_rail_off();
 }
@@ -19059,6 +19525,7 @@ void irrigoto_valve_close(void)
     sensor_rail_on();
     motor_rail_on();
     valve_goto(VALVE_CLOSED_DEG, 2.0f, 10000, true);
+    valve_verify_closed_dry("valve_close", true);   // b480
 }
 
 void irrigoto_valve_open(void)

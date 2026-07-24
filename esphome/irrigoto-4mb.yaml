@@ -1,0 +1,29 @@
+# Irrigoto — local dev wrapper, 4 MB flash variant.
+#
+# Same as irrigoto.yaml but targets OtO units with a 4 MB flash chip
+# (newer hardware revisions — `python -m esptool flash_id` to check):
+#
+#   python -m esphome compile esphome/irrigoto-4mb.yaml
+#   python -m esphome run     esphome/irrigoto-4mb.yaml --device COM4
+#
+# The only differences from the 8 MB dev wrapper are the two
+# substitution overrides below; everything else comes from
+# irrigoto-core.yaml. End users on 4 MB hardware make the same two
+# overrides in their copy of example.yaml (see the comments there).
+
+substitutions:
+  flash_size: 4MB
+  partitions_csv: irrigoto-partitions-4mb.csv
+  # Separate build dir from the 8 MB wrapper so compiling one variant
+  # doesn't clobber the other's sdkconfig/objects. The runtime name
+  # still gets the per-unit MAC suffix appended.
+  device_name: irrigoto4
+
+packages:
+  irrigoto: !include irrigoto-core.yaml
+
+external_components:
+  - source:
+      type: local
+      path: ../components
+    components: [irrigoto]

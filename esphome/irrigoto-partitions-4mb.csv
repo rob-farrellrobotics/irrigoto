@@ -1,0 +1,17 @@
+# Name,   Type, SubType, Offset,  Size, Flags
+# 4 MB variant of irrigoto-partitions.csv, for OtO units whose
+# ESP32-WROOM carries a 4 MB flash chip (newer hardware revisions;
+# check with `python -m esptool flash_id`). Select it by overriding the
+# flash_size/partitions_csv substitutions — see irrigoto-core.yaml.
+#
+# Same structure as the 8 MB table (see its comments for the ota_0
+# offset and dropped-phy_init rationale); only the sizes differ:
+# OTA slots shrink 0x1E0000 -> 0x1B0000 (still ~400 KB of headroom
+# over the current app image, and the same slot size OtO's own 4 MB
+# factory layout uses) and littlefs grows 0x80000 -> 0x90000 to fill
+# the chip exactly to 0x400000. App slots stay 64 KB aligned.
+nvs,      data, nvs,     0x9000,  0x4000,
+otadata,  data, ota,     0xd000,  0x2000,
+ota_0,    app,  ota_0,   0x10000, 0x1B0000,
+ota_1,    app,  ota_1,   0x1C0000,0x1B0000,
+littlefs, data, spiffs,  0x370000,0x90000,

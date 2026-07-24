@@ -6,6 +6,12 @@
 #      your HA host:
 #        - example.yaml                         (this file)
 #        - esphome/irrigoto-partitions.csv      (8 MB OTA partition table)
+#      OtO units ship with either an 8 MB or a 4 MB flash chip (newer
+#      hardware revisions use 4 MB — check yours with
+#      `python -m esptool flash_id`, or see the flash-size step in
+#      docs/new_device_flashing.md). If yours is 4 MB, copy
+#      esphome/irrigoto-partitions-4mb.csv instead and uncomment the
+#      substitutions block below.
 #
 #   2. Make sure /config/esphome/secrets.yaml contains:
 #
@@ -25,8 +31,18 @@
 # main can move at any time; tags are immutable. Each published release is
 # tagged `v<build>` (see the repo's tags for the available builds).
 #
-# Hardware: ESP32-WROOM with 8 MB flash, OtO sprinkler control board.
+# Hardware: ESP32-WROOM with 8 MB or 4 MB flash, OtO sprinkler
+# control board.
 # Source: https://github.com/rob-farrellrobotics/irrigoto
+
+# 4 MB flash units ONLY — uncomment this block (and copy
+# irrigoto-partitions-4mb.csv next to this file instead of the 8 MB
+# CSV). Flashing the default 8 MB layout onto a 4 MB chip fails at
+# first boot because the filesystem partition lies beyond the end of
+# flash.
+#substitutions:
+#  flash_size: 4MB
+#  partitions_csv: irrigoto-partitions-4mb.csv
 
 packages:
   irrigoto:
