@@ -117,9 +117,13 @@ irrigoto/
 │       ├── irrigoto_api.h             <- C ↔ C++ interface
 │       ├── i2c_bus.c/.h               <- I2C driver
 │       ├── storage.c/.h               <- LittleFS persistence
+│       ├── *_html.h                   <- generated web-UI payloads (component
+│       │                                 root so every ESPHome version copies
+│       │                                 them into the build tree)
 │       ├── html/                      <- web UI HTML fragments
-│       │   ├── *.html                 <- editable sources
-│       │   └── *_html.h               <- R"(...)" #include payloads
+│       │   ├── *.html                 <- editable sources (regen.py rebuilds
+│       │   │                             the ../*_html.h payloads)
+│       │   └── regen.py
 │       └── *.py                       <- Python ESPHome entity definitions
 ├── homeassistant/
 │   ├── packages/                      <- HA package YAML (template sensors,

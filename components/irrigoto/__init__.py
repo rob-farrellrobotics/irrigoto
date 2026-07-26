@@ -6,8 +6,6 @@ YAML key: irrigoto
   id: irrigoto   # optional, needed if referenced in lambdas / services
 """
 
-import os
-
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.const import CONF_ID
@@ -16,19 +14,23 @@ from esphome.components.deep_sleep import DeepSleepComponent
 
 CONF_DEEP_SLEEP_ID = "deep_sleep_id"
 
-# HTML fragment "headers" live in ./html/ — they are not real C headers
-# (raw R"...(...)..." string bodies, only valid when #included inside a
-# string literal definition). Two reasons for the subdir:
-#   1. Keeps them out of ESPHome's component-root auto-copy (otherwise
-#      they'd land alongside irrigoto.h in the build tree and risk
-#      being pulled into esphome.h).
-#   2. ESPHome doesn't actually copy subdirs into its build tree at
-#      all, so the compiler reads these straight from the original
-#      source location via the -I flag added below.
-# irrigoto.c references them as bare #include "cal_html.h".
-_HTML_DIR = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "html")
-).replace("\\", "/")
+# HTML fragment "headers" (*_html.h) sit at the component ROOT so
+# ESPHome's standard source copy ships them into the build tree next to
+# irrigoto.c, where its bare #include "cal_html.h" resolves via normal
+# quote-include lookup — no include flags needed. They are not real C
+# headers (raw R"...(...)..." string bodies, only valid when #included
+# inside a string literal definition); nothing includes them except the
+# specific web-handler sites in irrigoto.c, so root placement is safe.
+# The editable .html sources + regen.py stay in ./html/ (not copied to
+# the build tree — not needed there).
+#
+# HISTORY (GitHub issue #4): they used to live in ./html/ with a
+# cg.add_build_flag("-I<abs source path>") escape hatch, because ESPHome
+# never copies component subdirs. ESPHome 2026.7's native ESP-IDF
+# builder (PlatformIO dropped) forwards -D/-W build flags but silently
+# drops -I flags, which broke every build from a clean checkout. Do NOT
+# reintroduce include-path flags for these; root placement is the only
+# mechanism that works across ESPHome versions.
 
 CODEOWNERS = ["@rob-farrellrobotics"]
 DEPENDENCIES = []
@@ -66,10 +68,8 @@ async def to_code(config):
     cg.add_build_flag("-DESPHOME_COMPONENT=1")
     # Silence legacy I2C deprecation warnings (we use it intentionally).
     cg.add_build_flag("-Wno-deprecated-declarations")
-    # Let irrigoto.c find the HTML fragment headers in ./html/ (which
-    # ESPHome doesn't copy into the build tree — the compiler reads
-    # them straight from the original source location).
-    cg.add_build_flag(f"-I{_HTML_DIR}")
+    # NOTE: no -I flags here — see the *_html.h placement note at the
+    # top of this file (ESPHome 2026.7+ drops -I from add_build_flag).
 
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)

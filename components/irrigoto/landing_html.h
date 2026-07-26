@@ -1,4 +1,5 @@
 /* Auto-generated from landing.html -- edit the .html, then run regen.py */
+#ifdef IRRIGOTO_HTML_PAYLOAD
 R"LANDHTML(
 <!DOCTYPE html>
 <html lang="en">
@@ -767,3 +768,4 @@ refreshSchedule(); setInterval(refreshSchedule, 30000);
 </body>
 </html>
 )LANDHTML"
+#endif /* IRRIGOTO_HTML_PAYLOAD */

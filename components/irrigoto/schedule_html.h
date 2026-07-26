@@ -1,4 +1,5 @@
 /* Auto-generated from schedule.html -- edit the .html, then run regen.py */
+#ifdef IRRIGOTO_HTML_PAYLOAD
 R"SCHEDHTML(
 <!DOCTYPE html>
 <html lang="en">
@@ -683,3 +684,4 @@ init();
 </body>
 </html>
 )SCHEDHTML"
+#endif /* IRRIGOTO_HTML_PAYLOAD */

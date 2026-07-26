@@ -12975,6 +12975,13 @@ static char               s_zone_json_buf[3072];
 #define ZONE_WEB_VALVE_STEP_DEG 0.5f  // open-loop valve step per button press (deg)
 #define ZONE_WEB_SETTLE_MS      300   // settle time after valve move before reading PSI
 
+// The *_html.h payloads are guarded raw-string fragments: they expand to
+// the string literal ONLY under this define. That keeps them inert when
+// other translation units include them blindly — ESPHome 2026.7+'s
+// generated esphome.h glob-includes every header it copied from the
+// component dir (GitHub issue #4).
+#define IRRIGOTO_HTML_PAYLOAD 1
+
 static const char s_zone_html[] =
 #include "zone_setup_html.h"
 ;

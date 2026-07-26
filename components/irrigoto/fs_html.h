@@ -1,4 +1,5 @@
-/* fs_html.h -- OtO filesystem browser page */
+/* Auto-generated from fs.html -- edit the .html, then run regen.py */
+#ifdef IRRIGOTO_HTML_PAYLOAD
 R"FSHTML(
 <!DOCTYPE html>
 <html lang="en">
@@ -237,3 +238,4 @@ loadTree();
 </body>
 </html>
 )FSHTML"
+#endif /* IRRIGOTO_HTML_PAYLOAD */

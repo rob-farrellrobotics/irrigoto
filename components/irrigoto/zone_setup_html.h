@@ -1,4 +1,5 @@
-/* Auto-generated from zone_setup.html -- do not edit directly */
+/* Auto-generated from zone_setup.html -- edit the .html, then run regen.py */
+#ifdef IRRIGOTO_HTML_PAYLOAD
 R"ZONEHTML(
 <!DOCTYPE html>
 <html lang="en">
@@ -1143,3 +1144,4 @@ poll();
 </body>
 </html>
 )ZONEHTML"
+#endif /* IRRIGOTO_HTML_PAYLOAD */

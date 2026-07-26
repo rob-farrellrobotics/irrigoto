@@ -1,4 +1,5 @@
-/* cal_html.h -- OtO calibration page */
+/* Auto-generated from cal.html -- edit the .html, then run regen.py */
+#ifdef IRRIGOTO_HTML_PAYLOAD
 R"CALHTML(
 <!DOCTYPE html>
 <html lang="en">
@@ -554,3 +555,4 @@ loadEncoder();
 </body>
 </html>
 )CALHTML"
+#endif /* IRRIGOTO_HTML_PAYLOAD */
