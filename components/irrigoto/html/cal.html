@@ -100,6 +100,8 @@ tr:last-child td{border-bottom:none;}
 </header>
 <main>
 
+<div class="note" style="margin:0 0 16px;padding:10px 12px;background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius-sm)">Run <b>Pressure &rarr; Throw</b> first &mdash; complete it before speed cal, jog cal, or zone creation. The other calibrations use its pressure map to open the valve; until it completes they run with the valve closed (dry).</div>
+
 <!-- Pressure calibration -->
 <section id="pressure">
   <div class="sec-hdr"><span class="sec-title">Pressure &rarr; Throw</span></div>
@@ -146,7 +148,7 @@ tr:last-child td{border-bottom:none;}
 <section id="speed">
   <div class="sec-hdr"><span class="sec-title">Nozzle Speed</span></div>
   <div class="card">
-    <div class="note">Runs the nozzle at each PWM duty level and measures deg/sec from the encoder. CW then CCW. Takes ~4 minutes. Connect water supply first &mdash; valve opens to ~30% pressure.</div>
+    <div class="note">Runs the nozzle at each PWM duty level and measures deg/sec from the encoder. CW then CCW. Takes ~4 minutes. With a completed pressure cal (and water connected) the valve opens to ~30% pressure; without one it runs dry with the valve closed.</div>
     <div class="btn-row">
       <button class="btn btn-green" id="noz-start-btn" onclick="nozStart()">&#9654; Run speed cal</button>
     </div>
@@ -162,7 +164,7 @@ tr:last-child td{border-bottom:none;}
 <section id="jog">
   <div class="sec-hdr"><span class="sec-title">Jog Pulse Calibration</span></div>
   <div class="card">
-    <div class="note">Measures how far the nozzle moves per PWM pulse under water load. Run AFTER nozzle speed cal. Valve opens to ~30% pressure &mdash; connect water supply first.</div>
+    <div class="note">Measures how far the nozzle moves per PWM pulse under water load. Run AFTER nozzle speed cal. With a completed pressure cal (and water connected) the valve opens to ~30% pressure; without one it runs dry with the valve closed.</div>
     <div class="btn-row">
       <button class="btn btn-green" id="jog-start-btn" onclick="jogStart()">&#9654; Run jog cal</button>
       <button class="btn btn-red" id="jog-cancel-btn" style="display:none" onclick="jogCancel()">&#9632; Cancel</button>

@@ -682,17 +682,21 @@ template:
       - name: <<DEV_DASH>> zone 1 cumulative depth
         unique_id: <<DEV_USC>>_zone_1_cumulative_depth_v2
         default_entity_id: sensor.<<DEV_USC>>_zone_1_cumulative_depth
-        unit_of_measurement: "cm"
-        # NOT device_class: precipitation -- HA auto-converts cm <-> in
-        # based on the user's measurement-system setting, which forced
-        # the chart axis into inches on an imperial install. Bare unit
-        # string is shown as-is. state_class alone is enough for stats.
+        unit_of_measurement: "mm"
+        # device_class: precipitation lets HA present this in whatever
+        # unit the instance is configured for (metric -> mm, imperial
+        # -> in) instead of pinning the axis to one system. An earlier
+        # revision dropped the device_class and hardcoded cm to stop an
+        # imperial install converting to inches -- but following the
+        # instance's own unit setting IS the wanted behaviour, and cm
+        # is a poor fit either way (a 1/8" run is 0.32 cm).
+        device_class: precipitation
         state_class: total_increasing
         icon: mdi:waves-arrow-up
         state: >-
           {% set d_mm = trigger.event.data.actual_avg_depth_mm | float(0) %}
           {{ ((states('sensor.<<DEV_USC>>_zone_1_cumulative_depth') | float(0)) +
-              (d_mm / 10)) | round(3) }}
+              d_mm) | round(3) }}
   - trigger:
       - trigger: event
         event_type: esphome.<<DEV_DASH>>_watering_complete
@@ -711,17 +715,21 @@ template:
       - name: <<DEV_DASH>> zone 2 cumulative depth
         unique_id: <<DEV_USC>>_zone_2_cumulative_depth_v2
         default_entity_id: sensor.<<DEV_USC>>_zone_2_cumulative_depth
-        unit_of_measurement: "cm"
-        # NOT device_class: precipitation -- HA auto-converts cm <-> in
-        # based on the user's measurement-system setting, which forced
-        # the chart axis into inches on an imperial install. Bare unit
-        # string is shown as-is. state_class alone is enough for stats.
+        unit_of_measurement: "mm"
+        # device_class: precipitation lets HA present this in whatever
+        # unit the instance is configured for (metric -> mm, imperial
+        # -> in) instead of pinning the axis to one system. An earlier
+        # revision dropped the device_class and hardcoded cm to stop an
+        # imperial install converting to inches -- but following the
+        # instance's own unit setting IS the wanted behaviour, and cm
+        # is a poor fit either way (a 1/8" run is 0.32 cm).
+        device_class: precipitation
         state_class: total_increasing
         icon: mdi:waves-arrow-up
         state: >-
           {% set d_mm = trigger.event.data.actual_avg_depth_mm | float(0) %}
           {{ ((states('sensor.<<DEV_USC>>_zone_2_cumulative_depth') | float(0)) +
-              (d_mm / 10)) | round(3) }}
+              d_mm) | round(3) }}
   - trigger:
       - trigger: event
         event_type: esphome.<<DEV_DASH>>_watering_complete
@@ -740,17 +748,21 @@ template:
       - name: <<DEV_DASH>> zone 3 cumulative depth
         unique_id: <<DEV_USC>>_zone_3_cumulative_depth_v2
         default_entity_id: sensor.<<DEV_USC>>_zone_3_cumulative_depth
-        unit_of_measurement: "cm"
-        # NOT device_class: precipitation -- HA auto-converts cm <-> in
-        # based on the user's measurement-system setting, which forced
-        # the chart axis into inches on an imperial install. Bare unit
-        # string is shown as-is. state_class alone is enough for stats.
+        unit_of_measurement: "mm"
+        # device_class: precipitation lets HA present this in whatever
+        # unit the instance is configured for (metric -> mm, imperial
+        # -> in) instead of pinning the axis to one system. An earlier
+        # revision dropped the device_class and hardcoded cm to stop an
+        # imperial install converting to inches -- but following the
+        # instance's own unit setting IS the wanted behaviour, and cm
+        # is a poor fit either way (a 1/8" run is 0.32 cm).
+        device_class: precipitation
         state_class: total_increasing
         icon: mdi:waves-arrow-up
         state: >-
           {% set d_mm = trigger.event.data.actual_avg_depth_mm | float(0) %}
           {{ ((states('sensor.<<DEV_USC>>_zone_3_cumulative_depth') | float(0)) +
-              (d_mm / 10)) | round(3) }}
+              d_mm) | round(3) }}
   - trigger:
       - trigger: event
         event_type: esphome.<<DEV_DASH>>_watering_complete
@@ -769,17 +781,21 @@ template:
       - name: <<DEV_DASH>> zone 4 cumulative depth
         unique_id: <<DEV_USC>>_zone_4_cumulative_depth_v2
         default_entity_id: sensor.<<DEV_USC>>_zone_4_cumulative_depth
-        unit_of_measurement: "cm"
-        # NOT device_class: precipitation -- HA auto-converts cm <-> in
-        # based on the user's measurement-system setting, which forced
-        # the chart axis into inches on an imperial install. Bare unit
-        # string is shown as-is. state_class alone is enough for stats.
+        unit_of_measurement: "mm"
+        # device_class: precipitation lets HA present this in whatever
+        # unit the instance is configured for (metric -> mm, imperial
+        # -> in) instead of pinning the axis to one system. An earlier
+        # revision dropped the device_class and hardcoded cm to stop an
+        # imperial install converting to inches -- but following the
+        # instance's own unit setting IS the wanted behaviour, and cm
+        # is a poor fit either way (a 1/8" run is 0.32 cm).
+        device_class: precipitation
         state_class: total_increasing
         icon: mdi:waves-arrow-up
         state: >-
           {% set d_mm = trigger.event.data.actual_avg_depth_mm | float(0) %}
           {{ ((states('sensor.<<DEV_USC>>_zone_4_cumulative_depth') | float(0)) +
-              (d_mm / 10)) | round(3) }}
+              d_mm) | round(3) }}
   - trigger:
       - trigger: event
         event_type: esphome.<<DEV_DASH>>_watering_complete
@@ -798,17 +814,21 @@ template:
       - name: <<DEV_DASH>> zone 5 cumulative depth
         unique_id: <<DEV_USC>>_zone_5_cumulative_depth_v2
         default_entity_id: sensor.<<DEV_USC>>_zone_5_cumulative_depth
-        unit_of_measurement: "cm"
-        # NOT device_class: precipitation -- HA auto-converts cm <-> in
-        # based on the user's measurement-system setting, which forced
-        # the chart axis into inches on an imperial install. Bare unit
-        # string is shown as-is. state_class alone is enough for stats.
+        unit_of_measurement: "mm"
+        # device_class: precipitation lets HA present this in whatever
+        # unit the instance is configured for (metric -> mm, imperial
+        # -> in) instead of pinning the axis to one system. An earlier
+        # revision dropped the device_class and hardcoded cm to stop an
+        # imperial install converting to inches -- but following the
+        # instance's own unit setting IS the wanted behaviour, and cm
+        # is a poor fit either way (a 1/8" run is 0.32 cm).
+        device_class: precipitation
         state_class: total_increasing
         icon: mdi:waves-arrow-up
         state: >-
           {% set d_mm = trigger.event.data.actual_avg_depth_mm | float(0) %}
           {{ ((states('sensor.<<DEV_USC>>_zone_5_cumulative_depth') | float(0)) +
-              (d_mm / 10)) | round(3) }}
+              d_mm) | round(3) }}
   - trigger:
       - trigger: event
         event_type: esphome.<<DEV_DASH>>_watering_complete
@@ -827,17 +847,21 @@ template:
       - name: <<DEV_DASH>> zone 6 cumulative depth
         unique_id: <<DEV_USC>>_zone_6_cumulative_depth_v2
         default_entity_id: sensor.<<DEV_USC>>_zone_6_cumulative_depth
-        unit_of_measurement: "cm"
-        # NOT device_class: precipitation -- HA auto-converts cm <-> in
-        # based on the user's measurement-system setting, which forced
-        # the chart axis into inches on an imperial install. Bare unit
-        # string is shown as-is. state_class alone is enough for stats.
+        unit_of_measurement: "mm"
+        # device_class: precipitation lets HA present this in whatever
+        # unit the instance is configured for (metric -> mm, imperial
+        # -> in) instead of pinning the axis to one system. An earlier
+        # revision dropped the device_class and hardcoded cm to stop an
+        # imperial install converting to inches -- but following the
+        # instance's own unit setting IS the wanted behaviour, and cm
+        # is a poor fit either way (a 1/8" run is 0.32 cm).
+        device_class: precipitation
         state_class: total_increasing
         icon: mdi:waves-arrow-up
         state: >-
           {% set d_mm = trigger.event.data.actual_avg_depth_mm | float(0) %}
           {{ ((states('sensor.<<DEV_USC>>_zone_6_cumulative_depth') | float(0)) +
-              (d_mm / 10)) | round(3) }}
+              d_mm) | round(3) }}
   - trigger:
       - trigger: event
         event_type: esphome.<<DEV_DASH>>_watering_complete
@@ -856,17 +880,21 @@ template:
       - name: <<DEV_DASH>> zone 7 cumulative depth
         unique_id: <<DEV_USC>>_zone_7_cumulative_depth_v2
         default_entity_id: sensor.<<DEV_USC>>_zone_7_cumulative_depth
-        unit_of_measurement: "cm"
-        # NOT device_class: precipitation -- HA auto-converts cm <-> in
-        # based on the user's measurement-system setting, which forced
-        # the chart axis into inches on an imperial install. Bare unit
-        # string is shown as-is. state_class alone is enough for stats.
+        unit_of_measurement: "mm"
+        # device_class: precipitation lets HA present this in whatever
+        # unit the instance is configured for (metric -> mm, imperial
+        # -> in) instead of pinning the axis to one system. An earlier
+        # revision dropped the device_class and hardcoded cm to stop an
+        # imperial install converting to inches -- but following the
+        # instance's own unit setting IS the wanted behaviour, and cm
+        # is a poor fit either way (a 1/8" run is 0.32 cm).
+        device_class: precipitation
         state_class: total_increasing
         icon: mdi:waves-arrow-up
         state: >-
           {% set d_mm = trigger.event.data.actual_avg_depth_mm | float(0) %}
           {{ ((states('sensor.<<DEV_USC>>_zone_7_cumulative_depth') | float(0)) +
-              (d_mm / 10)) | round(3) }}
+              d_mm) | round(3) }}
   - trigger:
       - trigger: event
         event_type: esphome.<<DEV_DASH>>_watering_complete
@@ -885,17 +913,21 @@ template:
       - name: <<DEV_DASH>> zone 8 cumulative depth
         unique_id: <<DEV_USC>>_zone_8_cumulative_depth_v2
         default_entity_id: sensor.<<DEV_USC>>_zone_8_cumulative_depth
-        unit_of_measurement: "cm"
-        # NOT device_class: precipitation -- HA auto-converts cm <-> in
-        # based on the user's measurement-system setting, which forced
-        # the chart axis into inches on an imperial install. Bare unit
-        # string is shown as-is. state_class alone is enough for stats.
+        unit_of_measurement: "mm"
+        # device_class: precipitation lets HA present this in whatever
+        # unit the instance is configured for (metric -> mm, imperial
+        # -> in) instead of pinning the axis to one system. An earlier
+        # revision dropped the device_class and hardcoded cm to stop an
+        # imperial install converting to inches -- but following the
+        # instance's own unit setting IS the wanted behaviour, and cm
+        # is a poor fit either way (a 1/8" run is 0.32 cm).
+        device_class: precipitation
         state_class: total_increasing
         icon: mdi:waves-arrow-up
         state: >-
           {% set d_mm = trigger.event.data.actual_avg_depth_mm | float(0) %}
           {{ ((states('sensor.<<DEV_USC>>_zone_8_cumulative_depth') | float(0)) +
-              (d_mm / 10)) | round(3) }}
+              d_mm) | round(3) }}
 
   # Score also lives in its own trigger group so it gets a clean
   # per-event update with measurement state_class. The score sensor

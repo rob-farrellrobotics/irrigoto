@@ -634,10 +634,14 @@ esp_err_t storage_water_save(uint16_t zone_id, const water_run_t *run)
                    " \"arc_s\": %.1f, \"arc_e\": %.1f, \"depth_mm\": %.3f, "
                    // b281: per-ring valve angle (for downstream gap analysis)
                    // and back-computed supply pressure during this ring.
-                   "\"valve_deg\": %.2f, \"supply_psi_est\": %.3f}%s\n",
+                   "\"valve_deg\": %.2f, \"supply_psi_est\": %.3f, "
+                   // b498: first/last in-sweep pressure sample -- the per-ring
+                   // derivative that reveals well-pump cycling.
+                   "\"head_psi\": %.4f, \"tail_psi\": %.4f}%s\n",
                 r->throw_mm, r->avg_psi, r->actual_throw_mm, r->dps, r->active_deg,
                 r->arc_start_deg, r->arc_end_deg, r->depth_mm,
                 r->valve_deg, r->supply_psi_est,
+                r->head_psi, r->tail_psi,
                 (i < (int)run->num_rings-1) ? "," : "");
     }
     fprintf(f, "  ]\n}\n");
@@ -679,7 +683,9 @@ esp_err_t storage_water_load(uint16_t zone_id, water_run_t *run)
         pp = strchr(pp, '['); if (pp) pp++;
         for (int i = 0; i < run->num_rings && pp && *pp; i++) {
             pp = strchr(pp, '{'); if (!pp) break;
-            char obj[256]; int depth=0, oj=0;
+            // b498: 256 -> 320. head/tail fields pushed the per-ring JSON
+            // line to ~240 chars; keep headroom so a ring never truncates.
+            char obj[320]; int depth=0, oj=0;
             const char *op = pp;
             while (*op && oj < (int)sizeof(obj)-1) {
                 obj[oj++] = *op;
@@ -701,6 +707,9 @@ esp_err_t storage_water_load(uint16_t zone_id, water_run_t *run)
             //       (zeroes if loading a pre-b281 file)
             if (json_get_float(obj, "valve_deg",        &fv)) run->rings[i].valve_deg        = fv;
             if (json_get_float(obj, "supply_psi_est",   &fv)) run->rings[i].supply_psi_est   = fv;
+            // b498: head/tail samples (zeroes if loading a pre-b498 file)
+            if (json_get_float(obj, "head_psi",         &fv)) run->rings[i].head_psi         = fv;
+            if (json_get_float(obj, "tail_psi",         &fv)) run->rings[i].tail_psi         = fv;
             pp = op;
         }
     }

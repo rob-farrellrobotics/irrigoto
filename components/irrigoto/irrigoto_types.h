@@ -53,6 +53,16 @@ typedef struct {
     float arc_end_deg;     // actual CW sweep end for this ring
     float depth_mm;        // estimated precipitation depth per pass [mm]
     float valve_deg;       // b281: valve angle held for this ring (for supply back-calc)
+    // b497: pressure at the START and END of this ring's sweep. avg_psi alone
+    // averages the shape away: a cycling well pump (~45-60 psi every ~20 gal on
+    // ba1f88) rises through one ring and falls through the next, and both
+    // record the same mean. Head/tail give a per-ring DERIVATIVE -- enough to
+    // tell a supply peak being climbed from one being left behind, which is
+    // what the throw-aware re-pick needs in order to fire a short ring when it
+    // can actually reach its target. b498: recorded for real (first/last sweep
+    // samples) and consumed by smooth_scheduler_pick's trend extrapolation.
+    float head_psi;        // first in-sweep sample for this ring
+    float tail_psi;        // last in-sweep sample for this ring
     float supply_psi_est;  // b281: cal-back-computed supply pressure during this ring
                            //       (avg_psi / f(valve_deg)); 0.0 if cal insufficient.
                            //       Diagnoses pump-supply dynamics on well-fed systems.

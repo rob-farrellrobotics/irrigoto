@@ -526,6 +526,15 @@ function drawHeatMap(W, H, cx, cy, maxR) {
       }
       if(hss!==null)hspans.push({lo:(arcStart+hss+360)%360,sp:arcSpan-hss});
       hspans.forEach(hs=>{
+        // b501: skip degenerate spans. The sweep tests bearing 0 and 360
+        // twice (the +HSTEP overshoot closes wrap runs), so an inside-run
+        // that STARTS on the final duplicated iterations yields a trailing
+        // span of zero/negative width (sp = arcSpan - hss <= 0). The
+        // he<=hl wrap adjustment below then promoted exactly those spans
+        // to FULL 360-degree annuli -- Combined's north-corner sliver at
+        // bearing ~0 painted every such ring as a complete circle in
+        // Predict, which the firmware never waters.
+        if(hs.sp<=0.01)return;
         let he=(hs.lo+hs.sp-90)*Math.PI/180;
         const hl=(hs.lo-90)*Math.PI/180;
         if(he<=hl)he+=2*Math.PI;

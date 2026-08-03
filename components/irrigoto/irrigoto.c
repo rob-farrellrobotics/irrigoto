@@ -22,6 +22,7 @@
 #include "esp_sleep.h"
 #include "esp_timer.h"    // b467: esp_timer_get_time() for /api/all uptime_s
 #include "esp_system.h"   // esp_reset_reason() for boot_diag
+#include "esp_heap_caps.h" // b486: largest-free-block for /api/all heap diag
 #include "driver/uart.h"
 #include "driver/i2c.h"
 #include "i2c_bus.h"
@@ -178,6 +179,18 @@ static led_expander_t s_led_expander = LED_EXP_UNKNOWN;
 static TickType_t          s_last_activity     = 0;  // tick count of last user input
 static volatile TickType_t s_last_web_req_tick = 0;  // tick of last zone web HTTP request
 static volatile bool s_ota_in_progress = false;  // true during OTA -- suppress sleep
+// b495: true while a valve frame sweep is running. The sweep executes INLINE in
+// the HTTP handler for 2-4 minutes with the valve OPEN, and it never touches
+// s_wcal.state -- so the b490/b491 no-sleep guard did not cover it and the
+// device could deep-sleep mid-sweep with water running. An external keep-alive
+// cannot substitute, because the sweep blocks the very web server that would
+// receive it (observed 2026-07-28: two of three repeatability runs returned
+// empty responses while the device napped mid-sweep). Guarded in
+// check_inactivity with a hard time bound so a wedged sweep cannot block sleep
+// indefinitely.
+static volatile bool       s_frame_sweep_active = false;
+static volatile TickType_t s_frame_sweep_start  = 0;
+#define FRAME_SWEEP_MAX_MS (10u * 60u * 1000u)
 static bool          s_sleep_disabled  = false;  // user-toggled; persisted in NVS as "pm_disable"
 // Configurable inactivity threshold (ms) and post-sleep wake timer (s).
 // Loaded from NVS at boot; defaults match the legacy compile-time constants.
@@ -471,6 +484,13 @@ static bool g_frame_suspect = false;
 // the reference frame on hardware whose magnet mounts at a random rotation --
 // the first pressure cal must measure the frame before trusting any angle.
 static bool g_valve_frame_calibrated = false;
+// b490: the saved pressure/throw cal was completed on the await timeout using
+// throw anchors INHERITED from the previous cal rather than freshly measured
+// ones. The map is usable (nozzle p->t physics is supply-independent; only the
+// valve v->p half was re-measured) but unconfirmed, so it is surfaced in red on
+// the web landing page until a proper cal replaces it. Persisted in
+// "vframe"/"cal_incomp" so a reboot cannot quietly hide it.
+static bool g_cal_incomplete = false;
 // b480/b481: pressure-verified closure ("off is always off"); defined with the
 // fault-forensics helpers, called from cal teardowns + sleep paths above it.
 static bool valve_verify_closed_dry(const char *ctx, bool allow_motor);
@@ -501,6 +521,40 @@ static int8_t g_nozzle_motor_dir = +1;
 #define VALVE_CAL_START_DEG (g_valve_cal_start_frame + g_valve_offset_deg) // pressure begins rising here (b474: per-unit, default 263)
 #define VALVE_CAL_STEP_DEG    1.0f   // finer step in active pressure range
 #define WATER_MIN_FLOW_PSI    0.30f  // below this PSI after valve open = no detectable flow, skip ring
+// b497: cap on re-firing a ring for THROW deficit alone (see select_next_ring).
+// Once a ring holds this multiple of its target depth, a short throw no longer
+// keeps it eligible -- more water cannot lengthen a throw the valve physically
+// cannot make. 2x leaves room for a genuine catch-up pass or two (a well pump
+// cycling between peaks and valleys can make one sweep read short) while
+// bounding the 44x over-water observed on ba1f88.
+#define WATER_THROW_REFIRE_DEPTH_X  4.0f   // far backstop only (was 44x on ba1f88)
+// b497: consecutive throw-only re-fires that fail to improve a ring's best
+// throw ratio before it stops being re-armed. b297 deliberately re-fires an
+// under-throwing ring so it can catch a supply peak (Rob's well cycles ~45-60
+// psi every ~20 gal), and that must keep working -- a ring that catches a peak
+// improves immediately and its counter resets. A ring at the valve's minimum
+// opening never improves (ba1f88 ring 32: 0.53/0.56/0.70, never near 0.90) and
+// gives up after this many fruitless attempts instead of watering forever.
+#define WATER_THROW_REFIRE_NOIMP_MAX  3
+#define WATER_THROW_IMPROVE_EPS       0.02f  // ratio gain that counts as progress
+// b499: trigger-aware peak hunting for the throw-recovery endgame. A pressure-
+// switch well pump only starts on drawdown below cut-in: with the valve closed
+// and the pump idle, tank pressure NEVER rises, so "wait for supply to
+// recover" is only meaningful while the pump is confirmed running (positive
+// intra-ring supply trend). When it is, a closed-valve dwell lets the pump
+// fill unopposed toward cut-out; when it is not, the only way up is to keep
+// drawing until the switch trips -- so fire the shortest remaining ring as
+// the trigger.
+#define WATER_SUPPLY_TREND_EPS   0.05f  // supply-psi rise across a ring that means "pump running"
+#define WATER_DWELL_MIN_S        15
+#define WATER_DWELL_MAX_S        120
+#define WATER_DWELL_MAX_PER_PASS 2
+static float   s_throw_best_ratio[WATER_RUN_MAX_RINGS];
+static uint8_t s_throw_noimp[WATER_RUN_MAX_RINGS];
+void irrigoto_throw_refire_reset(void)
+{
+    for (int i = 0; i < WATER_RUN_MAX_RINGS; i++) { s_throw_best_ratio[i] = 0.0f; s_throw_noimp[i] = 0; }
+}
 // b480: flow threshold for "off is always off" closure verification and the
 // scan's dry-at-closed invariant. Sits at ONSET_PSI -- just above the no-flow
 // floor -- so sensor noise can't cry leak. See valve_verify_closed_dry().
@@ -1842,6 +1896,20 @@ static void valve_offset_nvs_save(float off)
 
 // b480: persist + flip the frame-suspect flag (see g_frame_suspect). Set on
 // any leak-at-closed detection; cleared only by a successful frame cal.
+// b490: persist + flip the incomplete-cal marker (see g_cal_incomplete).
+static void cal_incomplete_set(bool on)
+{
+    if (g_cal_incomplete == on) return;
+    g_cal_incomplete = on;
+    nvs_handle_t h;
+    if (nvs_open("vframe", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, "cal_incomp", on ? 1 : 0);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    ESP_LOGW(TAG, "Pressure cal incomplete flag -> %s", on ? "SET" : "cleared");
+}
+
 static void valve_frame_suspect_set(bool on)
 {
     if (g_frame_suspect == on) return;
@@ -1905,6 +1973,13 @@ static void valve_offset_nvs_load(void)
         ESP_LOGW(TAG, "Valve frame SUSPECT flag loaded from NVS -- scheduled "
                       "watering refused until recalibrated");
     }
+    // b490: incomplete-cal marker (inherited throw anchors) also survives.
+    uint8_t inc = 0;
+    if (nvs_get_u8(h, "cal_incomp", &inc) == ESP_OK && inc) {
+        g_cal_incomplete = true;
+        ESP_LOGW(TAG, "Pressure cal marked INCOMPLETE (inherited throw anchors) "
+                      "-- re-run the cal and enter measured throws");
+    }
     // b474: per-unit flow-onset (frame deg). Plausibility-gated to 30-70 deg
     // before the peak (frame 306.7) so a garbage read can't lower the floor
     // into the closed region. Absent/out-of-range => keep the 263 default.
@@ -1949,6 +2024,45 @@ static float cal_read_pressure_avg(void)
 // rejects the brief water-hammer / valve-motion transients that fooled the
 // b390 valve-frame sweep (a single spike latched the argmax ~6 deg past the
 // true peak). Returns -1 if no sample read.
+// b490: rolling pressure window for the throw anchors.
+//
+// The anchor used to be ONE reading taken at the moment the operator submits --
+// minutes after they actually eyeballed the spray, and vulnerable to a
+// momentary dip (ba1f88 2026-07-28: anchor 5.597 PSI against a 7.712 scan
+// peak, which tilted the fit and cost throw). A supervisor task samples at
+// ~1 Hz while the valve is held open for measuring; the handler then takes the
+// MEDIAN of the last ~20 s, which is both robust to transients and
+// time-correlated with what the operator just watched.
+#define WCAL_PSI_WIN_N 20                 // 20 samples @ 1 Hz = last ~20 s
+static float   s_wcal_psi_ring[WCAL_PSI_WIN_N];
+static uint8_t s_wcal_psi_cnt = 0;
+static uint8_t s_wcal_psi_head = 0;
+
+static void wcal_psi_ring_reset(void) { s_wcal_psi_cnt = 0; s_wcal_psi_head = 0; }
+
+static void wcal_psi_ring_push(float p)
+{
+    if (p < 0.0f) return;
+    s_wcal_psi_ring[s_wcal_psi_head] = p;
+    s_wcal_psi_head = (uint8_t)((s_wcal_psi_head + 1) % WCAL_PSI_WIN_N);
+    if (s_wcal_psi_cnt < WCAL_PSI_WIN_N) s_wcal_psi_cnt++;
+}
+
+// Median of the window; -1 when nothing has been sampled yet (caller then
+// falls back to a fresh instantaneous read).
+static float wcal_psi_ring_median(void)
+{
+    if (s_wcal_psi_cnt == 0) return -1.0f;
+    float v[WCAL_PSI_WIN_N];
+    for (int i = 0; i < s_wcal_psi_cnt; i++) v[i] = s_wcal_psi_ring[i];
+    for (int i = 1; i < s_wcal_psi_cnt; i++) {
+        float key = v[i]; int j = i - 1;
+        while (j >= 0 && v[j] > key) { v[j+1] = v[j]; j--; }
+        v[j+1] = key;
+    }
+    return v[s_wcal_psi_cnt / 2];
+}
+
 static float cal_pressure_settled_median(int n)
 {
     if (n < 1) n = 1;
@@ -2013,13 +2127,29 @@ typedef enum {
 
 static struct {
     wcal_state_t state;
-    char         msg[128];
+    char         msg[192];           // b493: 128 truncated the timeout message
+    // b493: when the await parks the valve for safety the live pressure window
+    // goes to zero (no flow), so the anchor median is FROZEN at park time --
+    // that value is from while water was running, i.e. the pressure that
+    // actually produced the throw the operator measured.
+    float        anchor_psi_frozen;
+    bool         anchor_frozen;
+    // b494: throw-only re-anchor -- rescale the SAVED map to a freshly measured
+    // throw without re-running the pressure scan.
+    bool         reanchor_only;
     int          progress;
     pressure_map_t pmap;
     float          pmap_open_psi;
     float          pmap_max_throw;
     float          pmap_low_psi;     // b385: low throw anchor (pressure at the
     float          pmap_low_throw;   //       short opening) for two-anchor fit
+    bool           incomplete;       // b490: finished on the await timeout with
+                                     //       INHERITED throw anchors, not
+                                     //       operator-measured ones
+    // b492: discovery-phase result, surfaced in /cal/status so a short or
+    // sparse scan can be diagnosed directly (a supply dip during discovery
+    // shows up as disc_end well below the frame's open angle).
+    float          disc_baseline, disc_start, disc_end, disc_peak;
 } s_wcal;
 
 static void wcal_reset(void) { memset(&s_wcal, 0, sizeof(s_wcal)); }
@@ -2130,22 +2260,52 @@ static int cal_post_process_scan(pressure_map_t *m)
 // of the ~982mm "floor" on this ground-mounted unit. Anchoring the curve with
 // TWO measured points (a low opening and full open) gives the fit a real slope
 // AND intercept instead of forcing it through the origin.
-static void cal_apply_two_anchor_throw(pressure_map_t *pm,
-                                       float psi_lo, float throw_lo,
-                                       float psi_hi, float throw_hi)
+// b489: returns the high-anchor pressure actually used, so the caller can tell
+// the user when supply drift forced it away from the submitted reading.
+//
+// The high anchor is ONE instantaneous reading taken when the user submits the
+// measured throw -- minutes after the scan, after they walked out to the
+// sprinkler and back. Supply pressure moves in that window. On ba1f88
+// (2026-07-28) the anchor read 5.597 PSI while the scan had peaked at 7.712,
+// so 13 of 35 points sat above the anchor and the unbounded linear fit claimed
+// 48.1 ft of throw for a measured 30.0 ft.
+//
+// Two guards: pair the user's measured max throw with the scan's OWN max
+// pressure (both ends of the fit then come from the same data), and clamp the
+// result to the calibrated range -- everything past the high anchor is
+// extrapolation from data nobody validated. A too-steep slope under-opens the
+// valve for a given target throw, so this showed up as short outer rings.
+static float cal_apply_two_anchor_throw(pressure_map_t *pm,
+                                        float psi_lo, float throw_lo,
+                                        float psi_hi, float throw_hi)
 {
+    float scan_max = 0.0f;
+    for (int i = 0; i < (int)pm->num_points; i++)
+        if (pm->pressure_psi[i] > scan_max) scan_max = pm->pressure_psi[i];
+    if (scan_max > psi_hi + 0.01f)
+        ESP_LOGW(TAG, "cal: scan peaked at %.2f PSI vs anchor %.2f -- supply moved "
+                      "during cal; check the result", scan_max, psi_hi);
     if (psi_hi - psi_lo < 0.05f) {
         // Anchors too close in pressure to define a slope: fall back to the
         // legacy proportional ray off the high anchor rather than divide by ~0.
         for (int i = 0; i < (int)pm->num_points; i++)
             pm->throw_mm[i] = (psi_hi > 0) ? pm->pressure_psi[i] / psi_hi * throw_hi : 0.0f;
-        return;
+        return scan_max;
     }
+    // b490: NO CLAMP. Throw rises with pressure (range ~ v^2, v ~ sqrt(P)), so
+    // p->t legitimately extrapolates above the anchor -- the supply is often
+    // stronger during watering than it happened to be at cal time, and capping
+    // would make the firmware refuse to believe the reach it actually has.
+    // b489 clamped here; that was wrong AND ineffective -- it hid the symptom
+    // while leaving the slope (the real defect) untouched, so the under-throw
+    // it was meant to fix remained. The slope is fixed at the source now, by
+    // anchoring on the rolling window median instead of one late reading.
     float slope = (throw_hi - throw_lo) / (psi_hi - psi_lo);
     for (int i = 0; i < (int)pm->num_points; i++) {
         float t = throw_lo + (pm->pressure_psi[i] - psi_lo) * slope;
         pm->throw_mm[i] = (t > 0.0f) ? t : 0.0f;
     }
+    return scan_max;
 }
 
 // Adam 6114-E / v420 local fix: after /cal/valve the calibrated valve frame can
@@ -2223,9 +2383,40 @@ static int cal_do_pressure_scan(pressure_map_t *map, bool is_web)
     // legitimately exceed 360 (offset > ~+49 puts the active band across the
     // encoder wrap). VALVE_OPEN_DEG + 2 below is the frame-correct bound.
     float fine_end   = det_end + 10.0f;
-    float fine_end_capped = fminf(fine_end, VALVE_OPEN_DEG + 2.0f);
+    // b492: take the LARGER of the discovery-derived end and the frame's own
+    // full-open bound -- was fminf, which let one bad discovery sample truncate
+    // the whole cal.
+    //
+    // Discovery samples at coarse 10 deg steps and calls an angle "active" only
+    // if it beats baseline + 0.15 PSI. A momentary supply dip (or a failed
+    // pressure read) during those few samples drops det_end, and the fine scan
+    // then stops short of the pressures the sprinkler can actually reach.
+    // ba1f88 2026-07-28: discovery swept to 438 deg but reported det_end 372.8,
+    // so the scan ended at 382.8 instead of ~397 -- 20 points topping out at
+    // 6.08 PSI / 28.3 ft, on a zone that needs 32.6 ft. The outer rings then
+    // have no valve angle to reach for and under-throw.
+    //
+    // b493: use the frame's full-open bound OUTRIGHT rather than fminf (b492
+    // and earlier) or fmaxf (b492's over-correction, which on the next run saw
+    // det_end 435.8 and told the fine scan to sweep ~48 deg PAST full open,
+    // burning the point budget and water on angles watering never commands).
+    // Full open is known geometrically; discovery informs where flow STARTS,
+    // never where the usable range ends. Deterministic, and immune to a noisy
+    // coarse sample in either direction.
+    (void)fine_end;
+    float fine_end_capped = VALVE_OPEN_DEG + 2.0f;
     INFO("\nDetected: baseline=%.4f PSI  active=%.1f to %.1f deg  peak=%.4f PSI",
          baseline, det_start, det_end, det_peak);
+    if (fine_end < VALVE_OPEN_DEG + 2.0f)
+        ESP_LOGW(TAG, "Discovery ended early (det_end %.1f); scanning to full open "
+                      "%.1f anyway -- supply may have dipped mid-discovery",
+                 det_end, VALVE_OPEN_DEG + 2.0f);
+    // b492: keep the discovery result for /cal/status so a short scan can be
+    // diagnosed from the numbers instead of inferred from the point table.
+    s_wcal.disc_baseline = baseline;
+    s_wcal.disc_start    = det_start;
+    s_wcal.disc_end      = det_end;
+    s_wcal.disc_peak     = det_peak;
     INFO("Suggested constants: VALVE_CAL_START_DEG %.1f  VALVE_OPEN_DEG %.1f (peak at %.1f)",
          fine_start, det_peak_angle + 10.0f, det_peak_angle);
 
@@ -3035,7 +3226,8 @@ static int smooth_scheduler_pick(const bool *visited, int num_rings,
                                   const float *ring_throws,
                                   const float *last_actual_throw,
                                   const float *cum_depth, float depth_target,
-                                  float current_supply, float cal_supply,
+                                  float current_supply, float supply_trend,
+                                  float cal_supply,
                                   float median_throw, int pass)
 {
     // b297: bootstrap fix. The check `current_supply >= cal_supply * 0.90`
@@ -3043,9 +3235,18 @@ static int smooth_scheduler_pick(const bool *visited, int num_rings,
     // misclassified pass-0 as LOW supply and caused pass 0 to start with
     // a LOW-need (mid) ring instead of the outer ring. Default HIGH when
     // we have no real reading yet (current_supply <= 0).
+    //
+    // b498: current_supply is now the TAIL sample of the last ring (freshest
+    // point) and supply_trend is that ring's head->tail supply delta. A well
+    // pump cycling 45-60 psi every ~20 gal spans several rings per cycle, so
+    // extrapolating half a ring ahead classifies the supply the NEXT ring
+    // will actually see, instead of the level half a ring ago. A point
+    // sample alone cannot distinguish a peak being climbed from one being
+    // left behind.
+    float supply_pred = current_supply + 0.5f * supply_trend;
     bool supply_high = (current_supply <= 0.0f || cal_supply <= 0.5f)
                        ? true
-                       : (current_supply >= cal_supply * 0.90f);
+                       : (supply_pred >= cal_supply * 0.90f);
 
     int best = -1;
     float best_score = -1.0f;
@@ -3064,8 +3265,36 @@ static int smooth_scheduler_pick(const bool *visited, int num_rings,
         // diagnostic is gated on BOTH throw_ratio<0.90 AND supply_ratio
         // <0.90 from the LAST fire, so re-firing at higher supply will
         // unset the flag (and the corr machinery gets another data point).
+        // b497: the b297 throw-aware re-pick has NO TERMINATION. A ring that
+        // cannot reach 90% of its target throw keeps scoring, keeps getting
+        // re-fired, and keeps taking water -- forever.
+        //
+        // ba1f88 2026-08-01: ring 32 targeted 1130mm but physically achieved
+        // 595-789mm (ratio 0.53-0.70) at psi 0.65 -- the valve's minimum
+        // opening, where it cannot throw further no matter what. It was
+        // re-fired until cum_depth reached ~140mm against a 3.175mm target
+        // (44x over), drowning the zone core while the run never converged and
+        // "time remaining" sat at 2 min. Its corr factor ratcheted 1.555->1.590
+        // trying to compensate for a distance that was physically unreachable.
+        //
+        // Two reasons a short throw must not re-arm a ring indefinitely:
+        //   - Water cannot fix a geometry or supply problem. Past a generous
+        //     multiple of target depth, more passes only over-water.
+        //   - The measured ratio is partly luck. A well pump cycling (e.g.
+        //     45-60 psi every ~20 gal) means a sweep can sample a pressure
+        //     valley and read short through no fault of the ring; a few
+        //     re-fires let it catch a peak, unbounded re-fires just flood.
+        // The supply-limited diagnostic still records the shortfall, so the
+        // information is not lost -- only the runaway is.
+        // Primary rule: stop when re-firing stops HELPING. A ring waiting on a
+        // pressure peak improves its ratio the moment it catches one, so it
+        // keeps its retries; a ring pinned at the valve's floor never improves
+        // and stops after a few passes. Depth cap is only a far backstop.
+        bool throw_refire_ok = (cum_depth[i] < depth_target * WATER_THROW_REFIRE_DEPTH_X)
+                            && (s_throw_noimp[i] < WATER_THROW_REFIRE_NOIMP_MAX);
         float throw_def_frac = 0.0f;
-        if (pass > 0 && ring_throws[i] >= 100.0f && last_actual_throw != NULL) {
+        if (throw_refire_ok &&
+            pass > 0 && ring_throws[i] >= 100.0f && last_actual_throw != NULL) {
             float at = last_actual_throw[i];
             if (at >= 100.0f) {
                 float ratio = at / ring_throws[i];
@@ -3080,13 +3309,48 @@ static int smooth_scheduler_pick(const bool *visited, int num_rings,
         if (throw_def_frac > deficit_frac) deficit_frac = throw_def_frac;
         if (deficit_frac <= 0.0f) continue;   // both depth and throw satisfied
 
-        bool ring_needs_high = (ring_throws[i] >= median_throw);
+        // b498: a throw-driven re-fire needs HIGH supply no matter where its
+        // TARGET throw sits relative to the median. ba1f88's ring 32 had a
+        // short target (LOW-need by the median test) but was being re-fired
+        // because it under-threw -- the median test scheduled it into supply
+        // valleys, exactly when it could not reach, burning its b497 patience
+        // on fires that never had a chance.
+        bool ring_needs_high = (ring_throws[i] >= median_throw)
+                            || (throw_def_frac > 0.0f);
         float supply_match = (ring_needs_high == supply_high) ? 1.0f : 0.4f;
         float score = deficit_frac * supply_match;
 
         if (score > best_score) {
             best_score = score;
             best = i;
+        }
+    }
+    // b497: score the CHOSEN ring's progress. Improving (caught a better
+    // supply moment) resets its patience; not improving spends one of its
+    // attempts. Only throw-driven picks count -- a depth-driven re-fire is
+    // ordinary work, not a stalled retry.
+    // b499: only a fire launched at HIGH supply spends patience. A valley
+    // fire never had a fair chance at the target throw (ba1f88's 8 inner
+    // rings expired all their patience at 54-70% of cal supply), and valley
+    // fires are now sometimes deliberate pump-trigger draws. Improvement
+    // still resets patience regardless of supply -- a caught rise is a
+    // caught rise. Boundedness comes from the depth backstop
+    // (WATER_THROW_REFIRE_DEPTH_X) plus HIGH-supply fires charging normally.
+    if (best >= 0 && pass > 0 && last_actual_throw != NULL &&
+        ring_throws[best] >= 100.0f && cum_depth[best] >= depth_target) {
+        float at = last_actual_throw[best];
+        if (at >= 100.0f) {
+            float ratio = at / ring_throws[best];
+            if (ratio > s_throw_best_ratio[best] + WATER_THROW_IMPROVE_EPS) {
+                s_throw_best_ratio[best] = ratio;
+                s_throw_noimp[best] = 0;
+            } else if (supply_high && s_throw_noimp[best] < 255) {
+                s_throw_noimp[best]++;
+                if (s_throw_noimp[best] == WATER_THROW_REFIRE_NOIMP_MAX)
+                    ESP_LOGW(TAG, "  Ring %d: %d re-fires without throw gain "
+                                  "(best %.2f) -- no longer re-firing for throw",
+                             best + 1, WATER_THROW_REFIRE_NOIMP_MAX, s_throw_best_ratio[best]);
+            }
         }
     }
     return best;
@@ -3171,7 +3435,8 @@ static float nozzle_precip_depth_mm(float r_outer_mm, float r_inner_mm,
 static esp_err_t zone_load_primary(uint16_t id, zone_perimeter_t *z);
 static esp_err_t zone_save_primary(uint16_t id, const char *name_override, const zone_perimeter_t *z);
 static bool      nozzle_sweep_pulse(float, float, bool, float, uint16_t, uint32_t,
-                                    TickType_t, int, int, int, float, float, float*, int*, bool);
+                                    TickType_t, int, int, int, float, float, float*, int*,
+                                    float*, float*, bool);
 
 // ---- Last-watering record (actual per-ring PSI, DPS, active arc) --------
 // water_ring_data_t and water_run_t defined in irrigoto_types.h
@@ -3941,7 +4206,7 @@ static void phase_jog_pulse_cal(void)
                        pulse_duty, pulse_ms,
                        t0, 0, 1, 0,
                        VALVE_CLOSED_DEG,
-                       0.0f, &psi_sum, &psi_n, false);
+                       0.0f, &psi_sum, &psi_n, NULL, NULL, false);
 
     uint16_t raw1 = 0;
     as5600_read(ADDR_AS5600, &raw1, NULL, NULL);
@@ -3966,7 +4231,7 @@ static void phase_jog_pulse_cal(void)
                        pulse_duty, pulse_ms,
                        t0, 0, 1, 0,
                        VALVE_CLOSED_DEG,
-                       0.0f, &psi_sum, &psi_n, false);
+                       0.0f, &psi_sum, &psi_n, NULL, NULL, false);
 
     as5600_read(ADDR_AS5600, &raw1, NULL, NULL);
     float end_ccw = raw1 * (360.0f / 4096.0f);
@@ -4062,7 +4327,8 @@ static void wcal_jog_task(void *arg)
                                      : VALVE_CLOSED_DEG;
     nozzle_sweep_pulse(origin, TEST_ARC, true, 1.0f,
                        pulse_duty, pulse_ms, t0, 0, 1, 0,
-                       jog_valve_deg, jog_ring_throw, &psi_sum, &psi_n, false);
+                       jog_valve_deg, jog_ring_throw, &psi_sum, &psi_n,
+                       NULL, NULL, false);
 
     uint16_t raw1 = 0;
     as5600_read(ADDR_AS5600, &raw1, NULL, NULL);
@@ -4083,7 +4349,8 @@ static void wcal_jog_task(void *arg)
     psi_sum = 0.0f; psi_n = 0;
     nozzle_sweep_pulse(origin, TEST_ARC, false, 1.0f,
                        pulse_duty, pulse_ms, t0, 0, 1, 0,
-                       jog_valve_deg, jog_ring_throw, &psi_sum, &psi_n, false);
+                       jog_valve_deg, jog_ring_throw, &psi_sum, &psi_n,
+                       NULL, NULL, false);
 
     as5600_read(ADDR_AS5600, &raw1, NULL, NULL);
     float end_ccw = raw1 * (360.0f / 4096.0f);
@@ -6331,11 +6598,91 @@ static void check_battery_on_boot(void)
     boot_diag_append_and_save(&diag);
 }
 
+// b490: last-resort watchdog for a calibration stuck in a non-idle state.
+// The await steps have their own 5-minute operator timeout and the scan phases
+// are task-driven and finite, so this should never fire -- it exists so that no
+// future code path can strand the device awake with the valve open. Force-close
+// and return to idle; the operator re-runs the cal.
+#define CAL_WATCHDOG_MS (30u * 60u * 1000u)
+static TickType_t s_cal_state_since = 0;
+static wcal_state_t s_cal_state_seen = WCAL_IDLE;
+
+static void cal_watchdog_check(void)
+{
+    // b493: the await steps have their own two-stage supervisor (park at 5 min,
+    // give up at 30) which owns the valve and the cal outcome. Don't race it --
+    // this watchdog covers the OTHER in-progress states only.
+    if (s_wcal.state == WCAL_PRESSURE_AWAIT_THROW_LOW ||
+        s_wcal.state == WCAL_PRESSURE_AWAIT_THROW) return;
+    TickType_t now = xTaskGetTickCount();
+    if (s_wcal.state != s_cal_state_seen) {      // state moved -- restart the clock
+        s_cal_state_seen = s_wcal.state;
+        s_cal_state_since = now;
+        return;
+    }
+    if (s_cal_state_since == 0) { s_cal_state_since = now; return; }
+    if ((now - s_cal_state_since) < pdMS_TO_TICKS(CAL_WATCHDOG_MS)) return;
+    ESP_LOGE(TAG, "CAL WATCHDOG: state %d stuck >%u min -- closing valve, aborting",
+             (int)s_wcal.state, (unsigned)(CAL_WATCHDOG_MS / 60000u));
+    // NOTE: this runs on the main loop task, which has a 15 s watchdog. Keep it
+    // short -- a 4 s goto plus a sensor-only leak check. Deliberately NOT
+    // valve_verify_closed_dry(..., true): the seek-dry rescue can drive the
+    // motor for over a minute and would trip the task WDT from here. If the
+    // close doesn't seal, the leak is recorded + frame flagged, and the next
+    // boot's valve check (which runs in its own context) does the rescue.
+    motor_rail_on();
+    vTaskDelay(pdMS_TO_TICKS(100));
+    valve_goto(VALVE_CLOSED_DEG, 2.0f, 4000, false);
+    valve_verify_closed_dry("cal watchdog", false);
+    motor_rail_off();
+    snprintf(s_wcal.msg, sizeof(s_wcal.msg),
+             "Calibration timed out and was aborted -- valve closed. Please re-run.");
+    s_wcal.state = WCAL_IDLE;
+    s_cal_state_since = 0;
+}
+
 static void check_inactivity(void)
 {
     if (s_last_activity == 0) return;  // not yet initialised
     if (s_ota_in_progress) return;  // never sleep during OTA
     if (s_sleep_disabled)  return;  // user disabled auto-sleep
+    // b490: NEVER sleep mid-calibration. A cal holds the valve OPEN while the
+    // operator measures, the cal task has already exited at the await steps, and
+    // the sleep path does NOT close the valve -- so if the browser stopped
+    // polling, the 30 s web timeout plus the inactivity timeout put the device
+    // to sleep with water running for the whole nap (10 min at sleep_dur_s=600),
+    // closing only at the next wake's boot check. Guarding on the cal state
+    // covers the scan phases too, where a closed browser could previously sleep
+    // the device mid-sweep. Bounded by the await timeout + cal watchdog below,
+    // so a stuck cal cannot block sleep forever and flatten the battery.
+    // b491: test the ACTIVE states explicitly rather than "not IDLE and not
+    // DONE". WCAL_ERROR is terminal -- the cal is over, just unsuccessfully --
+    // and the b490 form blocked sleep on it, so any failed cal kept the device
+    // awake until the 30-min watchdog fired. The timeout path added in b490
+    // sets WCAL_ERROR itself on a unit with no previous cal, so it could
+    // trigger its own battery drain. Any future in-progress state must be
+    // added to this list.
+    bool cal_active = (s_wcal.state == WCAL_PRESSURE_SCANNING        ||
+                       s_wcal.state == WCAL_PRESSURE_AWAIT_THROW     ||
+                       s_wcal.state == WCAL_PRESSURE_AWAIT_THROW_LOW ||
+                       s_wcal.state == WCAL_NOZZLE_RUNNING           ||
+                       s_wcal.state == WCAL_JOG_RUNNING);
+    if (cal_active) {
+        cal_watchdog_check();
+        return;
+    }
+    // b495: the frame sweep runs inline in the HTTP handler and never sets
+    // s_wcal.state, so it needs its own guard. Time-bounded: if a sweep somehow
+    // wedges past FRAME_SWEEP_MAX_MS, stop blocking sleep rather than sitting
+    // awake forever (the wake-time valve check closes the valve).
+    if (s_frame_sweep_active) {
+        if ((uint32_t)((xTaskGetTickCount() - s_frame_sweep_start) * portTICK_PERIOD_MS)
+                < FRAME_SWEEP_MAX_MS)
+            return;
+        ESP_LOGE(TAG, "Frame sweep exceeded %u min -- releasing the sleep guard",
+                 (unsigned)(FRAME_SWEEP_MAX_MS / 60000u));
+        s_frame_sweep_active = false;
+    }
     // Suppress sleep while a web client is actively polling.
     // s_last_web_req_tick is set by WEB_TOUCH() in every zone web handler.
     // A client polling every 900ms will keep this fresh; a closed browser
@@ -6767,7 +7114,8 @@ static bool nozzle_sweep_pulse(
         TickType_t t_start,
         int ring, int arc_label, int first_sec,
         float valve_deg, float ring_throw,
-        float *psi_sum_out, int *psi_n_out, bool direct_valve)
+        float *psi_sum_out, int *psi_n_out,
+        float *psi_head_out, float *psi_tail_out, bool direct_valve)
 {
     const uint32_t SETTLE_MS = 120;
 
@@ -6999,6 +7347,13 @@ static bool nozzle_sweep_pulse(
             as5600_read(ADDR_AS5600L, &v_raw, NULL, NULL);
             float csv_psi=0.0f; mprls_read_quiet(&csv_psi);
             if (psi_sum_out && csv_psi > 0.1f) { *psi_sum_out += csv_psi; (*psi_n_out)++; }
+            // b498: real head/tail samples. Head latches on the first valid
+            // sample (caller seeds with -1); tail tracks the latest, so after
+            // a multi-arc ring it holds the last arc's final sample.
+            if (csv_psi > 0.1f) {
+                if (psi_head_out && *psi_head_out < 0.0f) *psi_head_out = csv_psi;
+                if (psi_tail_out) *psi_tail_out = csv_psi;
+            }
             water_trace_sample(csv_psi);  // b283: 1Hz-rate-limited, harmless no-op when inactive
             // Sector from actual bearing so column stays correct at higher sample rate
             int sec = (int)(cur_deg / WATER_SECTOR_DEG);
@@ -7230,6 +7585,7 @@ static bool nozzle_sweep_encoder_gentle(
         int ring, int arc_label, int first_sec,
         float valve_deg, float ring_throw,
         float *psi_sum_out, int *psi_n_out,
+        float *psi_head_out, float *psi_tail_out,
         uint32_t *elapsed_ms_out)
 {
     // Adjust sweep_origin/arc_deg if nozzle is behind or ahead of start.
@@ -7663,6 +8019,11 @@ static bool nozzle_sweep_encoder_gentle(
             as5600_read(ADDR_AS5600L, &v_raw, NULL, NULL);
             float csv_psi = 0.0f; mprls_read_quiet(&csv_psi);
             if (psi_sum_out && csv_psi > 0.1f) { *psi_sum_out += csv_psi; (*psi_n_out)++; }
+            // b498: real head/tail samples (see nozzle_sweep_pulse).
+            if (csv_psi > 0.1f) {
+                if (psi_head_out && *psi_head_out < 0.0f) *psi_head_out = csv_psi;
+                if (psi_tail_out) *psi_tail_out = csv_psi;
+            }
             water_trace_sample(csv_psi);  // b283: 1Hz-rate-limited, harmless no-op when inactive
             float valve_live = v_raw * (360.0f / 4096.0f);
             float _at2 = cal_pressure_to_throw_mm(csv_psi);
@@ -10298,6 +10659,39 @@ static void phase_water_zone(void)
         s_web_water_mode = 0;
         return;
     }
+    // b502: outermost-ring flat-band re-aim. A perimeter walked at near-
+    // constant radius (Combined: points 18-21 all ~9936mm) leaves the
+    // outermost ring's radius inside the polygon only in sub-degree
+    // slivers at each vertex -- the straight edges between vertices sag
+    // inward, the arc clipper (correctly, b309/b435) refuses slivers, and
+    // the ring never waters: the outer band of the deepest lobe stays dry
+    // every run. Instead of abandoning that water, step the ring inward a
+    // few percent until the zone arc clips to a usable span. Measured on
+    // Combined: 9911mm -> 4 deg of slivers (unwaterable); 9713mm -> ~56 deg
+    // solid arc over the same lobe. Rings whose clip is already usable
+    // (>= half a sector) are untouched.
+    if (have_zone && num_rings >= 1) {
+        float _orig_t  = ring_throws[0];
+        // Never step past the midpoint to ring 2 -- that's ring 2's band.
+        float _floor_t = num_rings >= 2 ? (_orig_t + ring_throws[1]) * 0.5f
+                                        : _orig_t * 0.90f;
+        for (int _try = 0; _try < 5; _try++) {
+            float _lo = zone_arc_start;
+            float _hi = (zone_arc_deg >= 359.0f)
+                        ? fmodf(zone_arc_start + 359.5f, 360.0f)
+                        : zone_arc_end;
+            zone_clip_arc_to_polygon(&zone, ring_throws[0], &_lo, &_hi, 0.5f);
+            float _span = fmodf(_hi - _lo + 360.0f, 360.0f);
+            if (_span >= 0.5f * WATER_SECTOR_DEG) break;   // usable arc
+            float _next = ring_throws[0] * 0.98f;
+            if (_next < _floor_t) break;
+            ring_throws[0] = _next;
+        }
+        if (ring_throws[0] < _orig_t - 0.5f)
+            INFO("Ring 1 re-aimed %.0f -> %.0fmm (only slivers inside the "
+                 "polygon at %.0fmm -- flat perimeter edge)",
+                 _orig_t, ring_throws[0], _orig_t);
+    }
     INFO("Rings: %d  (%.0fft outer to %.0fft inner)",
          num_rings, ring_throws[0]/304.8f, ring_throws[num_rings-1]/304.8f);
 
@@ -10874,6 +11268,15 @@ static void phase_water_zone(void)
         sched_median_throw = _sorted[_n_sort / 2];
     }
     float sched_supply_est  = 0.0f;  // 0 = bootstrap, assume HIGH on first pick
+    // b498: head->tail supply delta across the last completed ring. Positive
+    // while the well pump climbs toward cut-off, negative while drawing down.
+    // Fed to the scheduler so it classifies the supply the NEXT ring will see.
+    float sched_supply_trend = 0.0f;
+    // b499: that same rise as a rate (supply-psi per second, measured across
+    // the ring's sweep time). Sizes the closed-valve dwell; conservative by
+    // construction -- the pump fills faster with the valve closed than it
+    // did while the ring was drawing.
+    float sched_supply_rate  = 0.0f;
     float sched_cal_supply  = cal_anchor_supply_pressure_map();
     if (smooth_mode) {
         INFO("b296 scheduler armed: median_throw=%.0fmm cal_supply=%.2f PSI",
@@ -10932,44 +11335,128 @@ static void phase_water_zone(void)
             sched_last_throw[_i] = s_last_water_run.rings[_i].actual_throw_mm;
         }
 
+        // b499: closed-valve dwells used this pass (bounded so a misread
+        // trend can't stall the run waiting on a pump that isn't filling).
+        int sched_dwells = 0;
+
     for (int _iter = 0; _iter < num_rings; _iter++) {
         // b296: smooth mode uses the supply-aware scheduler. Other modes
         // (gentle, pulse) keep the original sequential iteration order --
         // gentle has no per-ring valve correction, so reordering it has
         // no benefit, and pulse uses a completely different loop above.
         int ring;
+        bool was_trigger_fire = false;   // b502: for post-fire futility check
         if (smooth_mode) {
-            ring = smooth_scheduler_pick(sched_visited, num_rings,
+            // b499: throw-recovery endgame -- trigger-aware peak hunting.
+            // When every remaining eligible ring is throw-driven (depth met,
+            // throw short), firing order should follow the pump, not the
+            // deficit ranking. Positive trend = pump confirmed running: close
+            // the valve and let it fill unopposed toward cut-out, then fire
+            // into the peak. No rise = pump idle inside its hysteresis band
+            // with nothing drawing -- waiting can NEVER help (a pressure-
+            // switch pump only starts on drawdown below cut-in), so fire the
+            // shortest remaining ring: it is the least hurt by the valley and
+            // its draw is what trips the switch.
+            int trigger_ring = -1;
+            if (pass > 0) {
+                bool depth_work = false; int shortest = -1;
+                for (int i = 0; i < num_rings && i < WATER_RUN_MAX_RINGS; i++) {
+                    if (sched_visited[i]) continue;
+                    if (depth_mm - smooth_cumulative_depth[i] > 0.0f) {
+                        depth_work = true; break;
+                    }
+                    // Mirror the scheduler's throw-refire eligibility.
+                    bool _ok = (smooth_cumulative_depth[i] < depth_mm * WATER_THROW_REFIRE_DEPTH_X)
+                            && (s_throw_noimp[i] < WATER_THROW_REFIRE_NOIMP_MAX);
+                    if (_ok && ring_throws[i] >= 100.0f && sched_last_throw[i] >= 100.0f &&
+                        sched_last_throw[i] < ring_throws[i] * 0.90f) {
+                        if (shortest < 0 || ring_throws[i] < ring_throws[shortest])
+                            shortest = i;
+                    }
+                }
+                float rise_needed = sched_cal_supply * 0.95f - sched_supply_est;
+                if (!depth_work && shortest >= 0 && sched_cal_supply > 0.5f &&
+                    sched_supply_est > 0.0f && rise_needed > 0.0f) {
+                    if (sched_supply_trend > WATER_SUPPLY_TREND_EPS &&
+                        sched_dwells < WATER_DWELL_MAX_PER_PASS) {
+                        uint32_t dwell_s = WATER_DWELL_MAX_S;
+                        if (sched_supply_rate > 0.004f) {
+                            dwell_s = (uint32_t)(rise_needed / sched_supply_rate);
+                            if (dwell_s < WATER_DWELL_MIN_S) dwell_s = WATER_DWELL_MIN_S;
+                            if (dwell_s > WATER_DWELL_MAX_S) dwell_s = WATER_DWELL_MAX_S;
+                        }
+                        sched_dwells++;
+                        INFO("Sched: pump filling (trend %+.2f, %.3f psi/s) -- "
+                             "closed-valve dwell %lus toward cut-out before throw recovery",
+                             sched_supply_trend, sched_supply_rate,
+                             (unsigned long)dwell_s);
+                        valve_goto(VALVE_CLOSED_DEG, 2.0f, 10000, false);
+                        s_valve_last_dir = -1;
+                        for (uint32_t _d = 0; _d < dwell_s; _d++) {
+                            vTaskDelay(pdMS_TO_TICKS(1000));
+                            TOUCH_ACTIVITY();
+                            if (uart_getchar(0) != 0 || s_water_abort) {
+                                INFO("Stopped."); goto abort;
+                            }
+                        }
+                        // The tank is unobservable with the valve closed (the
+                        // MPRLS sits downstream); assume the dwell topped the
+                        // band. The next ring's head sample re-anchors reality
+                        // immediately.
+                        sched_supply_est   = sched_cal_supply;
+                        sched_supply_trend = 0.0f;
+                        sched_supply_rate  = 0.0f;
+                    } else if (sched_supply_trend <= WATER_SUPPLY_TREND_EPS) {
+                        trigger_ring = shortest;
+                    }
+                }
+            }
+            if (trigger_ring >= 0) {
+                ring = trigger_ring;
+                was_trigger_fire = true;
+                INFO("Sched: pump-trigger fire ring %d (shortest remaining throw %.1fm, "
+                     "supply %.2f flat/falling -- drawing down to trip the pump)",
+                     ring + 1, ring_throws[ring] / 1000.0f, sched_supply_est);
+            } else {
+                ring = smooth_scheduler_pick(sched_visited, num_rings,
                                           ring_throws, sched_last_throw,
                                           smooth_cumulative_depth,
                                           depth_mm, sched_supply_est,
+                                          sched_supply_trend,
                                           sched_cal_supply, sched_median_throw,
                                           pass);
+            }
             if (ring < 0) {
                 INFO("Sched: no remaining deficit -- pass %d ended early", pass + 1);
                 break;
             }
             sched_visited[ring] = true;
+            if (trigger_ring < 0) {   // b499: trigger fires logged above
             float _def  = depth_mm - smooth_cumulative_depth[ring];
-            // b297: same bootstrap fix as in smooth_scheduler_pick so the
-            // log line agrees with what the scheduler actually used.
+            // b297/b498: same bootstrap + trend-extrapolation logic as in
+            // smooth_scheduler_pick so the log line agrees with what the
+            // scheduler actually used.
             bool _shi   = (sched_supply_est <= 0.0f || sched_cal_supply <= 0.5f)
                           ? true
-                          : (sched_supply_est >= sched_cal_supply * 0.90f);
-            bool _rh    = (ring_throws[ring] >= sched_median_throw);
+                          : (sched_supply_est + 0.5f * sched_supply_trend
+                             >= sched_cal_supply * 0.90f);
             // b297: indicate whether re-pick was driven by throw shortfall
             // (depth was already met -- we're firing again for throw recovery).
             float _at = s_last_water_run.rings[ring].actual_throw_mm;
             bool _re_throw = (pass > 0 && _def <= 0.0f &&
                               _at >= 100.0f && ring_throws[ring] >= 100.0f &&
                               _at < ring_throws[ring] * 0.90f);
+            // b498: a throw-driven re-fire is HIGH-need regardless of the
+            // median test (matches smooth_scheduler_pick).
+            bool _rh    = (ring_throws[ring] >= sched_median_throw) || _re_throw;
             INFO("Sched: pick ring %d (deficit %.2fmm, throw %.1fm, %s-need, "
-                 "supply %s=%.2f, cal=%.2f%s)",
+                 "supply %s=%.2f trend %+.2f, cal=%.2f%s)",
                  ring + 1, _def, ring_throws[ring] / 1000.0f,
                  _rh ? "HIGH" : "LOW",
                  _shi ? "HIGH" : "LOW",
-                 sched_supply_est, sched_cal_supply,
+                 sched_supply_est, sched_supply_trend, sched_cal_supply,
                  _re_throw ? ", RE-THROW" : "");
+            }
         } else {
             ring = _iter;
             // b364: sequential modes (gentle, pulse) -- skip rings that earlier
@@ -11204,6 +11691,8 @@ static void phase_water_zone(void)
         }
 
         float ring_psi_sum = 0.0f; int ring_psi_n = 0;
+        // b497: head/tail pressure for this ring (see water_ring_data_t).
+        float ring_head_psi = -1.0f, ring_tail_psi = -1.0f;
         bool  ring_no_flow = false;   // set if no detectable flow on first arc
         INFO("Ring %2d/%d  throw=%.0fmm  valve=%.1fdeg (was %.1f, delta %.1f)  "
              "%d arc(s)  %.1fdps  %s  %s",
@@ -11612,6 +12101,7 @@ static void phase_water_zone(void)
                     t_start, ring+1, ai+1, arc->first_sec,
                     valve_target_deg, ring_throw,
                     &ring_psi_sum, &ring_psi_n,
+                    &ring_head_psi, &ring_tail_psi,
                     &arc_elapsed_ms);
                 // Accumulate actual sweep time for smooth-mode dps measurement.
                 if (smooth_mode && arc_elapsed_ms > 0) {
@@ -11630,7 +12120,8 @@ static void phase_water_zone(void)
                     eff_duty, eff_ms,
                     t_start, ring+1, ai+1, arc->first_sec,
                     valve_target_deg, ring_throw,
-                    &ring_psi_sum, &ring_psi_n, direct_ring);
+                    &ring_psi_sum, &ring_psi_n,
+                    &ring_head_psi, &ring_tail_psi, direct_ring);
             } else {
                 swept_ok = nozzle_sweep_continuous(
                     seg_origin, seg_deg, cw, run_duty,
@@ -11682,6 +12173,8 @@ static void phase_water_zone(void)
         if (!ring_no_flow && ring < WATER_RUN_MAX_RINGS) {
             {
                 float _avg = ring_psi_n > 0 ? ring_psi_sum / ring_psi_n : 0.0f;
+                if (ring_head_psi < 0.0f) ring_head_psi = _avg;   // no samples: fall back
+                if (ring_tail_psi < 0.0f) ring_tail_psi = _avg;
                 float _at  = _avg > 0.1f ? cal_pressure_to_throw_mm(_avg) : ring_throw;
                 // Derive arc extents from last arc's seg_origin/seg_deg
                 float _arc_s = cw ? seg_origin
@@ -11698,16 +12191,43 @@ static void phase_water_zone(void)
                     .active_deg      = active_count * (float)WATER_SECTOR_DEG,
                     .arc_start_deg   = _arc_s,
                     .arc_end_deg     = _arc_e,
+                    .head_psi        = ring_head_psi,     // b497: per-ring pressure trend
+                    .tail_psi        = ring_tail_psi,
                     .valve_deg       = valve_target_deg,  // b281: for supply back-calc
                 };
                 // b296: feed the scheduler's rolling supply estimate. Updated
                 // every ring (not just per-pass) so the scheduler reacts to
                 // pump cycles within a pass rather than lagging by a full
                 // pass. Smooth mode only -- other modes don't consult it.
-                if (smooth_mode && _avg > 0.1f && valve_target_deg > 0.5f) {
-                    float _new_supply = supply_psi_from_pressure_map(
-                                            valve_target_deg, _avg);
-                    if (_new_supply > 0.1f) sched_supply_est = _new_supply;
+                // b498: estimate from the TAIL sample (the freshest point,
+                // not a mean lagging half a ring) and record the head->tail
+                // supply delta as the trend the scheduler extrapolates with.
+                // Falls back to the ring mean when head/tail were degenerate
+                // (e.g. a sweep too short for two valid samples).
+                if (smooth_mode && valve_target_deg > 0.5f) {
+                    float _sup_head = ring_head_psi > 0.1f
+                        ? supply_psi_from_pressure_map(valve_target_deg, ring_head_psi)
+                        : 0.0f;
+                    float _sup_tail = ring_tail_psi > 0.1f
+                        ? supply_psi_from_pressure_map(valve_target_deg, ring_tail_psi)
+                        : 0.0f;
+                    if (_sup_tail > 0.1f) {
+                        sched_supply_est   = _sup_tail;
+                        sched_supply_trend = _sup_head > 0.1f
+                                           ? _sup_tail - _sup_head : 0.0f;
+                        // b499: express the trend as a fill rate for dwell sizing.
+                        sched_supply_rate  = (ring_sweep_ms > 500)
+                                           ? sched_supply_trend / (ring_sweep_ms / 1000.0f)
+                                           : 0.0f;
+                    } else if (_avg > 0.1f) {
+                        float _new_supply = supply_psi_from_pressure_map(
+                                                valve_target_deg, _avg);
+                        if (_new_supply > 0.1f) {
+                            sched_supply_est   = _new_supply;
+                            sched_supply_trend = 0.0f;
+                            sched_supply_rate  = 0.0f;
+                        }
+                    }
                 }
             }
         }
@@ -11724,6 +12244,22 @@ static void phase_water_zone(void)
                                                  : ring_throws[ring + 1];
             smooth_cumulative_depth[ring] +=
                 nozzle_precip_depth_mm(_ro, _ri, _r->dps, _r->avg_psi);
+        }
+        // b502: a pump-trigger fire's one job is to trip the switch. If the
+        // trend is still flat after the fire, it failed at that too -- charge
+        // the ring's patience. Without this, a ring whose clipped arc draws
+        // too little to reach cut-in loops trigger fires to the pass cap
+        // (RockGarden ring 1: ~6 deg sliver, ~0.5L/fire, 7 futile passes).
+        // A trigger fire that DOES raise the trend stays uncharged: the next
+        // pick dwells and the peak fire gets its fair chance.
+        if (smooth_mode && was_trigger_fire &&
+            sched_supply_trend <= WATER_SUPPLY_TREND_EPS &&
+            ring < WATER_RUN_MAX_RINGS && s_throw_noimp[ring] < 255) {
+            s_throw_noimp[ring]++;
+            if (s_throw_noimp[ring] == WATER_THROW_REFIRE_NOIMP_MAX)
+                ESP_LOGW(TAG, "  Ring %d: %d pump-trigger fires without a "
+                              "supply rise -- no longer re-firing for throw",
+                         ring + 1, WATER_THROW_REFIRE_NOIMP_MAX);
         }
         rings_done++;
         cw = !cw;
@@ -11831,6 +12367,17 @@ static void phase_water_zone(void)
                     float _at = s_last_water_run.rings[i].actual_throw_mm;
                     if (_at >= 100.0f && ring_throws[i] >= 100.0f) {
                         throw_done = (_at >= ring_throws[i] * 0.90f);
+                        // b499: a ring whose throw recovery is exhausted
+                        // (patience spent or depth backstop hit) cannot make
+                        // progress in any further pass -- the scheduler will
+                        // refuse it. Count it done so the run closes out
+                        // instead of spinning empty passes to the cap while
+                        // logging "N rings still need water". The gap
+                        // analysis still records it as supply-limited.
+                        if (!throw_done && depth_done &&
+                            (s_throw_noimp[i] >= WATER_THROW_REFIRE_NOIMP_MAX ||
+                             smooth_cumulative_depth[i] >= depth_mm * WATER_THROW_REFIRE_DEPTH_X))
+                            throw_done = true;
                     }
                 }
                 if (depth_done && throw_done) continue;
@@ -12354,7 +12901,8 @@ static void water_cleanup_pass(
         float psi_sum = 0.0f; int psi_n = 0;
         nozzle_sweep_pulse(seg_origin, seg_deg_r, cw, nozzle_dps,
                            eff_duty, eff_ms, t_start, i+1, 1, 0,
-                           valve_deg_r, ring_throw, &psi_sum, &psi_n, false);
+                           valve_deg_r, ring_throw, &psi_sum, &psi_n,
+                           NULL, NULL, false);
 
         // Accumulate delivered depth for next pass re-analysis
         if (psi_n > 0) {
@@ -13707,8 +14255,207 @@ static esp_err_t exp_lash_handler(httpd_req_t *req)
 typedef struct {
     float peak, offset, closed, max_psi, flow_start;
     bool  cstart_stored;
+    float anchor_deg;      // b488: measured dry (or min-pressure) start angle
+    bool  anchor_was_dry;  // false => never read below LEAK_CLOSED_PSI
+    bool  mirrored;        // true => the peak+90 seal won (frame shifted 180)
 } vframe_sweep_result_t;
 static int valve_frame_sweep(vframe_sweep_result_t *out);
+static int valve_frame_sweep_inner(vframe_sweep_result_t *out);
+
+// b490: recover the previous cal's pressure->throw relationship from the SAVED
+// map. The anchors themselves live only in RAM, but every saved point carries
+// (pressure, throw), so a least-squares line through them reconstructs the
+// relation. This is what lets an operator-abandoned cal keep its fresh scan:
+// p->t is nozzle physics and supply-independent, so inheriting it is sound,
+// while v->p -- the half that actually changes when the valve frame moves -- is
+// exactly what the new scan just re-measured. Returns false if there is no
+// usable previous cal (a virgin unit), in which case nothing may be invented.
+static bool cal_prev_throw_fit(float *slope_out, float *intercept_out)
+{
+    pressure_map_t prev;
+    if (cal_load_primary(&prev) != ESP_OK) return false;
+    if (prev.num_points < 2) return false;
+    double sp = 0, st = 0, spp = 0, spt = 0; int n = 0;
+    for (int i = 0; i < (int)prev.num_points; i++) {
+        float p = prev.pressure_psi[i], t = prev.throw_mm[i];
+        if (p <= 0.0f || t <= 0.0f) continue;
+        sp += p; st += t; spp += (double)p * p; spt += (double)p * t; n++;
+    }
+    if (n < 2) return false;
+    double den = n * spp - sp * sp;
+    if (den < 1e-6) return false;
+    double slope = (n * spt - sp * st) / den;
+    if (slope <= 0.0) return false;          // throw must rise with pressure
+    *slope_out     = (float)slope;
+    *intercept_out = (float)((st - slope * sp) / n);
+    return true;
+}
+
+// b490: supervise the operator-input steps. Samples pressure at ~1 Hz into the
+// rolling window (used as the throw anchor) and bounds how long the valve may
+// sit open waiting for a human. On timeout: close the valve FIRST, then either
+// finish the cal with inherited p->t (keeping the fresh scan) or, on a unit
+// with no previous cal to inherit from, save nothing and say so.
+// b493: two-stage wait, because the thing that must be bounded is WATER, not
+// the calibration.
+//
+// Stage 1 (PARK, 5 min): close and verify the valve, freeze the anchor median,
+// and KEEP AWAITING. The operator's measurement is still valid -- they watched
+// the spray while the water was running, and the frozen median is the pressure
+// from exactly that period -- so they can come back and enter it. b490 instead
+// finished the cal at this point, which meant stepping away for a phone call
+// cost you the cal and returned "not awaiting low throw" when you tried to
+// enter the number you had just measured.
+//
+// Stage 2 (GIVE UP, 30 min): only now fall back to the previous cal's p->t and
+// mark the result incomplete.
+#define WCAL_AWAIT_PARK_MS   (5u  * 60u * 1000u)
+#define WCAL_AWAIT_GIVEUP_MS (30u * 60u * 1000u)
+static void wcal_await_supervisor(void)
+{
+    wcal_state_t seen = s_wcal.state;
+    TickType_t   step_start = xTaskGetTickCount();
+    bool         parked = false;
+    wcal_psi_ring_reset();
+    s_wcal.anchor_frozen = false;
+    while (s_wcal.state == WCAL_PRESSURE_AWAIT_THROW_LOW ||
+           s_wcal.state == WCAL_PRESSURE_AWAIT_THROW) {
+        if (s_wcal.state != seen) {          // advanced to the next step
+            seen = s_wcal.state;
+            step_start = xTaskGetTickCount();
+            parked = false;
+            wcal_psi_ring_reset();           // different opening = different pressure
+            s_wcal.anchor_frozen = false;
+        }
+        if (!parked) {                       // once parked there is no flow to sample
+            float p = 0.0f;
+            if (mprls_read_quiet(&p)) wcal_psi_ring_push(p);
+        }
+        uint32_t el_ms = (uint32_t)((xTaskGetTickCount() - step_start) * portTICK_PERIOD_MS);
+        if (!parked && el_ms >= WCAL_AWAIT_PARK_MS) {
+            s_wcal.anchor_psi_frozen = wcal_psi_ring_median();
+            s_wcal.anchor_frozen     = (s_wcal.anchor_psi_frozen >= 0.0f);
+            ESP_LOGW(TAG, "Cal await: %u s with no entry -- closing valve, keeping the "
+                          "cal open (anchor frozen at %.2f PSI)",
+                     (unsigned)(el_ms / 1000u), s_wcal.anchor_psi_frozen);
+            valve_goto(VALVE_CLOSED_DEG, 2.0f, 10000, false);
+            valve_verify_closed_dry("cal await park", true);
+            parked = true;
+            snprintf(s_wcal.msg, sizeof(s_wcal.msg),
+                "Valve CLOSED for safety after %u min with no entry -- the cal is still "
+                "waiting. Enter the throw you measured; it is still valid.",
+                (unsigned)(el_ms / 60000u));
+        }
+        if (el_ms >= WCAL_AWAIT_GIVEUP_MS) break;
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    if (s_wcal.state != WCAL_PRESSURE_AWAIT_THROW_LOW &&
+        s_wcal.state != WCAL_PRESSURE_AWAIT_THROW)
+        return;                              // operator finished -- nothing to do
+
+    // ---- gave up after WCAL_AWAIT_GIVEUP_MS ----
+    uint32_t total_min = (uint32_t)((xTaskGetTickCount() - step_start) *
+                                    portTICK_PERIOD_MS / 60000u);
+    if (!parked) {                            // shouldn't happen, but never leave it open
+        valve_goto(VALVE_CLOSED_DEG, 2.0f, 10000, false);
+        valve_verify_closed_dry("cal await giveup", true);
+    }
+    float slope = 0.0f, icept = 0.0f;
+    if (cal_prev_throw_fit(&slope, &icept)) {
+        pressure_map_t *pm = &s_wcal.pmap;
+        for (int i = 0; i < (int)pm->num_points; i++) {
+            float t = icept + slope * pm->pressure_psi[i];
+            pm->throw_mm[i] = (t > 0.0f) ? t : 0.0f;
+        }
+        esp_err_t r = cal_save_primary(pm);
+        s_wcal.incomplete = true;
+        cal_incomplete_set(true);
+        if (r == ESP_OK) {
+            snprintf(s_wcal.msg, sizeof(s_wcal.msg),
+                "INCOMPLETE: no throw entered in %u min. Scan kept (%d pts) using the "
+                "PREVIOUS cal's throw scale. Valve closed. Re-run and enter throws.",
+                (unsigned)total_min, pm->num_points);
+            s_wcal.state = WCAL_DONE;
+        } else {
+            snprintf(s_wcal.msg, sizeof(s_wcal.msg),
+                "Cal gave up after %u min and the save FAILED (%s). Valve closed.",
+                (unsigned)total_min, esp_err_to_name(r));
+            s_wcal.state = WCAL_ERROR;
+        }
+    } else {
+        // Nothing to inherit -- do not invent a throw scale.
+        snprintf(s_wcal.msg, sizeof(s_wcal.msg),
+            "Cal gave up after %u min with no throw entered and no previous cal to fall "
+            "back on -- nothing saved. Valve closed. Please re-run.", (unsigned)total_min);
+        s_wcal.state = WCAL_ERROR;
+    }
+    motor_rail_off();
+    sensor_rail_off();
+}
+
+// b494: throw at a given pressure, read off the saved map by linear
+// interpolation between the bracketing points (the map is ordered by valve
+// angle, and pressure rises with angle). Beyond either end it extends the
+// nearest segment, matching the map's own linear p->t character.
+static float cal_map_throw_at_psi(const pressure_map_t *pm, float psi)
+{
+    int n = (int)pm->num_points;
+    if (n < 2) return -1.0f;
+    if (psi <= pm->pressure_psi[0] || psi >= pm->pressure_psi[n-1]) {
+        int a = (psi <= pm->pressure_psi[0]) ? 0   : n - 2;
+        int b = a + 1;
+        float dp = pm->pressure_psi[b] - pm->pressure_psi[a];
+        if (fabsf(dp) < 1e-4f) return pm->throw_mm[b];
+        return pm->throw_mm[a] +
+               (psi - pm->pressure_psi[a]) * (pm->throw_mm[b] - pm->throw_mm[a]) / dp;
+    }
+    for (int i = 0; i < n - 1; i++) {
+        float p0 = pm->pressure_psi[i], p1 = pm->pressure_psi[i+1];
+        if (psi >= p0 && psi <= p1) {
+            float dp = p1 - p0;
+            if (fabsf(dp) < 1e-4f) return pm->throw_mm[i];
+            return pm->throw_mm[i] +
+                   (psi - p0) * (pm->throw_mm[i+1] - pm->throw_mm[i]) / dp;
+        }
+    }
+    return -1.0f;
+}
+
+// b494: re-anchor the throw scale without re-scanning.
+//
+// The v->p half of a cal is genuinely measured; every THROW number is just the
+// operator's one measurement carried through. So an estimated (or sloppy)
+// throw entry leaves a map that is correctly shaped but wrongly scaled -- and
+// nothing in the firmware can detect that. Rather than force a full re-cal
+// (minutes, water, and a fresh scan that was never the problem), reopen the
+// valve, take a proper measurement, and rescale the SAVED map so it passes
+// through it. Relative shape is preserved; only the scale moves.
+static void wcal_reanchor_task(void *arg)
+{
+    (void)arg;
+    adc_setup();
+    sensor_rail_on();
+    motor_rail_on();
+    vTaskDelay(pdMS_TO_TICKS(300));
+    if (cal_load_primary(&s_wcal.pmap) != ESP_OK || s_wcal.pmap.num_points < 2) {
+        snprintf(s_wcal.msg, sizeof(s_wcal.msg),
+            "Re-anchor needs an existing calibration and there is none saved -- "
+            "run a full pressure calibration first.");
+        s_wcal.state = WCAL_ERROR;
+        motor_rail_off(); sensor_rail_off();
+        vTaskDelete(NULL); return;
+    }
+    s_wcal.reanchor_only = true;
+    valve_goto(VALVE_OPEN_DEG, 1.0f, 15000, false);
+    vTaskDelay(pdMS_TO_TICKS(CAL_SETTLE_MS));
+    s_wcal.pmap_open_psi = cal_read_pressure_avg();
+    snprintf(s_wcal.msg, sizeof(s_wcal.msg),
+        "Re-anchor: valve full open (%.2f PSI) -- measure the MAX throw and enter it. "
+        "No re-scan; the existing curve is just rescaled.", s_wcal.pmap_open_psi);
+    s_wcal.state = WCAL_PRESSURE_AWAIT_THROW;
+    wcal_await_supervisor();
+    vTaskDelete(NULL);
+}
 
 static void wcal_pressure_task(void *arg)
 {
@@ -13744,11 +14491,16 @@ static void wcal_pressure_task(void *arg)
                     "Frame cal failed: valve never moved -- check motor power/wiring.");
             else if (frc == -2)
                 snprintf(s_wcal.msg, sizeof(s_wcal.msg),
-                    "Frame cal found no flow -- turn the water supply ON and retry.");
+                    "Frame cal: no pressure response (max %.2f PSI) -- turn the water "
+                    "supply ON, or check the valve is coupled to the motor.", fr.max_psi);
+            else if (frc == -4)
+                snprintf(s_wcal.msg, sizeof(s_wcal.msg),
+                    "Frame cal failed: no usable sensor data -- check the pressure "
+                    "sensor and valve encoder.");
             else
                 snprintf(s_wcal.msg, sizeof(s_wcal.msg),
-                    "Frame cal failed: implausible offset %.1f (peak %.1f). Retry or /cal/valve/set.",
-                    fr.offset, fr.peak);
+                    "Frame cal: found the peak (%.1f) but no angle sealed -- nothing "
+                    "stored. Valve may be leaking; retry after checking.", fr.peak);
             s_wcal.state = WCAL_ERROR;
             motor_rail_off(); sensor_rail_off();
             vTaskDelete(NULL); return;
@@ -13809,6 +14561,12 @@ static void wcal_pressure_task(void *arg)
         "Scan done (%d pts). Valve open a little (%.2f PSI) -- measure the SHORT throw.",
         n, low_psi);
     s_wcal.state = WCAL_PRESSURE_AWAIT_THROW_LOW;
+    // b490: DON'T exit here. The await steps hold the valve OPEN while the
+    // operator walks out to measure, and this task used to vTaskDelete -- so
+    // nothing sampled pressure and, worse, nothing watched the valve. Stay
+    // alive as a supervisor: feed the rolling pressure window that the throw
+    // handlers use for their anchor, and bound the wait.
+    wcal_await_supervisor();
     vTaskDelete(NULL);
 }
 
@@ -14002,7 +14760,8 @@ static esp_err_t api_all_handler(httpd_req_t *req)
         "\"valve_open\":%d,\"uptime_s\":%lu,\"last_sleep_reason\":\"%s\","
         "\"sleep_dur_s\":%lu,\"inact_s\":%lu,"   // b472: expose cadence params
         "\"frame_suspect\":%s,\"frame_calibrated\":%s,"   // b480: closure-verify state
-        "\"device_name\":\"%s\",\"zones\":[",
+        "\"cal_incomplete\":%s,"                          // b490: inherited throw anchors
+        "\"device_name\":\"%s\"",
         FW_BUILD, wifi_get_rssi(), s_wifi_ip,
         hostname ? hostname : "",
         bat_mv,
@@ -14015,7 +14774,30 @@ static esp_err_t api_all_handler(httpd_req_t *req)
         sleep_buf,
         (unsigned long)s_sleep_dur_s, (unsigned long)(s_inactivity_ms/1000u),
         g_frame_suspect?"true":"false", g_valve_frame_calibrated?"true":"false",
+        g_cal_incomplete?"true":"false",
         s_device_name);
+    httpd_resp_send_chunk(req, buf, n);
+
+    // b486: heap headroom. The b448-b461 crash saga was heap exhaustion
+    // (APIOverflowBuffer / ListEntities allocs failing -> abort) and we had
+    // NO runtime number for it -- diagnosis needed UART backtraces. Three
+    // read-only counters, emitted as their own chunk so the first chunk's
+    // 512-byte scratch buffer keeps its existing headroom (see b405 note):
+    //   heap_free     -- free bytes right now
+    //   heap_min_free -- low-water mark since boot; catches the worst
+    //                    moment (e.g. an HA reconnect descriptor burst)
+    //                    even when polled long after it passed
+    //   heap_largest  -- largest contiguous 8-bit block. THE number for
+    //                    the crash class we hit: a big alloc can fail from
+    //                    fragmentation while total free still looks fine.
+    // Static DRAM sits at ~97% of its *segment* (b485 build: 175784/180736)
+    // but that segment is static data only -- these counters measure the
+    // separate ~150KB heap pool, which is what actually ran out.
+    n = snprintf(buf, sizeof(buf),
+        ",\"heap_free\":%lu,\"heap_min_free\":%lu,\"heap_largest\":%lu,\"zones\":[",
+        (unsigned long)esp_get_free_heap_size(),
+        (unsigned long)esp_get_minimum_free_heap_size(),
+        (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     httpd_resp_send_chunk(req, buf, n);
 
     int count=0;
@@ -14479,8 +15261,14 @@ static esp_err_t cal_status_handler(httpd_req_t *req)
     char buf[2048]; int n = 0;
     n += snprintf(buf+n, sizeof(buf)-n,
         "{\"state\":%d,\"msg\":\"%s\",\"progress\":%d,"
+        "\"cal_incomplete\":%s,"        // b490: inherited throw anchors
+        "\"disc_baseline\":%.3f,\"disc_start\":%.1f,\"disc_end\":%.1f,"
+        "\"disc_peak\":%.3f,\"open_deg\":%.1f,"   // b492: discovery diagnostics
         "\"open_psi\":%.3f,\"num_points\":%u,\"points\":[",
         (int)s_wcal.state, s_wcal.msg, s_wcal.progress,
+        g_cal_incomplete ? "true" : "false",
+        s_wcal.disc_baseline, s_wcal.disc_start, s_wcal.disc_end,
+        s_wcal.disc_peak, VALVE_OPEN_DEG,
         s_wcal.pmap_open_psi, pm->num_points);
     for (int i = 0; i < (int)pm->num_points && n < (int)sizeof(buf)-80; i++) {
         n += snprintf(buf+n, sizeof(buf)-n,
@@ -14526,7 +15314,14 @@ static esp_err_t cal_pressure_start_handler(httpd_req_t *req)
 static esp_err_t cal_pressure_throw_low_handler(httpd_req_t *req)
 {
     if (s_wcal.state != WCAL_PRESSURE_AWAIT_THROW_LOW) {
-        httpd_resp_sendstr(req, "{\"error\":\"not awaiting low throw\"}");
+        // b493: say WHY, not just "no". The old bare message appeared when a
+        // cal had already been finished on the timeout, leaving the operator
+        // holding a measurement with no explanation.
+        httpd_resp_sendstr(req, g_cal_incomplete
+            ? "{\"error\":\"this cal already gave up waiting and was finished with the "
+              "previous cal's throw scale -- re-run the calibration to enter measured throws\"}"
+            : "{\"error\":\"not awaiting the SHORT throw right now -- start a pressure "
+              "calibration first (or the cal has already moved on to the max throw)\"}");
         return ESP_OK;
     }
     char body[64] = {0};
@@ -14539,9 +15334,17 @@ static esp_err_t cal_pressure_throw_low_handler(httpd_req_t *req)
         httpd_resp_sendstr(req, "{\"error\":\"throw_mm out of range (100-15000)\"}");
         return ESP_OK;
     }
-    // Fresh pressure at the current short opening -- time-correlated with the
-    // short throw the user just measured.
-    float psi_now = cal_read_pressure_avg();
+    // b490: median of the last ~20 s sampled by the await supervisor while the
+    // valve sat at this opening -- time-correlated with the throw the operator
+    // just watched, and immune to a one-off dip. Falls back to a fresh read if
+    // the window is somehow empty.
+    // b493: if the await parked the valve for safety, use the median frozen at
+    // park time -- taken while water was still running, so it is the pressure
+    // that produced the throw the operator measured. Sampling now would read
+    // ~0 (valve shut) and wreck the fit.
+    float psi_now = s_wcal.anchor_frozen ? s_wcal.anchor_psi_frozen
+                                         : wcal_psi_ring_median();
+    if (psi_now < 0.0f) psi_now = cal_read_pressure_avg();
     s_wcal.pmap_low_psi   = psi_now;
     s_wcal.pmap_low_throw = throw_mm;
     ESP_LOGI(TAG, "cal low throw: %.0f mm at fresh PSI=%.3f", throw_mm, psi_now);
@@ -14561,7 +15364,11 @@ static esp_err_t cal_pressure_throw_low_handler(httpd_req_t *req)
 static esp_err_t cal_pressure_throw_handler(httpd_req_t *req)
 {
     if (s_wcal.state != WCAL_PRESSURE_AWAIT_THROW) {
-        httpd_resp_sendstr(req, "{\"error\":\"not awaiting throw\"}");
+        httpd_resp_sendstr(req, g_cal_incomplete
+            ? "{\"error\":\"this cal already gave up waiting and was finished with the "
+              "previous cal's throw scale -- re-run the calibration to enter measured throws\"}"
+            : "{\"error\":\"not awaiting the MAX throw right now -- enter the SHORT throw "
+              "first, or start a pressure calibration\"}");
         return ESP_OK;
     }
     char body[64] = {0};
@@ -14580,15 +15387,68 @@ static esp_err_t cal_pressure_throw_handler(httpd_req_t *req)
     // still at VALVE_OPEN_DEG from when the low-throw step completed, so this
     // is the same operating point as the throw they just observed.
     pressure_map_t *pm = &s_wcal.pmap;
-    float psi_now = cal_read_pressure_avg();
+    // b494: re-anchor path -- rescale the saved curve through the new
+    // measurement instead of refitting from two anchors.
+    if (s_wcal.reanchor_only) {
+        float psi_r = s_wcal.anchor_frozen ? s_wcal.anchor_psi_frozen
+                                           : wcal_psi_ring_median();
+        if (psi_r < 0.0f) psi_r = cal_read_pressure_avg();
+        float t_old = cal_map_throw_at_psi(pm, psi_r);
+        if (t_old <= 1.0f) {
+            httpd_resp_sendstr(req,
+                "{\"error\":\"cannot read the saved curve at this pressure -- run a full cal\"}");
+            return ESP_OK;
+        }
+        float k = throw_mm / t_old;
+        for (int i = 0; i < (int)pm->num_points; i++) pm->throw_mm[i] *= k;
+        s_wcal.pmap_max_throw = throw_mm;
+        esp_err_t rr = cal_save_primary(pm);
+        s_wcal.reanchor_only = false;
+        s_wcal.incomplete = false;
+        cal_incomplete_set(false);
+        if (!valve_goto(VALVE_CLOSED_DEG, 2.0f, 10000, false))
+            ESP_LOGW(TAG, "re-anchor: final close drive timed out");
+        valve_verify_closed_dry("re-anchor end", true);
+        motor_rail_off(); sensor_rail_off();
+        if (rr == ESP_OK) {
+            snprintf(s_wcal.msg, sizeof(s_wcal.msg),
+                "Re-anchored: %.0fmm (%.1fft) at %.2f PSI -- curve rescaled x%.3f "
+                "(%d pts kept).", throw_mm, throw_mm/304.8f, psi_r, k, pm->num_points);
+            s_wcal.state = WCAL_DONE;
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_sendstr(req, "{\"ok\":true}");
+        } else {
+            snprintf(s_wcal.msg, sizeof(s_wcal.msg),
+                "Re-anchor save FAILED: %s", esp_err_to_name(rr));
+            s_wcal.state = WCAL_ERROR;
+            httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"save failed\"}");
+        }
+        return ESP_OK;
+    }
+    // b490: window median (see the low handler) rather than one reading taken
+    // after the operator walks back.
+    // b493: if the await parked the valve for safety, use the median frozen at
+    // park time -- taken while water was still running, so it is the pressure
+    // that produced the throw the operator measured. Sampling now would read
+    // ~0 (valve shut) and wreck the fit.
+    float psi_now = s_wcal.anchor_frozen ? s_wcal.anchor_psi_frozen
+                                         : wcal_psi_ring_median();
+    if (psi_now < 0.0f) psi_now = cal_read_pressure_avg();
     s_wcal.pmap_max_throw = throw_mm;
     // b385: two-anchor fit -- low anchor from the AWAIT_THROW_LOW step, high
     // anchor measured now at full open. Fills throw_mm[] for every point.
-    cal_apply_two_anchor_throw(pm,
+    float psi_used = cal_apply_two_anchor_throw(pm,
         s_wcal.pmap_low_psi, s_wcal.pmap_low_throw,
         psi_now,             throw_mm);
     ESP_LOGI(TAG, "cal two-anchor: lo(%.3fPSI,%.0fmm) hi(%.3fPSI,%.0fmm)",
-        s_wcal.pmap_low_psi, s_wcal.pmap_low_throw, psi_now, throw_mm);
+        s_wcal.pmap_low_psi, s_wcal.pmap_low_throw, psi_used, throw_mm);
+    // b489/b490: surface supply drift -- psi_used is the scan's own peak, so a
+    // large gap over the anchor window means the supply moved during the cal and
+    // the result deserves a re-run on a steadier supply. Informational only.
+    float drift_pct = (psi_now > 0.01f) ? (psi_used - psi_now) / psi_now * 100.0f : 0.0f;
+    // A properly completed cal clears the incomplete marker.
+    s_wcal.incomplete = false;
+    cal_incomplete_set(false);
     esp_err_t _save_err = cal_save_primary(pm);
     // b481: terminal close of the whole pressure/throw cal -- verify it sealed.
     if (!valve_goto(VALVE_CLOSED_DEG, 2.0f, 10000, false))
@@ -14597,9 +15457,15 @@ static esp_err_t cal_pressure_throw_handler(httpd_req_t *req)
     motor_rail_off();
     sensor_rail_off();
     if (_save_err == ESP_OK) {
-        snprintf(s_wcal.msg, sizeof(s_wcal.msg),
-            "Saved. Max throw %.0fmm (%.1fft), %d points.",
-            throw_mm, throw_mm/304.8f, pm->num_points);
+        if (drift_pct > 10.0f)
+            snprintf(s_wcal.msg, sizeof(s_wcal.msg),
+                "Saved. Max throw %.0fmm (%.1fft), %d points. WARNING: supply "
+                "drifted %.0f%% (anchor %.1f vs peak %.1f PSI) -- consider a re-cal.",
+                throw_mm, throw_mm/304.8f, pm->num_points, drift_pct, psi_now, psi_used);
+        else
+            snprintf(s_wcal.msg, sizeof(s_wcal.msg),
+                "Saved. Max throw %.0fmm (%.1fft), %d points.",
+                throw_mm, throw_mm/304.8f, pm->num_points);
         s_wcal.state = WCAL_DONE;
         httpd_resp_set_type(req, "application/json");
         httpd_resp_sendstr(req, "{\"ok\":true}");
@@ -14888,7 +15754,79 @@ static esp_err_t cal_encoder_handler(httpd_req_t *req)
 // (not stored; valve still parked closed by ball geometry). Typedef + forward
 // declaration live above wcal_pressure_task, which calls this from earlier in
 // the file.
+// b488: find a DRY anchor with zero frame knowledge.
+//
+// The magnet mounts at a random rotation per unit, so on a first cal the
+// stored frame is meaningless -- but "where is the water off?" is answerable
+// from pressure alone. Step around looking for a reading below
+// LEAK_CLOSED_PSI; if nothing is ever dry (weeping seal, debris) fall back to
+// the lowest-pressure angle seen so the caller can still proceed and flag the
+// frame suspect. Never trust a "dry" result as evidence of geometry: with the
+// supply OFF every angle reads dry, which is exactly why the caller must still
+// require real flow during the sweep before storing anything.
+//
+// Returns true if a genuinely dry angle was found. *anchor is always set (the
+// dry angle, or the argmin), *min_psi to the lowest settled median seen, and
+// *reads_ok false only if the sensor never returned a sample at all.
+static bool valve_seek_dry_anchor(float *anchor, float *min_psi, bool *reads_ok)
+{
+    uint16_t raw = 0;
+    *reads_ok = false;
+    if (!as5600_read(ADDR_AS5600L, &raw, NULL, NULL)) { *anchor = -1.0f; return false; }
+    float cur = raw * (360.0f / 4096.0f);
+    float best_deg = cur, best_psi = 1e9f;
+    float dir = -1.0f;                       // closing direction on reference wiring
+    float prev = -1.0f;
+    for (int i = 0; i < 13; i++) {           // 13 x 15 = 195 deg > one 180 period
+        float psi = cal_pressure_settled_median(3);
+        if (psi >= 0.0f) {
+            *reads_ok = true;
+            if (psi < best_psi) { best_psi = psi; best_deg = cur; }
+            if (psi < LEAK_CLOSED_PSI) {
+                *anchor = cur; *min_psi = psi;
+                INFO("Frame anchor: dry at %.1f deg raw (%.2f PSI)", cur, psi);
+                return true;
+            }
+            // First step made it clearly worse -> walking toward max flow;
+            // reverse once and keep going the other way.
+            if (i == 1 && prev >= 0.0f && psi > prev + 0.2f) dir = -dir;
+            prev = psi;
+        }
+        cur += dir * 15.0f;
+        valve_goto_direct(cur, 2.0f, 6000, false);
+        vTaskDelay(pdMS_TO_TICKS(400));
+    }
+    *anchor  = best_deg;
+    *min_psi = (best_psi > 1e8f) ? -1.0f : best_psi;
+    ESP_LOGW(TAG, "Frame anchor: never dry; using min-pressure angle %.1f deg (%.2f PSI)",
+             best_deg, *min_psi);
+    return false;
+}
+
+// Normalize a frame offset into (-90, +90]. A ball valve's flow curve has a
+// 180 deg period (open at t, closed at t+/-90, open again at t+180), so the
+// frame is only meaningful mod 180 -- and every possible magnet rotation maps
+// into this half-period. That makes the old "implausible offset" rejection
+// impossible to trigger spuriously on a first cal.
+static float valve_offset_normalize(float off)
+{
+    while (off >   90.0f) off -= 180.0f;
+    while (off <= -90.0f) off += 180.0f;
+    return off;
+}
+
+// b495: wrapper so the no-sleep flag is cleared on EVERY exit path of the
+// sweep (there are five returns inside).
 static int valve_frame_sweep(vframe_sweep_result_t *out)
+{
+    s_frame_sweep_start  = xTaskGetTickCount();
+    s_frame_sweep_active = true;
+    int rc = valve_frame_sweep_inner(out);
+    s_frame_sweep_active = false;
+    return rc;
+}
+
+static int valve_frame_sweep_inner(vframe_sweep_result_t *out)
 {
     memset(out, 0, sizeof(*out));
     out->flow_start = -1.0f;
@@ -14909,12 +15847,30 @@ static int valve_frame_sweep(vframe_sweep_result_t *out)
     g_valve_motor_dir = (int8_t)mdir;
     motor_dir_nvs_save("dir", (int8_t)mdir);
 
-    // b474: seat closed first so the sweep begins BELOW flow onset -- required
-    // to observe the per-unit onset angle. Uses the current offset's closed
-    // (peak-75.7 deg), which is still below onset on both the reference frame
-    // and a re-cal'd unit. The onset capture is additionally guarded on
-    // "started dry", so a wrong first-cal offset can't store a bogus onset.
-    valve_goto_direct(VALVE_CLOSED_DEG, 2.0f, 8000, false);
+    // b488: anchor on a MEASURED dry angle, not on the stored frame.
+    //
+    // The old code seated to VALVE_CLOSED_DEG (= 231 + stored offset) and swept
+    // 120 deg from there, which only finds the peak when the true offset lies in
+    // [-75.7, +44.3] -- roughly a third of the possible magnet rotations. Every
+    // other unit failed first cal with a bogus "turn the water on". It also made
+    // failure self-perpetuating: a bad stored offset biased the next attempt.
+    // Anchoring on measured dry means every cal starts from physical reality,
+    // whatever garbage is in NVS, so a unit can never calibrate itself into a
+    // corner. It also guarantees the b474 "started dry" precondition for the
+    // flow-onset capture.
+    float anchor = 0.0f, anchor_psi = -1.0f; bool reads_ok = false;
+    bool anchor_dry = valve_seek_dry_anchor(&anchor, &anchor_psi, &reads_ok);
+    out->anchor_deg = anchor; out->anchor_was_dry = anchor_dry;
+    if (!reads_ok) {   // pressure sensor (or the valve encoder) never answered
+        ESP_LOGE(TAG, "Frame cal: no usable sensor data at anchor stage "
+                      "(anchor %.1f, min_psi %.2f)", anchor, anchor_psi);
+        motor_rail_off();
+        return -4;
+    }
+    if (!anchor_dry)
+        ESP_LOGW(TAG, "Frame cal: anchor never read dry (min %.2f PSI) -- "
+                      "continuing from lowest-pressure angle", anchor_psi);
+    valve_goto_direct(anchor, 2.0f, 8000, false);
     vTaskDelay(pdMS_TO_TICKS(400));
 
     // Phase 1 -- coarse sweep from the current angle. Settle, then read a
@@ -14934,8 +15890,13 @@ static int valve_frame_sweep(vframe_sweep_result_t *out)
     float flow_start = -1.0f;
     bool  started_dry = false, first_sample = true;
     const float STEP = 3.0f;
-    const float SPAN = 120.0f;             // sweep up to start + 120 deg
-    for (int i = 0; i < 50 && deg < start + SPAN; i++) {
+    // b488: 120 -> 160 deg. From a dry anchor the nearest peak is at most ~136
+    // deg away in a fixed direction (the dry arc is ~93 deg wide and the peak
+    // sits ~44 deg past its edge), so 160 covers the worst case with margin.
+    // The adaptive "falling" break below still exits early in the typical case,
+    // so this costs water only when the anchor happens to sit far from a peak.
+    const float SPAN = 160.0f;
+    for (int i = 0; i < 60 && deg < start + SPAN; i++) {
         valve_goto_direct(deg, 0.5f, 4000, false);
         vTaskDelay(pdMS_TO_TICKS(1500));            // let motion transients dissipate
         float psi = cal_pressure_settled_median(5);
@@ -14949,8 +15910,11 @@ static int valve_frame_sweep(vframe_sweep_result_t *out)
     }
 
     // Must have seen real flow, else the supply is off / too low to calibrate.
+    // b488: park back at the MEASURED anchor (not the assumed frame's closed,
+    // which may be wet on an uncalibrated unit) so a failed cal leaves the
+    // valve at the safest angle we actually observed.
     if (best_psi < 1.0f) {
-        valve_goto_direct(start, 2.0f, 8000, false);
+        valve_goto_direct(anchor, 2.0f, 8000, false);
         motor_rail_off();
         out->max_psi = best_psi;
         return -2;
@@ -14968,19 +15932,106 @@ static int valve_frame_sweep(vframe_sweep_result_t *out)
     }
     best_psi = peak_psi;
 
-    float offset = peak - 306.7f;
-    if (offset <= -120.0f || offset >= 120.0f) {   // b473: ±60 -> ±120 (motor swap can re-clock the magnet, e.g. ba1f88 ~-78 deg)
-        // Implausible -- don't store, but still park closed by ball geometry.
-        // b62944 lesson: a sweep that starts inside/past a flow window can
-        // latch its own start as "best" and land here -- the mirrored (mod
-        // 180) window is often the real one. Not auto-applied: the caller /
-        // user decides (see tools/extract_factory_cal.py caution block).
-        valve_goto_direct(peak - 90.0f, 2.0f, 10000, false);
+    // b488: VERIFY BEFORE STORE. Nothing is persisted until the measured frame
+    // has reproduced its geometry -- park where it claims "closed" and prove the
+    // water is off. This is what makes the cal un-foolable by a supply that was
+    // toggled mid-sweep (a tap event fabricates a plausible peak, but it will
+    // not reproduce) and by a stuck-high sensor (never reads dry anywhere).
+    //
+    // It also makes a died-mid-cal unit recoverable: the old code saved the
+    // offset -- and flipped g_valve_frame_calibrated -- BEFORE this park, so a
+    // brownout in that window left a unit believing it held a proven frame it
+    // had never verified. Now a dead cal leaves no trace at all.
+    //
+    // Both closed positions (peak-90 and peak+90) are the same hydraulic state
+    // mod 180, so if the first is wet we try its mirror before giving up; a
+    // winning mirror simply means the frame is shifted 180 deg.
+    bool  mirrored = false;
+    float closed   = peak - 90.0f;
+    valve_goto_direct(closed, 2.0f, 10000, true);
+    vTaskDelay(pdMS_TO_TICKS(400));
+    float park_psi = cal_pressure_settled_median(5);
+    // NOTE: unlike valve_verify_closed_dry() at boot, an unreadable sensor is
+    // NOT accepted as "dry" here. Cal acceptance requires positive evidence.
+    bool sealed_clean = (park_psi >= 0.0f && park_psi < LEAK_CLOSED_PSI);
+    if (!sealed_clean) {
+        float mirror = peak + 90.0f;
+        ESP_LOGW(TAG, "Frame park wet at %.1f deg (%.2f PSI) -- trying mirror %.1f",
+                 closed, park_psi, mirror);
+        valve_goto_direct(mirror, 2.0f, 10000, true);
+        vTaskDelay(pdMS_TO_TICKS(400));
+        float mpsi = cal_pressure_settled_median(5);
+        if (mpsi >= 0.0f && mpsi < LEAK_CLOSED_PSI) {
+            mirrored = true; sealed_clean = true;
+            closed = mirror; peak = peak + 180.0f;   // same lobe, other half-period
+            park_psi = mpsi;
+            INFO("Frame mirror sealed (%.2f PSI) -- frame shifted 180 deg", mpsi);
+        } else {
+            park_psi = mpsi;
+        }
+    }
+
+    // b495: pick the half-period representative NEAREST THE STORED FRAME, not
+    // the one that happens to fall inside (-90, +90].
+    //
+    // The frame is only meaningful mod 180, so an offset has two equally valid
+    // representatives 180 apart. b488 always canonicalised into (-90, +90] --
+    // fine in the middle of that window, but ba1f88 sits at ~+88, right on the
+    // boundary. Three back-to-back sweeps measured peaks within ~5.5 deg of each
+    // other, yet the stored offset read +87.53 then -87.01: mod 180 those are
+    // 5.46 deg apart, but they straddle the wrap, so the frame appeared to flip
+    // 174 deg between runs and left the saved pressure map inconsistent with it.
+    // Anchoring on the existing frame keeps successive cals on the same
+    // representative, so a re-cal moves the frame by the measurement error and
+    // nothing more. A first cal (no frame yet) still canonicalises.
+    float off_raw  = peak - 306.7f;
+    float offset   = valve_offset_normalize(off_raw);
+    float peak_adj = peak + (offset - off_raw);
+    if (g_valve_frame_calibrated) {
+        float alt = (offset > 0.0f) ? offset - 180.0f : offset + 180.0f;
+        if (alt > -120.0f && alt < 120.0f &&          // storable (b473 clamp)
+            fabsf(alt - g_valve_offset_deg) < fabsf(offset - g_valve_offset_deg)) {
+            INFO("Frame: using representative %.2f (near stored %.2f) instead of %.2f",
+                 alt, g_valve_offset_deg, offset);
+            peak_adj += (alt - offset);
+            offset    = alt;
+        }
+    }
+    peak = peak_adj;
+    // b495: the representative choice moves where the frame says "closed", so
+    // re-prove the seal THERE rather than relying on the park we verified at
+    // the pre-shift position. Belt and suspenders: never store a closed angle
+    // that has not itself been shown dry.
+    if (sealed_clean) {
+        float final_closed = peak - 90.0f;
+        if (fabsf(final_closed - closed) > 1.0f) {
+            valve_goto_direct(final_closed, 2.0f, 10000, true);
+            vTaskDelay(pdMS_TO_TICKS(400));
+            float fpsi = cal_pressure_settled_median(5);
+            if (fpsi >= 0.0f && fpsi < LEAK_CLOSED_PSI) {
+                closed = final_closed; park_psi = fpsi;
+                INFO("Frame: re-verified seal at chosen representative (%.2f PSI)", fpsi);
+            } else {
+                ESP_LOGW(TAG, "Frame: chosen representative did not seal (%.2f PSI) "
+                              "-- not storing", fpsi);
+                sealed_clean = false; park_psi = fpsi;
+            }
+        }
+    }
+
+    if (!sealed_clean) {
+        // Measured a peak but no angle sealed -- do NOT store. Retreat to the
+        // measured anchor (best observed) and let the caller report honestly.
+        valve_verify_closed_dry("frame-sweep park", true);  // rescue + fault + suspect
+        valve_goto_direct(anchor, 2.0f, 10000, false);
         motor_rail_off();
-        out->peak = peak; out->offset = offset; out->max_psi = best_psi;
+        out->peak = peak; out->offset = offset; out->closed = closed;
+        out->max_psi = best_psi; out->flow_start = flow_start; out->mirrored = mirrored;
         return -3;
     }
 
+    // Proven sealed -> now it is safe to persist. Order matters: offset first
+    // (the onset is expressed relative to it).
     g_valve_offset_deg = offset;
     valve_offset_nvs_save(offset);
 
@@ -14990,8 +16041,11 @@ static int valve_frame_sweep(vframe_sweep_result_t *out)
     // re-truncate the short-throw rings). Plausibility-gated 30-70 deg before
     // the peak. If not captured/implausible, the prior value (or 263 default)
     // stands -- so a unit that never re-cals is unaffected.
+    // b488: the mirrored case shifts the frame 180, so the raw onset angle no
+    // longer maps into the gate window -- skip it rather than store a bogus
+    // floor; the next (non-mirrored) cal will capture it.
     float cstart_frame = 0.0f; bool cstart_stored = false;
-    if (started_dry && flow_start > 0.0f) {
+    if (started_dry && flow_start > 0.0f && !mirrored) {
         cstart_frame = (flow_start - 2.0f) - offset;
         if (cstart_frame > 236.7f && cstart_frame < 276.7f) {
             g_valve_cal_start_frame = cstart_frame;
@@ -14999,66 +16053,168 @@ static int valve_frame_sweep(vframe_sweep_result_t *out)
             cstart_stored = true;
         }
     }
-
-    // Park fully closed: 90 deg back from the pressure peak (ball geometry).
-    float closed = peak - 90.0f;
-    valve_goto_direct(closed, 2.0f, 10000, true);
-    // b480: "off is always off" -- prove the park sealed before declaring
-    // success. Deliberately NOT valve_verify_closed_dry() first: a park that
-    // only seals after a seek-dry rescue is still a MISCALIBRATED frame and
-    // must not clear the suspect flag.
-    float park_psi = cal_pressure_settled_median(3);
-    bool sealed_clean = (park_psi < 0.0f) || (park_psi < LEAK_CLOSED_PSI);
-    if (!sealed_clean)
-        valve_verify_closed_dry("frame-sweep park", true);  // rescue + fault + suspect
     motor_rail_off();
 
     out->peak = peak; out->offset = offset; out->closed = closed;
     out->max_psi = best_psi; out->flow_start = flow_start;
-    out->cstart_stored = cstart_stored;
-    if (!sealed_clean) return -3;
+    out->cstart_stored = cstart_stored; out->mirrored = mirrored;
     valve_frame_suspect_set(false);   // measured, stored, and verified sealed
     return 0;
 }
 
+// b496: last frame-sweep outcome, for the now-ASYNC POST /cal/valve.
+static struct {
+    volatile bool         running;
+    int                   rc;      // 1 = in progress, 0 = ok, <0 = failure code
+    char                  msg[176];
+    vframe_sweep_result_t res;
+} s_fsweep;
+
+// b496: describe a sweep result. Shared by the async status and the pressure
+// cal's auto-sweep so both speak with one voice.
+static void fsweep_describe(int rc, const vframe_sweep_result_t *r,
+                            char *out, size_t cap)
+{
+    switch (rc) {
+    case 0:
+        snprintf(out, cap, "ok -- offset %.2f, peak %.1f, closed %.1f, max %.2f PSI%s",
+                 r->offset, r->peak, r->closed, r->max_psi,
+                 r->mirrored ? " (mirror lobe sealed)" : "");
+        break;
+    case -1:
+        snprintf(out, cap, "valve never moved -- check motor power/wiring, then retry");
+        break;
+    case -2:
+        snprintf(out, cap, "no pressure response across 160 deg (max %.2f PSI) -- supply "
+                           "off/too low, or valve not coupled to the motor", r->max_psi);
+        break;
+    case -4:
+        snprintf(out, cap, "no usable sensor data -- check MPRLS (0x18) and the valve "
+                           "encoder AS5600L (0x40)");
+        break;
+    default:
+        snprintf(out, cap, "peak found at %.1f (offset %.2f) but no angle sealed -- nothing "
+                           "stored; valve may be leaking", r->peak, r->offset);
+        break;
+    }
+}
+
+static void valve_frame_sweep_task(void *arg)
+{
+    (void)arg;
+    vframe_sweep_result_t r;
+    int rc = valve_frame_sweep(&r);
+    s_fsweep.res = r;
+    s_fsweep.rc  = rc;
+    fsweep_describe(rc, &r, s_fsweep.msg, sizeof(s_fsweep.msg));
+    ESP_LOGI(TAG, "frame sweep finished: %s", s_fsweep.msg);
+    s_fsweep.running = false;
+    vTaskDelete(NULL);
+}
+
+// b496: POST /cal/valve now STARTS the sweep and returns immediately; poll
+// GET /cal/valve for sweep_running / sweep_msg.
+//
+// It used to run the 2-4 minute sweep inline in the HTTP handler, which
+// outlived the web server's socket timeout -- so the result JSON was never
+// delivered and every caller saw an empty response and concluded the sweep had
+// failed, when it had actually succeeded (ba1f88 2026-07-28: three sweeps, zero
+// responses, all three completed). Blocking the handler also starved the whole
+// web UI for the duration.
 static esp_err_t cal_valve_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "application/json");
-    vframe_sweep_result_t r;
-    int rc = valve_frame_sweep(&r);
-    char buf[300];
-    int n;
-    switch (rc) {
-    case 0:
-        n = snprintf(buf, sizeof(buf),
-            "{\"ok\":true,\"peak_deg\":%.2f,\"offset\":%.2f,\"closed_deg\":%.2f,"
-            "\"max_psi\":%.3f,\"motor_dir\":%d,\"flow_start_deg\":%.2f,"
-            "\"cal_start_frame\":%.2f,\"cal_start_stored\":%s}",
-            r.peak, r.offset, r.closed, r.max_psi, (int)g_valve_motor_dir,
-            r.flow_start, g_valve_cal_start_frame, r.cstart_stored ? "true" : "false");
-        break;
-    case -1:
-        n = snprintf(buf, sizeof(buf),
-            "{\"error\":\"polarity probe: valve never moved -- check motor power/wiring, then retry\"}");
-        break;
-    case -2:
-        n = snprintf(buf, sizeof(buf),
-            "{\"error\":\"no flow (max %.2f PSI) -- turn the water supply ON, then retry\"}",
-            r.max_psi);
-        break;
-    default:
-        n = snprintf(buf, sizeof(buf),
-            "{\"error\":\"implausible offset %.2f (peak %.2f, max %.3f PSI) -- not stored\"}",
-            r.offset, r.peak, r.max_psi);
-        break;
+    if (s_fsweep.running || s_frame_sweep_active) {
+        httpd_resp_sendstr(req,
+            "{\"error\":\"a frame sweep is already running -- poll GET /cal/valve\"}");
+        return ESP_OK;
     }
-    httpd_resp_send(req, buf, n);
+    if (s_web_water_mode != 0) {
+        httpd_resp_sendstr(req, "{\"error\":\"device is watering\"}");
+        return ESP_OK;
+    }
+    if (s_wcal.state != WCAL_IDLE && s_wcal.state != WCAL_DONE &&
+        s_wcal.state != WCAL_ERROR) {
+        httpd_resp_sendstr(req, "{\"error\":\"a calibration is already running\"}");
+        return ESP_OK;
+    }
+    s_fsweep.running = true;
+    s_fsweep.rc      = 1;
+    snprintf(s_fsweep.msg, sizeof(s_fsweep.msg),
+             "sweep running (2-4 min, water will run) -- poll GET /cal/valve");
+    if (xTaskCreatePinnedToCore(valve_frame_sweep_task, "vframe_sweep", 8192,
+                                NULL, 4, NULL, 0) != pdPASS) {
+        s_fsweep.running = false;
+        s_fsweep.rc      = -5;
+        snprintf(s_fsweep.msg, sizeof(s_fsweep.msg), "could not start sweep task (low memory)");
+        httpd_resp_sendstr(req, "{\"error\":\"could not start sweep task (low memory)\"}");
+        return ESP_OK;
+    }
+    httpd_resp_sendstr(req,
+        "{\"ok\":true,\"started\":true,\"note\":\"sweep runs 2-4 min with water on; "
+        "poll GET /cal/valve for sweep_running and sweep_msg\"}");
     return ESP_OK;
 }
 
 // b390: set the valve frame offset directly (no sweep). Used to push a known
 // offset -- e.g. one decoded from the factory valve_home, or a hand-verified
 // value -- and persist it. POST /cal/valve/set?offset=<deg>
+// b489: read-only frame inspection. GET /cal/valve
+//
+// There was no way to see the stored frame without running a sweep or pushing
+// a new value -- diagnosing the ba1f88 poison test meant INFERRING the offset
+// from the valve angles in the cal point table. Now the frame is directly
+// readable, including whether it has ever been measured and whether it is
+// currently trusted.
+// b494: POST /cal/throw/reanchor -- reopen the valve so the operator can
+// measure the max throw properly, then rescale the SAVED curve through it. No
+// pressure re-scan: the v->p data was never the problem, only the one throw
+// number every t value is derived from.
+static esp_err_t cal_throw_reanchor_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/json");
+    if (s_wcal.state != WCAL_IDLE && s_wcal.state != WCAL_DONE &&
+        s_wcal.state != WCAL_ERROR) {
+        httpd_resp_sendstr(req, "{\"error\":\"a calibration is already running\"}");
+        return ESP_OK;
+    }
+    if (s_web_water_mode != 0) {
+        httpd_resp_sendstr(req, "{\"error\":\"device is watering\"}");
+        return ESP_OK;
+    }
+    s_wcal.progress = 0;
+    snprintf(s_wcal.msg, sizeof(s_wcal.msg), "Re-anchor starting -- opening valve...");
+    xTaskCreatePinnedToCore(wcal_reanchor_task, "wcal_reanchor", 6144, NULL, 4, NULL, 0);
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+static esp_err_t cal_valve_info_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/json");
+    char buf[560];
+    int n = snprintf(buf, sizeof(buf),
+        "{\"offset\":%.2f,\"calibrated\":%s,\"suspect\":%s,\"cal_incomplete\":%s,"
+        "\"closed_deg\":%.2f,\"open_deg\":%.2f,\"peak_deg\":%.2f,"
+        "\"cal_start_frame\":%.2f,\"cal_start_deg\":%.2f,\"motor_dir\":%d,"
+        // b496: async sweep status -- POST /cal/valve returns immediately now
+        "\"sweep_running\":%s,\"sweep_rc\":%d,\"sweep_msg\":\"%s\","
+        "\"sweep_anchor_deg\":%.2f,\"sweep_anchor_dry\":%s,\"sweep_mirrored\":%s}",
+        g_valve_offset_deg,
+        g_valve_frame_calibrated ? "true" : "false",
+        g_frame_suspect ? "true" : "false",
+        g_cal_incomplete ? "true" : "false",
+        VALVE_CLOSED_DEG, VALVE_OPEN_DEG, VALVE_PEAK_DEG,
+        g_valve_cal_start_frame, VALVE_CAL_START_DEG,
+        (int)g_valve_motor_dir,
+        s_fsweep.running ? "true" : "false", s_fsweep.rc, s_fsweep.msg,
+        s_fsweep.res.anchor_deg,
+        s_fsweep.res.anchor_was_dry ? "true" : "false",
+        s_fsweep.res.mirrored ? "true" : "false");
+    httpd_resp_send(req, buf, n);
+    return ESP_OK;
+}
+
 static esp_err_t cal_valve_set_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "application/json");
@@ -15075,14 +16231,24 @@ static esp_err_t cal_valve_set_handler(httpd_req_t *req)
     }
     g_valve_offset_deg = off;
     valve_offset_nvs_save(off);
-    // b480: an explicitly pushed offset counts as a human vouching for the
-    // frame -- clear the suspect flag. The very next verified close will
-    // re-flag it if the pushed value is wrong (b62944: a bad factory-decode
-    // push put "closed" ON the flow window; the leak check caught it).
-    valve_frame_suspect_set(false);
-    char buf[140];
+    // b489: a pushed offset is a CLAIM, not a measurement -- mark the frame
+    // suspect until something verifies it.
+    //
+    // b480 did the opposite (cleared suspect, treating the push as a human
+    // vouching for the frame), betting that "the very next verified close will
+    // re-flag it if wrong". That bet failed on ba1f88 2026-07-28: clearing
+    // suspect ALSO satisfies the web pressure cal's auto-frame-sweep trigger
+    // (!calibrated || suspect), so a deliberately bad push sailed straight into
+    // a pressure scan on the bad frame and produced a junk 18-point cal. Marking
+    // it suspect instead means the next pressure cal measures the frame first --
+    // which is exactly the self-correction we want armed after an unverified
+    // push. Scheduled runs are refused meanwhile; manual + cal still work.
+    valve_frame_suspect_set(true);
+    char buf[220];
     int n = snprintf(buf, sizeof(buf),
-        "{\"ok\":true,\"offset\":%.2f,\"closed_deg\":%.2f,\"open_deg\":%.2f,\"peak_deg\":%.2f}",
+        "{\"ok\":true,\"offset\":%.2f,\"closed_deg\":%.2f,\"open_deg\":%.2f,\"peak_deg\":%.2f,"
+        "\"frame_suspect\":true,\"note\":\"pushed offset is unverified -- run POST /cal/valve "
+        "or a pressure cal to measure and clear\"}",
         off, 231.0f + off, 308.0f + off, 306.7f + off);
     httpd_resp_send(req, buf, n);
     return ESP_OK;
@@ -16177,15 +17343,23 @@ static esp_err_t zone_last_water_handler(httpd_req_t *req)
     uint16_t lw_zone_id = ids[0] ? (uint16_t)atoi(ids) : s_web_zone_id;
     // b298: bump from 2048 -> 8192. The previous size truncated the
     // rings[] array at ~12 entries because each ring's JSON object is
-    // ~150 chars and the guard `n < sizeof(buf) - 120` cut the loop
-    // short for the 15-ring N1 and 23-ring N2 zones. 8KB comfortably
-    // fits WATER_RUN_MAX_RINGS (36) rings: 36*170 + 250 header ~= 6.4KB.
-    static char buf[8192];
+    // ~150 chars and the guard cut the loop short for the 15-ring N1 and
+    // 23-ring N2 zones.
+    // b498: 8192 -> 10240 (head/tail grew each ring to ~200 chars; 36*200 +
+    // 250 header ~= 7.5KB), and static -> heap. Static DRAM is at 98.9%;
+    // a buffer used only while this handler runs shouldn't hold 10KB of it
+    // permanently. Transient alloc failure degrades to a 500, not a crash.
+    const size_t BUFSZ = 10240;
+    char *buf = malloc(BUFSZ);
+    if (!buf) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_OK;
+    }
     int n = 0;
     water_run_t _run = {0};
     if (storage_ready()) storage_water_load(lw_zone_id, &_run);
     const water_run_t *r = &_run;
-    n += snprintf(buf+n, sizeof(buf)-n,
+    n += snprintf(buf+n, BUFSZ-n,
         "{\"fw_build\":%u,\"num_rings\":%u,"
         "\"arc_start\":%.1f,\"arc_span\":%.1f,"
         // b281: run-level supply pressure summary
@@ -16199,25 +17373,33 @@ static esp_err_t zone_last_water_handler(httpd_req_t *req)
         r->arc_start_deg, r->arc_span_deg,
         r->supply_psi_min, r->supply_psi_max, r->supply_psi_avg,
         (unsigned)r->rings_supply_limited, r->target_depth_mm);
+    // Guard margin must exceed the largest possible ring object (~240 chars
+    // with b498's head/tail fields) plus the closing "]}"; snprintf RETURNS
+    // the untruncated length, so a too-small margin would let n pass BUFSZ
+    // and wrap the size_t arithmetic on the next call.
     for (int i = 0; i < (int)r->num_rings && i < WATER_RUN_MAX_RINGS
-                     && n < (int)sizeof(buf)-120; i++) {
+                     && n < (int)BUFSZ-320; i++) {
         const water_ring_data_t *rd = &r->rings[i];
-        n += snprintf(buf+n, sizeof(buf)-n,
+        n += snprintf(buf+n, BUFSZ-n,
             "%s{\"throw_mm\":%.0f,\"avg_psi\":%.3f,"
             "\"dps\":%.2f,\"active_deg\":%.1f,\"actual_throw_mm\":%.0f,"
             "\"arc_s\":%.1f,\"arc_e\":%.1f,"
             // b281: per-ring valve angle + back-computed supply pressure
-            "\"valve_deg\":%.2f,\"supply_psi_est\":%.2f}",
+            "\"valve_deg\":%.2f,\"supply_psi_est\":%.2f,"
+            // b498: per-ring pressure derivative (well-pump cycle visibility)
+            "\"head_psi\":%.3f,\"tail_psi\":%.3f}",
             i ? "," : "", rd->throw_mm, rd->avg_psi, rd->dps,
             rd->active_deg, rd->actual_throw_mm,
             rd->arc_start_deg, rd->arc_end_deg,
-            rd->valve_deg, rd->supply_psi_est);
+            rd->valve_deg, rd->supply_psi_est,
+            rd->head_psi, rd->tail_psi);
     }
-    n += snprintf(buf+n, sizeof(buf)-n, "]}");
+    n += snprintf(buf+n, BUFSZ-n, "]}");
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     HTTP_CONN_CLOSE(req);
     httpd_resp_send(req, buf, n);
+    free(buf);
     return ESP_OK;
 }
 
@@ -16229,7 +17411,9 @@ static void zone_web_start(void)
     httpd_config_t cfg   = HTTPD_DEFAULT_CONFIG();
     cfg.server_port      = ZONE_WEB_PORT;
     cfg.ctrl_port        = ZONE_WEB_CTRL_PORT;
-    cfg.max_uri_handlers  = 68;  // MUST be set before httpd_start (cfg is copied there);
+    cfg.max_uri_handlers  = 70;  // b489: 68 -> 70, keeping the 2-slot margin over
+                                 // the _Static_assert below.
+                                 // MUST be set before httpd_start (cfg is copied there);
                                  // headroom over uris[] count -- _Static_assert below guards it.
                                  // (b378: was 40 and silently dropped every handler past #40,
                                  //  including /valve/probe and all /fs/* -- the post-start
@@ -16305,6 +17489,8 @@ static void zone_web_start(void)
         {.uri="/zone/export",           .method=HTTP_GET,  .handler=zone_export_handler},    // b398
         {.uri="/zone/import",           .method=HTTP_POST, .handler=zone_import_handler},     // b398
         {.uri="/zone/trace",            .method=HTTP_POST, .handler=zone_trace_handler},      // b417
+        {.uri="/cal/throw/reanchor",    .method=HTTP_POST, .handler=cal_throw_reanchor_handler}, // b494
+        {.uri="/cal/valve",             .method=HTTP_GET,  .handler=cal_valve_info_handler}, // b489
         {.uri="/cal/valve",             .method=HTTP_POST, .handler=cal_valve_handler},   // b389
         {.uri="/cal/valve/set",         .method=HTTP_POST, .handler=cal_valve_set_handler}, // b390
         {.uri="/cal/valve/start/set",   .method=HTTP_POST, .handler=cal_valve_start_set_handler}, // b474
@@ -16314,7 +17500,7 @@ static void zone_web_start(void)
         {.uri="/fs/upload",             .method=HTTP_POST, .handler=fs_upload_handler},
         {.uri="/fs/delete",             .method=HTTP_POST, .handler=fs_delete_handler},
     };
-    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 66,
+    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 68,   // b489: 66 -> 68 (GET /cal/valve)
                    "uris[] exceeds cfg.max_uri_handlers -- raise it before httpd_start");
     for (size_t i = 0; i < sizeof(uris)/sizeof(uris[0]); i++)
         httpd_register_uri_handler(s_zone_server, &uris[i]);
@@ -16837,10 +18023,52 @@ float irrigoto_last_water_total_depth_mm(void)
     return sum;
 }
 
-// Area covered (m^2). Each ring is approximated as a thin annular sector
-// of width WATER_RING_SPACING centered on the ring's throw distance.
-// A_ring_mm2 = (active_deg * pi/180) * throw_mm * spacing_mm
-// Summed across rings that actually ran (depth > 0 or active arc > 0).
+// b487: radial width of the ground annulus a ring actually owns (mm).
+//
+// Ring generation steps inward by sp = WATER_RING_SPACING * (t/act_max_throw),
+// floored at WATER_MIN_RING_SPACING -- so the gap between consecutive rings
+// SHRINKS toward the centre. Charging every ring the flat WATER_RING_SPACING
+// (700mm) therefore counted inner ground many times over. Measured against a
+// real 35-ring capture (builds/serp_full_b432_water.csv): flat spacing summed
+// to 513 m^2 where the physical ceiling (pi * rmax^2) is 176 m^2 -- a 2.92x
+// over-count. Reproducing the generation formula still gives 1.71x (it uses
+// the step computed AT the outer radius, not the gap that ended up between
+// the stored rings). Midpoint-differencing the actual stored throws lands at
+// 1.04x, so that is what we do: each ring owns half the gap to the ring
+// outside it plus half the gap to the ring inside it.
+//
+// This is REPORTING ONLY. The heatmap/coverage raster classifies cells with
+// ring_covers(), which keeps its own +-WATER_RING_SPACING/2 footprint band --
+// deliberately untouched here so heatmaps render exactly as before.
+static float ring_annulus_width_mm(int nr, int idx)
+{
+    float r = s_last_water_run.rings[idx].throw_mm;
+    float outer = 0.0f, inner = 0.0f;
+    bool have_outer = false, have_inner = false;
+    for (int j = 0; j < nr; j++) {
+        if (j == idx) continue;
+        const water_ring_data_t *o = &s_last_water_run.rings[j];
+        if (o->active_deg <= 0.0f || o->throw_mm <= 0.0f) continue;
+        float t = o->throw_mm;
+        if (t > r + 1.0f)      { if (!have_outer || t < outer) { outer = t; have_outer = true; } }
+        else if (t < r - 1.0f) { if (!have_inner || t > inner) { inner = t; have_inner = true; } }
+    }
+    float w;
+    if (have_outer && have_inner) w = (outer - inner) * 0.5f;
+    else if (have_inner)          w = (r - inner);   // outermost ring
+    else if (have_outer)          w = (outer - r);   // innermost ring
+    else                          w = (float)WATER_RING_SPACING;  // lone ring
+    if (w > (float)WATER_RING_SPACING) w = (float)WATER_RING_SPACING;
+    if (w < 1.0f)                      w = 1.0f;
+    return w;
+}
+
+// Area covered (m^2). Each ring is an annular sector of its own measured
+// width (see ring_annulus_width_mm) centered on its throw distance:
+//   A_ring_mm2 = (active_deg * pi/180) * throw_mm * width_mm
+// Summed across rings that actually ran. On a multi-pass run the same radius
+// appears more than once; ground is counted ONCE (the repeat pass's water is
+// accounted in volume, not area).
 float irrigoto_last_water_area_m2(void)
 {
     float sum_mm2 = 0.0f;
@@ -16849,14 +18077,25 @@ float irrigoto_last_water_area_m2(void)
     for (int i = 0; i < nr; i++) {
         const water_ring_data_t *r = &s_last_water_run.rings[i];
         if (r->active_deg <= 0.0f || r->throw_mm <= 0.0f) continue;
+        // Skip if an earlier ring already claimed this radius with at least
+        // as wide an arc (approximates the union; exact enough for a stat).
+        bool counted = false;
+        for (int j = 0; j < i; j++) {
+            const water_ring_data_t *o = &s_last_water_run.rings[j];
+            if (o->active_deg <= 0.0f || o->throw_mm <= 0.0f) continue;
+            if (fabsf(o->throw_mm - r->throw_mm) <= 1.0f &&
+                o->active_deg >= r->active_deg) { counted = true; break; }
+        }
+        if (counted) continue;
         float arc_rad = r->active_deg * (float)M_PI / 180.0f;
-        sum_mm2 += arc_rad * r->throw_mm * (float)WATER_RING_SPACING;
+        sum_mm2 += arc_rad * r->throw_mm * ring_annulus_width_mm(nr, i);
     }
     return sum_mm2 / 1.0e6f;  // mm^2 -> m^2
 }
 
 // Estimated water volume (liters). For each ring, volume = depth * area
-// (where 1 mm * 1 m^2 = 1 L). Sum across rings.
+// (where 1 mm * 1 m^2 = 1 L). Sum across rings. Unlike area, EVERY pass
+// counts -- a second pass over the same ground delivers real extra water.
 float irrigoto_last_water_volume_l(void)
 {
     float sum_L = 0.0f;
@@ -16866,7 +18105,7 @@ float irrigoto_last_water_volume_l(void)
         const water_ring_data_t *r = &s_last_water_run.rings[i];
         if (r->active_deg <= 0.0f || r->throw_mm <= 0.0f) continue;
         float arc_rad = r->active_deg * (float)M_PI / 180.0f;
-        float area_m2 = (arc_rad * r->throw_mm * (float)WATER_RING_SPACING)
+        float area_m2 = (arc_rad * r->throw_mm * ring_annulus_width_mm(nr, i))
                         / 1.0e6f;
         sum_L += r->depth_mm * area_m2;  // depth(mm) * area(m^2) = volume(L)
     }
@@ -19583,11 +20822,11 @@ bool irrigoto_cal_pressure_throw(float throw_mm)
     // b385: two-anchor fit. Degenerates to the legacy proportional ray when no
     // low anchor was captured (pmap_low_psi/throw both 0), so the HA path stays
     // functional even though it has no low-throw service wired.
-    cal_apply_two_anchor_throw(pm,
+    float psi_used = cal_apply_two_anchor_throw(pm,
         s_wcal.pmap_low_psi, s_wcal.pmap_low_throw,
         psi_now,             throw_mm);
     INFO("HA cal two-anchor: lo(%.3fPSI,%.0fmm) hi(%.3fPSI,%.0fmm)",
-        s_wcal.pmap_low_psi, s_wcal.pmap_low_throw, psi_now, throw_mm);
+        s_wcal.pmap_low_psi, s_wcal.pmap_low_throw, psi_used, throw_mm);
     esp_err_t _r = cal_save_primary(pm);
     valve_goto(VALVE_CLOSED_DEG, 2.0f, 10000, false);
     motor_rail_off();

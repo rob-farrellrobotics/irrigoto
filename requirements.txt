@@ -22,9 +22,15 @@
 # left at 2026.4.5 created a 2-minor API skew spanning the known-bad 2026.5.x
 # reconnect-handshake changes -> ~30% cold-wake reconnect panics on both units
 # (b437 baseline was 0/259 in mid-June, ~30% after the HA update). Matching the
-# firmware to the integration (2026.6.2) closes the skew. Tested clean
-# across the fleet (confirmed 2026-07-23): the 2026.6.x corrections hold,
-# cold-wake reconnects are stable, and all units now build on this pin.
-esphome==2026.6.2
-# pip resolved (verified installing 2026.6.2): aioesphomeapi 45.3.1,
-# esptool 5.3.0, zeroconf 0.149.16.
+# firmware to the integration (2026.6.2) closed the skew and tested clean
+# fleet-wide through b483.
+#
+# 2026-07-25: HA Core updated to 2026.7.4 (2026.7.x integration) -> repinned
+# to match, per the keep-firmware-matched-to-the-integration-minor rule above.
+# NOTE: 2026.7 replaced PlatformIO with a native ESP-IDF builder — on Windows
+# it refuses to run under Git Bash/MSys; compile from PowerShell. Build layout
+# also changed (b484 relocated the *_html.h payloads for it — see
+# components/irrigoto/__init__.py).
+esphome==2026.7.2
+# pip resolved (verified installing 2026.7.2): aioesphomeapi 45.7.0,
+# esptool 5.3.1, zeroconf 0.150.0.

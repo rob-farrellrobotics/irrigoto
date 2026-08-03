@@ -150,6 +150,14 @@ section{margin-bottom:18px;}
     <div id="conn-dot"></div><span id="conn-txt">connecting</span>
   </div>
 </header>
+<!-- b490: shown when the saved pressure cal was finished on the await timeout
+     with throw anchors inherited from the previous cal instead of measured. -->
+<div id="cal-incomplete" style="display:none;margin:8px 12px;padding:8px 12px;
+     border:1px solid #f87171;border-radius:6px;background:rgba(248,113,113,0.12);
+     color:#f87171;font-size:13px;font-weight:600;text-align:center;">
+  &#9888; Calibration incomplete &mdash; throw values were never entered, so the
+  previous cal's throw scale is in use. Re-run the pressure calibration.
+</div>
 <main>
   <section>
     <div class="sec-hdr">
@@ -478,6 +486,7 @@ async function refresh(){
   try{
     const d=await fetch('/api/all').then(r=>r.json());
     dot(true);
+    document.getElementById('cal-incomplete').style.display=d.cal_incomplete?'block':'none';
     document.getElementById('d-fw').textContent='build '+d.fw_build;
     document.getElementById('d-wifi').innerHTML=
       (d.wifi_ip?'<span style="color:var(--text-mid);font-size:11px">'+d.wifi_ip+'</span> ':'')+rssiLabel(d.wifi_rssi);
