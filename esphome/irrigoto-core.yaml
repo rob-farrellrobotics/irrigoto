@@ -240,6 +240,11 @@ api:
   # isn't enough, the fallback is trimming entities/services (the 9 services incl.
   # 5 motor/cal ones have HTTP equivalents). Valid range 1..64.
   max_send_queue: 64
+  # b531: NEVER reboot for lack of an API client. The ESPHome default (15 min)
+  # restarted a benched unit with no HA every 15 min, and would do the same to
+  # any unit mid-watering during an HA outage (boot check closes the valve ->
+  # run lost). Units must water on schedule with NO wireless connection.
+  reboot_timeout: 0s
   # b459: b458 (queue 64 + batch_delay 500ms) STILL TaskWDT'd on f9e994 (#129).
   # The decoded stack shows the block is in the *pre-subscription* ListEntities
   # DESCRIPTOR send (ListEntitiesIterator::on_service), stuck in a BLOCKING lwip
@@ -346,6 +351,7 @@ time:
 # OTA updates via ESPHome (replaces the custom curl-push OTA)
 ota:
   - platform: esphome
+    id: esphome_ota  # lets a wrapper `!extend` it (e.g. a different password)
     password: !secret ota_password
 
 # b342: explicit safe_mode config so the boot is marked good after a
@@ -378,6 +384,10 @@ wifi:
   # easier/longer -- i.e. 16.5 dBm was pointed the wrong way. Full power helps the
   # weak-signal unit reach the AP and drain the descriptor burst faster.
   output_power: 20dB
+  # b531: same for WiFi loss -- no reboot (default 15 min). Every deep-sleep
+  # wake re-initialises the WiFi stack anyway, and a reboot mid-run would
+  # close the valve and lose the watering.
+  reboot_timeout: 0s
   # Static IP optional — comment out for DHCP
   # manual_ip:
   #   static_ip: 192.168.1.150

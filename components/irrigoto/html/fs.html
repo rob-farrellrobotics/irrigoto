@@ -15,6 +15,12 @@
       try{localStorage.setItem('irrigoto_theme',t2);}catch(e){}}
   }).catch(function(){});
 })();
+// b532: set the device clock from this phone (as landing/schedule, b437), so
+// ANY page opened after a power loss with no HA gives the unit a clock.
+(function(){try{fetch('/api/time',{method:'POST',
+  headers:{'Content-Type':'application/x-www-form-urlencoded'},
+  body:'epoch='+Math.floor(Date.now()/1000)+'&tz='+(-new Date().getTimezoneOffset())
+}).catch(function(){});}catch(e){}})();
 </script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}

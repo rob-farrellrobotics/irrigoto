@@ -153,6 +153,15 @@ typedef enum {
 // Keep upper bits high when driving normal firmware states; the diagnostic raw
 // walk saw 0x00 as red, but bits 4-7 are not needed for the LED colours and
 // may be routed differently on future board variants.
+//
+// b530 charger-red on an SX1502 board (a 4MB OtO on the bench, tested
+// via /api/led, 2026-09-25): unlike the TCA6408A boards, the BQ25504 charge
+// indicator does NOT show while the ESP32 is awake -- not even with every
+// SX1502 pin released to input (dir=0xFF) while the battery was charging.
+// It DOES light red during deep sleep (expander unpowered) with the charger
+// attached, and goes out when the charger is removed. So "red = charging"
+// is a sleep-only indicator on SX1502 boards. Top nibble of RegData reads
+// back 0 even when written 1 (pins held low externally).
 #define SX_LED_OFF      0xFE
 #define SX_LED_RED      0xF0
 #define SX_LED_GREEN    0xFB
@@ -184,6 +193,9 @@ static bool s_sensor_rail = false;
 static bool s_motor_rail  = false;
 static bool s_tca_outputs  = false;  // true once LED expander pins are configured as outputs
 static led_expander_t s_led_expander = LED_EXP_UNKNOWN;
+// b529: raw detect reads, exposed in /api/all (-1 = I2C read failed).
+static int16_t s_led_exp_adv = -1;   // SX1502 RegAdvanced (0x00 => SX1502)
+static int16_t s_led_exp_cfg = -1;   // TCA6408A config register
 static TickType_t          s_last_activity     = 0;  // tick count of last user input
 static volatile TickType_t s_last_web_req_tick = 0;  // tick of last zone web HTTP request
 static volatile bool s_ota_in_progress = false;  // true during OTA -- suppress sleep
@@ -1433,6 +1445,10 @@ static void phase_nozzle_motor(void)
 // Nozzle direction: forward increases angle, reverse decreases.
 // Uses backlash compensation -- always approaches from below.
 
+// b528: |error| at or beyond this after a sign flip means the error WRAPPED
+// (the motor ran away from the target), not a real overshoot.
+#define GOTO_WRAP_DEG 90.0f
+
 static bool nozzle_goto_direct(float target_deg, float tolerance_deg,
                                 uint32_t timeout_ms, bool verbose)
 {
@@ -1575,8 +1591,14 @@ static bool nozzle_goto_direct(float target_deg, float tolerance_deg,
 
         // Stop conditions: within tolerance, overshot, or coast will overshoot
         if (abs_err <= tolerance_deg)                        { reached = true; break; }
-        if (forward  && error < 0)                           { reached = true; break; }
-        if (!forward && error > 0)                           { reached = true; break; }
+        // b528: a sign flip is an overshoot only near the target -- a
+        // runaway (reversed motor polarity) flips sign at the far side
+        // (+179.9 -> -179.9) and used to be reported as reached.
+        if ((forward ? error < 0 : error > 0)) {
+            if (abs_err < GOTO_WRAP_DEG) { reached = true; break; }
+            ESP_LOGW(TAG, "  Nozzle RUNAWAY: moved away from target (err %.1f) -- motor polarity?", error);
+            break;
+        }
         if (stopping_dist >= abs_err + tolerance_deg * 0.5f) { reached = true; break; }
     }
 
@@ -5343,9 +5365,9 @@ static bool valve_goto_jog(float target_deg, float tolerance_deg,
         if (error < -180.0f) error += 360.0f;
 
         if (fabsf(error) <= tolerance_deg) { reached = true; break; }
-        // Overshoot: passed through target
-        if ((closing && error < -tolerance_deg) ||
-            (!closing && error > tolerance_deg)) { reached = true; break; }
+        // Overshoot: passed through target (b528: near it -- not a far-side wrap)
+        if (((closing && error < -tolerance_deg) ||
+             (!closing && error > tolerance_deg)) && fabsf(error) < GOTO_WRAP_DEG) { reached = true; break; }
     }
 
     mcpwm_timer_start_stop(timer, MCPWM_TIMER_STOP_EMPTY);
@@ -5583,8 +5605,12 @@ static bool valve_goto_direct(float target_deg, float tolerance_deg,
 
         // Stop conditions
         if (abs_err <= tolerance_deg)                        { reached = true; break; }
-        if (forward  && error > 0)                           { reached = true; break; }
-        if (!forward && error < 0)                           { reached = true; break; }
+        // b528: sign flip = overshoot only near the target (see nozzle_goto_direct).
+        if ((forward ? error > 0 : error < 0)) {
+            if (abs_err < GOTO_WRAP_DEG) { reached = true; break; }
+            ESP_LOGW(TAG, "  Valve RUNAWAY: moved away from target (err %.1f) -- motor polarity?", error);
+            break;
+        }
         if (stopping_dist >= abs_err + tolerance_deg * 0.5f) { reached = true; break; }
     }
 
@@ -5853,6 +5879,8 @@ static void led_expander_detect(void)
     // TCA6408A-compatible default path.
     uint8_t advanced = 0xFF;
     esp_err_t r_sx = i2c_bus_read_reg(ADDR_TCA6408A, SX1502_REG_ADVANCED, &advanced, 1);
+    s_led_exp_adv = (r_sx  == ESP_OK) ? advanced : -1;
+    s_led_exp_cfg = (r_tca == ESP_OK) ? cfg      : -1;
     if (r_sx == ESP_OK && advanced == 0x00) {
         s_led_expander = LED_EXP_SX1502;
         INFO("LED expander detected: SX1502 (advanced=0x%02X, tca_cfg=0x%02X)", advanced, cfg);
@@ -15769,6 +15797,15 @@ static esp_err_t api_all_handler(httpd_req_t *req)
     // Static DRAM sits at ~97% of its *segment* (b485 build: 175784/180736)
     // but that segment is static data only -- these counters measure the
     // separate ~150KB heap pool, which is what actually ran out.
+    // b529: which LED expander boot detection picked (SX1502 vs
+    // TCA6408A-compatible) + the raw register reads it decided on. Own chunk.
+    n = snprintf(buf, sizeof(buf),
+        ",\"led_exp\":\"%s\",\"led_exp_adv\":%d,\"led_exp_cfg\":%d",
+        s_led_expander == LED_EXP_SX1502   ? "sx1502" :
+        s_led_expander == LED_EXP_TCA6408A ? "tca6408a" : "unknown",
+        (int)s_led_exp_adv, (int)s_led_exp_cfg);
+    httpd_resp_send_chunk(req, buf, n);
+
     // b525: winter fields ride in THIS chunk, not the head one -- b522 widened
     // the head past its buffer and streamed garbage for 25 min (see b523).
     n = snprintf(buf, sizeof(buf),
@@ -16247,6 +16284,59 @@ static esp_err_t api_time_handler(httpd_req_t *req)
 // the HA switch; this lets the OTA flow re-enable it without HA. Wake-safe
 // (HTTP handler -- doesn't touch the boot/wake path the regression lives in).
 // GET /api/auto_sleep -> {"auto_sleep":bool}; POST on=0|1 sets it.
+// b530: LED test. GET /api/led?c=off|red|green|blue|yellow|cyan|purple|white
+// drives the logical colour through tca_led_set (per-chip map); ?raw=0xNN
+// writes the expander's output/data register directly (after the normal
+// init); ?c=release sets every expander pin to INPUT so only the charger
+// (BQ25504 status) can drive red -- the "is OFF really hands-off" test.
+// Always answers with the chip and the data/output + dir/config readback.
+// The next firmware LED write (sleep, wifi blink) overrides it.
+static esp_err_t api_led_handler(httpd_req_t *req)
+{
+    char qs[48] = {0}, c[12] = {0}, rawv[8] = {0};
+    httpd_req_get_url_query_str(req, qs, sizeof(qs));
+    bool is_sx = false;
+    sensor_rail_on();
+    led_expander_detect();
+    is_sx = (s_led_expander == LED_EXP_SX1502);
+    const uint8_t REG_DATA = is_sx ? SX1502_REG_DATA : TCA6408A_REG_OUTPUT;
+    const uint8_t REG_DIR  = is_sx ? SX1502_REG_DIR  : TCA6408A_REG_CONFIG;
+    const char *err = NULL;
+    if (httpd_query_key_value(qs, "raw", rawv, sizeof(rawv)) == ESP_OK) {
+        uint8_t v = (uint8_t)strtoul(rawv, NULL, 0);
+        tca_led_set(LED_OFF);                       // ensures pins are outputs
+        i2c_bus_write_reg(ADDR_TCA6408A, REG_DATA, &v, 1);
+        INFO("LED test: raw 0x%02X", v);
+    } else if (httpd_query_key_value(qs, "c", c, sizeof(c)) == ESP_OK) {
+        static const char *names[] = {"off","red","green","blue","yellow","cyan","purple","white"};
+        int idx = -1;
+        for (int i = 0; i < 8; i++) if (strcmp(c, names[i]) == 0) idx = i;
+        if (strcmp(c, "release") == 0) {
+            uint8_t all_in = 0xFF;
+            i2c_bus_write_reg(ADDR_TCA6408A, REG_DIR, &all_in, 1);
+            s_tca_outputs = false;                  // next tca_led_set re-inits
+            INFO("LED test: expander pins released (all inputs)");
+        } else if (idx >= 0) {
+            tca_led_set((uint8_t)idx);             // LED_OFF..LED_WHITE = 0..7
+            INFO("LED test: %s", c);
+        } else {
+            err = "c must be off|red|green|blue|yellow|cyan|purple|white|release";
+        }
+    }
+    uint8_t d = 0, dir = 0;
+    esp_err_t rd = i2c_bus_read_reg(ADDR_TCA6408A, REG_DATA, &d, 1);
+    esp_err_t rr = i2c_bus_read_reg(ADDR_TCA6408A, REG_DIR, &dir, 1);
+    char buf[200];
+    int n = snprintf(buf, sizeof(buf),
+        "{\"chip\":\"%s\",\"data\":%d,\"dir\":%d%s%s%s}",
+        is_sx ? "sx1502" : "tca6408a",
+        rd == ESP_OK ? d : -1, rr == ESP_OK ? dir : -1,
+        err ? ",\"error\":\"" : "", err ? err : "", err ? "\"" : "");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buf, n);
+    return ESP_OK;
+}
+
 static esp_err_t api_auto_sleep_handler(httpd_req_t *req)
 {
     HTTP_CONN_CLOSE(req);
@@ -18527,7 +18617,7 @@ static void zone_web_start(void)
     httpd_config_t cfg   = HTTPD_DEFAULT_CONFIG();
     cfg.server_port      = ZONE_WEB_PORT;
     cfg.ctrl_port        = ZONE_WEB_CTRL_PORT;
-    cfg.max_uri_handlers  = 76;  // b525: 74 -> 76 (/api/winter GET+POST); b522: 72 -> 74 (/api/fault_hold GET+POST); b512: 70 -> 72 (/api/uart_log GET+POST); b489: 68 -> 70, keeping the 2-slot margin over
+    cfg.max_uri_handlers  = 77;  // b530: 76 -> 77 (/api/led GET); b525: 74 -> 76 (/api/winter GET+POST); b522: 72 -> 74 (/api/fault_hold GET+POST); b512: 70 -> 72 (/api/uart_log GET+POST); b489: 68 -> 70, keeping the 2-slot margin over
                                  // the _Static_assert below.
                                  // MUST be set before httpd_start (cfg is copied there);
                                  // headroom over uris[] count -- _Static_assert below guards it.
@@ -18558,6 +18648,7 @@ static void zone_web_start(void)
         {.uri="/zone/last_log",    .method=HTTP_GET,  .handler=zone_last_log_handler},   // b292
         {.uri="/api/all",         .method=HTTP_GET,  .handler=api_all_handler},
         {.uri="/api/auto_sleep",  .method=HTTP_GET,  .handler=api_auto_sleep_handler},  // b447
+        {.uri="/api/led",         .method=HTTP_GET,  .handler=api_led_handler},         // b530
         {.uri="/api/auto_sleep",  .method=HTTP_POST, .handler=api_auto_sleep_handler},  // b447
         {.uri="/api/detail_log",  .method=HTTP_GET,  .handler=api_detail_log_handler},
         {.uri="/api/uart_log",    .method=HTTP_GET,  .handler=api_uart_log_handler},   // b512
@@ -18622,7 +18713,7 @@ static void zone_web_start(void)
         {.uri="/fs/upload",             .method=HTTP_POST, .handler=fs_upload_handler},
         {.uri="/fs/delete",             .method=HTTP_POST, .handler=fs_delete_handler},
     };
-    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 74,   // b525: 72 -> 74 (/api/winter GET+POST); b522: 70 -> 72 (/api/fault_hold GET+POST); b512: 68 -> 70 (/api/uart_log GET+POST); b489: 66 -> 68
+    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 75,   // b530: 74 -> 75 (/api/led GET); b525: 72 -> 74 (/api/winter GET+POST); b522: 70 -> 72 (/api/fault_hold GET+POST); b512: 68 -> 70 (/api/uart_log GET+POST); b489: 66 -> 68
                    "uris[] exceeds cfg.max_uri_handlers -- raise it before httpd_start");
     for (size_t i = 0; i < sizeof(uris)/sizeof(uris[0]); i++)
         httpd_register_uri_handler(s_zone_server, &uris[i]);
