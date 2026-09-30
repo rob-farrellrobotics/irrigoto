@@ -3629,6 +3629,7 @@ static uint16_t    s_last_water_zone_id = 0;
 #define WATER_STATUS_NOZZLE_FAULT 3
 #define WATER_STATUS_WATER_LOSS   4
 #define WATER_STATUS_NO_SUPPLY    5   // b466: ~0 PSI at supply check = nothing connected
+#define WATER_STATUS_LOW_BATTERY  6   // b539: filtered battery < 3.50 V mid-run
 static int  s_water_status_code      = WATER_STATUS_COMPLETED;
 static int  s_last_water_status_code = WATER_STATUS_COMPLETED;
 // Unix epoch when the last watering ended (set in the same block that
@@ -6920,6 +6921,100 @@ static void cal_watchdog_check(void)
              "Calibration timed out and was aborted -- valve closed. Please re-run.");
     s_wcal.state = WCAL_IDLE;
     s_cal_state_since = 0;
+}
+
+// b539: battery guard for watering + calibration, matched to the stock OtO
+// firmware (reverse-engineered 2026-09-30, v4.2.1-v5 / v4.3.7-v4C):
+//  - reading: battery volts sampled at 1 Hz through the SAME 2nd-order
+//    low-pass stock uses (Butterworth, fc 0.1 Hz @ 1 Hz), seeded with the
+//    first sample -- motor pulses (single-sample dips of 100-250 mV) can't
+//    trip anything.
+//  - start gate: no watering / calibration start at <= 3.64 V, allowed again
+//    at >= 3.66 V (stock v4's LOW_BATERY band; stock v5 has no start gate).
+//    Scheduled runs keep retrying through their catch-up window, then count
+//    as missed (existing path) -- no HA or WiFi needed.
+//  - mid-run: < 3.50 V aborts watering (status "low_battery", normal close-
+//    the-valve unwind) and cancels a calibration (stop_and_close), as stock's
+//    WATERING_LOW_BATTERY_THRESHOLD path does.
+//  - critical: < 3.45 V (stock CRITICALLY_LOW) -> close valve + sleep, even
+//    with auto-sleep off, into the b533 hourly low-battery re-check.
+#define BATT_START_BLOCK_V   3.64f
+#define BATT_START_OK_V      3.66f
+#define BATT_RUN_ABORT_V     3.50f
+#define BATT_CRITICAL_V      3.45f
+static float s_batt_filt_v = 0.0f;
+static bool  s_bf_init = false;
+static float s_bf_x1, s_bf_x2, s_bf_y1, s_bf_y2;
+static bool  s_batt_start_blocked = false;
+static bool  s_batt_crit_fired = false;
+static TickType_t s_batt_refuse_log = 0;
+
+static void batt_filter_tick(void)
+{
+    float v = irrigoto_get_battery_mv() / 1000.0f;
+    if (v < 2.0f || v > 4.6f) return;                  // ADC glitch
+    if (!s_bf_init) {
+        s_bf_x1 = s_bf_x2 = s_bf_y1 = s_bf_y2 = s_batt_filt_v = v;
+        s_bf_init = true;
+    }
+    float y = 0.06746f * v + 0.13491f * s_bf_x1 + 0.06746f * s_bf_x2
+            + 1.14298f * s_bf_y1 - 0.41280f * s_bf_y2;
+    s_bf_x2 = s_bf_x1; s_bf_x1 = v;
+    s_bf_y2 = s_bf_y1; s_bf_y1 = y;
+    s_batt_filt_v = y;
+    if (!s_batt_start_blocked && y <= BATT_START_BLOCK_V) {
+        s_batt_start_blocked = true;
+        ESP_LOGW(TAG, "Battery %.3f V (filtered) <= %.2f V -- watering/calibration starts BLOCKED",
+                 y, BATT_START_BLOCK_V);
+    } else if (s_batt_start_blocked && y >= BATT_START_OK_V) {
+        s_batt_start_blocked = false;
+        ESP_LOGI(TAG, "Battery %.3f V (filtered) >= %.2f V -- starts allowed again",
+                 y, BATT_START_OK_V);
+    }
+}
+
+// Returns false (and logs, rate-limited) when a start must be refused.
+static bool batt_ok_to_start(const char *what)
+{
+    if (!s_bf_init) batt_filter_tick();
+    if (!s_batt_start_blocked) return true;
+    TickType_t now = xTaskGetTickCount();
+    if (s_batt_refuse_log == 0 || (now - s_batt_refuse_log) > pdMS_TO_TICKS(60000)) {
+        s_batt_refuse_log = now;
+        ESP_LOGW(TAG, "%s refused: battery %.2f V (filtered) -- needs >= %.2f V",
+                 what, s_batt_filt_v, BATT_START_OK_V);
+    }
+    return false;
+}
+
+static void batt_guard_check(void)
+{
+    if (!s_bf_init) return;
+    const float y = s_batt_filt_v;
+    const bool cal_active = s_wcal.state == WCAL_PRESSURE_SCANNING        ||
+                            s_wcal.state == WCAL_PRESSURE_AWAIT_THROW     ||
+                            s_wcal.state == WCAL_PRESSURE_AWAIT_THROW_LOW ||
+                            s_wcal.state == WCAL_NOZZLE_RUNNING           ||
+                            s_wcal.state == WCAL_JOG_RUNNING;
+    if (y < BATT_RUN_ABORT_V) {
+        if (s_web_water_mode != 0 && s_water_status_code == WATER_STATUS_COMPLETED) {
+            ESP_LOGW(TAG, "Battery %.3f V (filtered) < %.2f V -- ABORTING watering", y, BATT_RUN_ABORT_V);
+            water_set_status(WATER_STATUS_LOW_BATTERY);
+        }
+        if (cal_active) {
+            ESP_LOGW(TAG, "Battery %.3f V (filtered) < %.2f V -- CANCELLING calibration", y, BATT_RUN_ABORT_V);
+            irrigoto_stop_and_close();      // cancels the cal, closes + verifies the valve
+            snprintf(s_wcal.msg, sizeof(s_wcal.msg),
+                     "Stopped: battery %.2f V is too low. Charge the unit and re-run.", y);
+        }
+    }
+    if (y < BATT_CRITICAL_V && !s_batt_crit_fired && s_web_water_mode == 0 && !cal_active) {
+        s_batt_crit_fired = true;
+        s_lowbatt_hold    = true;           // next boot needs BATT_RESUME_VOLTAGE_V
+        ESP_LOGW(TAG, "Battery %.3f V (filtered) < %.2f V -- CRITICAL: closing valve and sleeping",
+                 y, BATT_CRITICAL_V);
+        irrigoto_sleep_now_with_reason(LOWBATT_RECHECK_S, "low battery");
+    }
 }
 
 // b533: turn the motor rail off once nothing has used it for a while. Manual
@@ -15196,6 +15291,13 @@ static esp_err_t zone_water_handler(httpd_req_t *req)
         httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"invalid mode");
         return ESP_OK;
     }
+    if (!batt_ok_to_start("watering")) {     // b539
+        char eb[96];
+        snprintf(eb, sizeof(eb), "battery too low (%.2f V) -- charge to %.2f V or more",
+                 s_batt_filt_v, BATT_START_OK_V);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, eb);
+        return ESP_OK;
+    }
     int duration_min = 0;
     if (mode == WATER_MODE_CHASE) {
         duration_min = atoi(dur_s);
@@ -15921,10 +16023,12 @@ static esp_err_t api_all_handler(httpd_req_t *req)
     // b529: which LED expander boot detection picked (SX1502 vs
     // TCA6408A-compatible) + the raw register reads it decided on. Own chunk.
     n = snprintf(buf, sizeof(buf),
-        ",\"led_exp\":\"%s\",\"led_exp_adv\":%d,\"led_exp_cfg\":%d,\"led_exp_dir0\":%d",
+        ",\"led_exp\":\"%s\",\"led_exp_adv\":%d,\"led_exp_cfg\":%d,\"led_exp_dir0\":%d,"
+        "\"bat_filt_mv\":%d,\"batt_block\":%s",
         s_led_expander == LED_EXP_SX1502   ? "sx1502" :
         s_led_expander == LED_EXP_TCA6408A ? "tca6408a" : "unknown",
-        (int)s_led_exp_adv, (int)s_led_exp_cfg, (int)s_led_exp_dir0);
+        (int)s_led_exp_adv, (int)s_led_exp_cfg, (int)s_led_exp_dir0,
+        (int)(s_batt_filt_v * 1000.0f + 0.5f), s_batt_start_blocked ? "true" : "false");
     httpd_resp_send_chunk(req, buf, n);
 
     // b525: winter fields ride in THIS chunk, not the head one -- b522 widened
@@ -16585,6 +16689,14 @@ static esp_err_t cal_pressure_start_handler(httpd_req_t *req)
         httpd_resp_sendstr(req, "{\"error\":\"calibration already running\"}");
         return ESP_OK;
     }
+    if (!batt_ok_to_start("calibration")) {   // b539
+        char eb[112];
+        snprintf(eb, sizeof(eb), "{\"error\":\"battery too low (%.2f V) -- charge to %.2f V or more\"}",
+                 s_batt_filt_v, BATT_START_OK_V);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, eb);
+        return ESP_OK;
+    }
     // b380: coast by default (the A/B found no cal benefit from braking -- see
     // s_cal_brake notes). Optional ?brake=1 re-enables the K hold for experiments.
     s_cal_brake = false;
@@ -16801,6 +16913,14 @@ static esp_err_t cal_nozzle_start_handler(httpd_req_t *req)
     if (s_wcal.state == WCAL_PRESSURE_SCANNING ||
         s_wcal.state == WCAL_NOZZLE_RUNNING) {
         httpd_resp_sendstr(req, "{\"error\":\"calibration already running\"}");
+        return ESP_OK;
+    }
+    if (!batt_ok_to_start("calibration")) {   // b539
+        char eb[112];
+        snprintf(eb, sizeof(eb), "{\"error\":\"battery too low (%.2f V) -- charge to %.2f V or more\"}",
+                 s_batt_filt_v, BATT_START_OK_V);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, eb);
         return ESP_OK;
     }
     wcal_reset();
@@ -18082,6 +18202,14 @@ static esp_err_t cal_jog_start_handler(httpd_req_t *req)
         httpd_resp_sendstr(req, "{\"error\":\"calibration already running\"}");
         return ESP_OK;
     }
+    if (!batt_ok_to_start("calibration")) {   // b539
+        char eb[112];
+        snprintf(eb, sizeof(eb), "{\"error\":\"battery too low (%.2f V) -- charge to %.2f V or more\"}",
+                 s_batt_filt_v, BATT_START_OK_V);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, eb);
+        return ESP_OK;
+    }
     wcal_reset();
     s_wcal.state = WCAL_JOG_RUNNING;
     s_jog_web_mode = true;
@@ -19030,6 +19158,8 @@ static void esphome_idle_task(void *arg)
 {
     (void)arg;
     while (true) {
+        batt_filter_tick();     // b539: 1 Hz, stock-matched low-pass
+        batt_guard_check();     // b539: mid-run abort / critical sleep
         check_inactivity();
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
@@ -19302,6 +19432,7 @@ void irrigoto_last_water_status_str(char *buf, size_t len)
         case WATER_STATUS_NOZZLE_FAULT: s = "nozzle_fault"; break;
         case WATER_STATUS_WATER_LOSS:   s = "water_loss";   break;
         case WATER_STATUS_NO_SUPPLY:    s = "no_supply";    break;
+        case WATER_STATUS_LOW_BATTERY:  s = "low_battery";  break;
         default:                        s = "unknown";      break;
     }
     snprintf(buf, len, "%s", s);
@@ -19753,6 +19884,10 @@ static void start_watering_web_mode(int zone, int web_mode, int depth8, uint32_t
         ESP_LOGW(TAG, "start_watering: lash experiment running -- refusing");
         return;
     }
+    // b539: battery gate. A refused SCHEDULED start is not marked done, so the
+    // scheduler retries it through the catch-up window (a sunny morning can
+    // still run it) and then records it missed.
+    if (!batt_ok_to_start(sched_epoch ? "scheduled watering" : "watering")) return;
     if (zone < 1) zone = 1;
     // b450: remember the scheduled epoch (0 = manual). Stamped "done" only once
     // water flows (sched_note_flow_started), set here only after the guards so a
@@ -22287,6 +22422,7 @@ bool irrigoto_cal_pressure_start(void)
         ESP_LOGW(TAG, "cal_pressure_start ignored — calibration already running");
         return false;
     }
+    if (!batt_ok_to_start("calibration")) return false;   // b539
     INFO("HA cal_pressure_start");
     wcal_reset();
     xTaskCreatePinnedToCore(wcal_pressure_task, "wcal_pres", 12288, NULL, 8, NULL, APP_CPU_NUM);
@@ -22355,6 +22491,7 @@ bool irrigoto_cal_nozzle_start(void)
         ESP_LOGW(TAG, "cal_nozzle_start ignored — calibration already running");
         return false;
     }
+    if (!batt_ok_to_start("calibration")) return false;   // b539
     INFO("HA cal_nozzle_start");
     wcal_reset();
     xTaskCreatePinnedToCore(wcal_nozzle_task, "wcal_nozzle", 8192, NULL, 8, NULL, APP_CPU_NUM);
