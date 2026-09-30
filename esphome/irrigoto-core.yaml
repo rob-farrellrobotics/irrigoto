@@ -397,6 +397,12 @@ wifi:
     # Fallback hotspot if WiFi is unavailable
     ssid: "${device_name} Fallback"
     password: !secret ap_password
+    # b540: bring this hotspot up after 30 s of failed WiFi (default 1 min).
+    # ESPHome holds back later component setup (incl. irrigoto's boot checks)
+    # until WiFi connects or the hotspot starts; with the firmware's post-wake
+    # setup window the hotspot + captive portal stays reachable for entering
+    # new WiFi credentials.
+    ap_timeout: 30s
 
 captive_portal:
 

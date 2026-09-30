@@ -7073,12 +7073,40 @@ static bool post_cal_hold_active(void)
     return false;
 }
 
+// b540: WiFi setup window. After a wake that is NOT a routine deep-sleep
+// timer wake (power-on, the wake switch/magnet, a reset), stay awake up to
+// SETUP_WINDOW_MS while the station is not associated, so ESPHome's
+// "<name> Fallback" hotspot + captive portal is actually usable to enter new
+// WiFi credentials. With a 1-min inactivity setting the unit used to sleep
+// right as the hotspot came up (ap_timeout). Ends as soon as WiFi associates;
+// timer wakes are unaffected (no battery cost on normal cycles); the b539
+// critical-battery sleep still overrides it. NB: in ESPHome mode
+// s_wifi_connected is seeded true at init, so ask the driver instead.
+#define SETUP_WINDOW_MS (5u * 60u * 1000u)
+static bool s_setup_window = false;
+static bool setup_window_hold(void)
+{
+    if (!s_setup_window) return false;
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        s_setup_window = false;
+        INFO("WiFi associated -- setup window closed, normal sleep rules");
+        return false;
+    }
+    if (xTaskGetTickCount() < pdMS_TO_TICKS(SETUP_WINDOW_MS)) return true;
+    s_setup_window = false;
+    ESP_LOGW(TAG, "No WiFi %u min after a manual wake -- setup window over, normal sleep rules",
+             (unsigned)(SETUP_WINDOW_MS / 60000u));
+    return false;
+}
+
 static void check_inactivity(void)
 {
     motor_rail_idle_check();
     if (s_last_activity == 0) return;  // not yet initialised
     if (s_ota_in_progress) return;  // never sleep during OTA
     if (post_cal_hold_active()) return;   // b534
+    if (setup_window_hold()) return;      // b540
     // b525: winter mode owns the sleep decision -- the unit holds awake for
     // the whole WINTER_WAKE_WINDOW_S (so HA and the web UI get a reliable
     // window to cancel, no matter what the inactivity knob says) and then
@@ -19181,6 +19209,9 @@ void irrigoto_init(void)
                                // forever-sleeps below BATT_MIN_VOLTAGE_V
                                // before the wake window is ever armed
     log_wake_cause();
+    // b540: a manual/power-on wake opens the WiFi setup window (see
+    // setup_window_hold); routine timer wakes don't.
+    s_setup_window = (esp_reset_reason() != ESP_RST_DEEPSLEEP);
     irrigoto_winter_arm_wake_window();   // b525: no-op unless winterized
 
     // b536: 2048 -> 4096. It logs (via ESPHome's log hook) while blinking
