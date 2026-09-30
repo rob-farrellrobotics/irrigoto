@@ -30,6 +30,13 @@ R"LANDHTML(
 }).catch(function(){});}catch(e){}})();
 </script>
 <style>
+/* b535: winter mode locks the whole UI except the winter banner's
+   "Resume normal operation" -- pointer-events inherit, the banner re-enables
+   its own subtree. Covers controls rendered later too. */
+body.winter-lock{pointer-events:none;}
+body.winter-lock #winter-banner{pointer-events:auto;}
+body.winter-lock button:not(#winter-banner button),body.winter-lock input,
+body.winter-lock select,body.winter-lock a{opacity:.45;}
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}
 :root,:root[data-theme="dark"]{
   --bg:#060c10;--bg2:#0b1820;--bg3:#0f2030;
@@ -575,6 +582,13 @@ function renderWinter(winter, leftS){
   }
   if(ban) ban.style.display=winter?'block':'none';
   if(btn) btn.style.display=winter?'none':'';
+  // b535: winter = the only thing you can do is exit winter mode.
+  document.body.classList.toggle('winter-lock', !!winter);
+  document.querySelectorAll('button,input,select,textarea').forEach(function(e){
+    if(ban && ban.contains(e)) return;
+    if(winter){ if(!e.disabled){ e.disabled=true; e.dataset.winterLock='1'; } }
+    else if(e.dataset.winterLock){ e.disabled=false; delete e.dataset.winterLock; }
+  });
   if(winter){
     const s=Math.max(0,leftS|0);
     const el=document.getElementById('winter-left');

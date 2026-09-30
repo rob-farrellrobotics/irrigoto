@@ -21,6 +21,27 @@
   headers:{'Content-Type':'application/x-www-form-urlencoded'},
   body:'epoch='+Math.floor(Date.now()/1000)+'&tz='+(-new Date().getTimezoneOffset())
 }).catch(function(){});}catch(e){}})();
+// b535: winter mode -- the only allowed action is exiting winter, which
+// lives on the home page. Lock this page (banner + no clicks + disabled
+// controls, including ones this page renders later).
+(function(){
+  function lock(){
+    fetch('/api/all').then(function(r){return r.json();}).then(function(d){
+      if(!d||!d.winter)return;
+      var st=document.createElement('style');
+      st.textContent='body.winter-lock{pointer-events:none}body.winter-lock #winter-lock{pointer-events:auto}'
+        +'body.winter-lock button,body.winter-lock input,body.winter-lock select,body.winter-lock canvas,body.winter-lock svg{opacity:.45}';
+      document.head.appendChild(st);
+      var b=document.createElement('div'); b.id='winter-lock';
+      b.style.cssText='position:sticky;top:0;z-index:9999;margin:8px 12px;padding:10px 12px;border-radius:10px;background:#1e3a5f;color:#dbeafe;font:600 14px system-ui,sans-serif';
+      b.innerHTML='&#10052; Winter sleep active — controls are disabled. <a href="/" style="color:#93c5fd">Go to the home page to resume normal operation</a>.';
+      document.body.prepend(b); document.body.classList.add('winter-lock');
+      var off=function(){document.querySelectorAll('button,input,select,textarea').forEach(function(e){e.disabled=true;});};
+      off(); new MutationObserver(off).observe(document.body,{childList:true,subtree:true});
+    }).catch(function(){});
+  }
+  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',lock);else lock();
+})();
 </script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}

@@ -97,6 +97,8 @@ static const char *TAG = "irrigoto";
 #define TCA6408A_REG_CONFIG     0x03
 #define SX1502_REG_DATA         0x00
 #define SX1502_REG_DIR          0x01       // 1=input, 0=output
+#define SX1502_DIR_V4           0xF0       // b537: IO0-3 outputs, IO4-7 inputs (as stock v4)
+#define SX1502_OUT_MASK         0x0F       // b537: never drive IO4-7
 #define SX1502_REG_ADVANCED     0xAB       // factory FW probes this register
 
 typedef enum {
@@ -191,11 +193,27 @@ static int s_pass = 0;
 static int s_fail = 0;
 static bool s_sensor_rail = false;
 static bool s_motor_rail  = false;
+// b536: handles of the small irrigoto tasks, for /api/all stack high-water
+// marks. b535 aborted in vApplicationStackOverflowHook on an 8MB unit's first
+// boot (decoded ba1f88 crash, 2026-09-28) -- one of these overflowed.
+static TaskHandle_t s_task_blink = NULL, s_task_idle = NULL, s_task_sched = NULL;
+static int s_blink_hwm = -1;   // led_blink deletes itself; it records its own mark
+// b533: tick of the last motor_rail_on() call -- the idle-off below turns the
+// 9 V rail back off (brake engaged) once nothing has used it for a while.
+static TickType_t s_motor_rail_last_use = 0;
+#define MOTOR_RAIL_IDLE_OFF_MS    (5u * 60u * 1000u)
+// b533: set when we enter the low-battery timed sleep; lives in RTC memory so
+// it survives deep sleep and is cleared by a power-on reset.
+static RTC_DATA_ATTR bool s_lowbatt_hold = false;
 static bool s_tca_outputs  = false;  // true once LED expander pins are configured as outputs
 static led_expander_t s_led_expander = LED_EXP_UNKNOWN;
 // b529: raw detect reads, exposed in /api/all (-1 = I2C read failed).
 static int16_t s_led_exp_adv = -1;   // SX1502 RegAdvanced (0x00 => SX1502)
 static int16_t s_led_exp_cfg = -1;   // TCA6408A config register
+// b537: SX1502 RegDir as found at boot, BEFORE we write it (-1 = not SX /
+// not read). 0xFF = power-on default (expander lost power in sleep); anything
+// else = it stayed powered through deep sleep with our last config.
+static int16_t s_led_exp_dir0 = -1;
 static TickType_t          s_last_activity     = 0;  // tick count of last user input
 static volatile TickType_t s_last_web_req_tick = 0;  // tick of last zone web HTTP request
 static volatile bool s_ota_in_progress = false;  // true during OTA -- suppress sleep
@@ -537,7 +555,13 @@ static void fault_hold_arm(void)
 
 // Power management
 #define INACTIVITY_SLEEP_MS   (5 * 60 * 1000)  // 5 minutes
-#define BATT_MIN_VOLTAGE_V        3.6f         // sleep forever below this (no motor activity)
+#define BATT_MIN_VOLTAGE_V        3.6f         // quiet low-battery sleep below this (no motor activity)
+// b533: low-battery sleep is no longer forever -- it re-checks on a timer so a
+// unit that recovers on solar/charger comes back by itself (units must run
+// with nobody touching them). Resume needs RESUME, not MIN, so a battery that
+// bounces back a little once the load drops can't flap in and out.
+#define BATT_RESUME_VOLTAGE_V     3.7f
+#define LOWBATT_RECHECK_S         3600u        // 1 h; a check costs ~1.5 s awake
 #define BATT_VALVE_SAFE_VOLTAGE_V 3.8f         // require this much margin to attempt the wake-time valve-close check. Lowered from 3.9V (b347) -- water safety > controller safety, and a single ADC sample at boot can read lower than steady-state if the battery hasn't recovered from prior watering load.
 
 // Zone perimeter
@@ -911,6 +935,7 @@ static void sensor_rail_off(void)
 
 static void motor_rail_on(void)
 {
+    s_motor_rail_last_use = xTaskGetTickCount();
     if (s_motor_rail) return;
     gpio_set_level(GPIO_9V_EN, 1);
     gpio_set_level(GPIO_K,     0);
@@ -5883,7 +5908,26 @@ static void led_expander_detect(void)
     s_led_exp_cfg = (r_tca == ESP_OK) ? cfg      : -1;
     if (r_sx == ESP_OK && advanced == 0x00) {
         s_led_expander = LED_EXP_SX1502;
-        INFO("LED expander detected: SX1502 (advanced=0x%02X, tca_cfg=0x%02X)", advanced, cfg);
+        uint8_t dir0 = 0;
+        if (i2c_bus_read_reg(ADDR_TCA6408A, SX1502_REG_DIR, &dir0, 1) == ESP_OK)
+            s_led_exp_dir0 = dir0;
+        INFO("LED expander detected: SX1502 (advanced=0x%02X, tca_cfg=0x%02X, dir@boot=0x%02X)",
+             advanced, cfg, (unsigned)dir0);
+        // b538: put IO4-IO7 back to inputs NOW, not at the first LED write --
+        // the expander keeps power (and its last config) across resets and
+        // deep sleep on v4, so after an update from an older build it would
+        // otherwise still drive IO4-7 high until the LED task runs.
+        uint8_t dir_v4 = SX1502_DIR_V4;
+        i2c_bus_write_reg(ADDR_TCA6408A, SX1502_REG_DIR, &dir_v4, 1);
+        // b537: an SX1502 means the OtO v4 board (stock firmware HW_CTRL_4).
+        // Stock v4 never configures or drives GPIO13 -- on v5 it is our motor
+        // brake "K", on v4 its wiring is unknown and we were driving it (high
+        // through every sleep). Disable the pad once: every later
+        // gpio_set_level(GPIO_K, ...) then has no effect on the pin.
+        gpio_set_direction(GPIO_K, GPIO_MODE_DISABLE);
+        gpio_pullup_dis(GPIO_K);
+        gpio_pulldown_dis(GPIO_K);
+        INFO("v4 board (SX1502): GPIO13 released (stock v4 never drives it)");
         return;
     }
 
@@ -5904,12 +5948,18 @@ static void tca_led_set(uint8_t val)
     led_expander_detect();
 
     if (s_led_expander == LED_EXP_SX1502) {
-        uint8_t raw = led_sx1502_value(val);
+        // b537: only IO0-IO3 are ours. Stock v4 firmware sets RegDir=0xF0
+        // (IO4-IO7 INPUTS) and masks every data write to 0x0F; its self-test
+        // expects IO4/6/7 to read low, i.e. they are tied to something on the
+        // board. We used to drive all 8 as outputs with IO4-7 HIGH (0xFE) --
+        // fighting that, and (the expander apparently staying powered in deep
+        // sleep on v4) all night. Suspected cause of the ~15x v4 sleep drain.
+        uint8_t raw = led_sx1502_value(val) & SX1502_OUT_MASK;
         if (!s_tca_outputs) {
-            uint8_t off = SX_LED_OFF;
+            uint8_t off = SX_LED_OFF & SX1502_OUT_MASK;
             esp_err_t r_data = i2c_bus_write_reg(ADDR_TCA6408A, SX1502_REG_DATA, &off, 1);
-            uint8_t all_out = 0x00;
-            esp_err_t r_dir = i2c_bus_write_reg(ADDR_TCA6408A, SX1502_REG_DIR, &all_out, 1);
+            uint8_t dir = SX1502_DIR_V4;
+            esp_err_t r_dir = i2c_bus_write_reg(ADDR_TCA6408A, SX1502_REG_DIR, &dir, 1);
             s_tca_outputs = (r_data == ESP_OK && r_dir == ESP_OK);
             if (!s_tca_outputs) {
                 ESP_LOGW(TAG, "SX1502 LED init failed (data=%s dir=%s)",
@@ -5954,6 +6004,7 @@ static void led_blink_task(void *arg)
     }
     // WiFi connected: solid blue
     tca_led_set(LED_BLUE);
+    s_blink_hwm = (int)uxTaskGetStackHighWaterMark(NULL);   // b536
     vTaskDelete(NULL);
 }
 
@@ -6633,15 +6684,21 @@ static const char *boot_diag_reset_reason_str(int r)
 // to leave the valve where it is and just back out cleanly.
 static void sleep_forever_quiet(const char *reason)
 {
-    ESP_LOGW(TAG, "Sleeping forever (quiet, no motors): %s", reason);
+    ESP_LOGW(TAG, "Low-battery sleep (quiet, no motors): %s -- re-check in %u min, "
+                  "resume at >= %.1fV", reason, (unsigned)(LOWBATT_RECHECK_S / 60u),
+                  BATT_RESUME_VOLTAGE_V);
     pm_record_reason(reason);
     tca_led_set(LED_OFF);
     sensor_rail_off();
     motor_rail_off();
     vTaskDelay(pdMS_TO_TICKS(100));
-    // No wakeup source -- physical reset required to revive. Matches
-    // sleep_forever()'s rationale: waking again under the same low battery
-    // would just measure low and sleep again, burning the dregs.
+    // b533: timed re-check instead of forever. b327 slept with NO wake source
+    // ("waking again would just burn the dregs"), but a charging unit then
+    // stayed dead until someone power-cycled it -- found on a bench unit at
+    // 3.39 V on the charger. A re-check is ~1.5 s awake (a few hundredths of
+    // a mAh), far below what solar puts back in an hour.
+    s_lowbatt_hold = true;
+    esp_sleep_enable_timer_wakeup((uint64_t)LOWBATT_RECHECK_S * 1000000ULL);
     esp_deep_sleep_start();
 }
 
@@ -6780,12 +6837,14 @@ static void check_battery_on_boot(void)
     // and falls back to boot_seq ordering.
     diag.boot_epoch            = (int64_t)time(NULL);
 
-    if (batt_v < BATT_MIN_VOLTAGE_V && batt_v > 0.5f) {
+    // b533: after a low-battery sleep, require the higher RESUME level.
+    const float batt_gate_v = s_lowbatt_hold ? BATT_RESUME_VOLTAGE_V : BATT_MIN_VOLTAGE_V;
+    if (batt_v < batt_gate_v && batt_v > 0.5f) {
         // > 0.5V check avoids false trigger if ADC not ready.
         // Quiet sleep -- do NOT try to close the valve. Motor draw under
         // low battery can brown out the regulator; valve stays where it is.
         ESP_LOGW(TAG, "Battery %.2fV below %.1fV threshold -- quiet sleep, no motor activity",
-                 batt_v, BATT_MIN_VOLTAGE_V);
+                 batt_v, batt_gate_v);
         diag.flags |= BOOT_DIAG_FLAG_BATT_TOO_LOW;
         // b480: sensor-only leak check (reads are safe at any battery; motor
         // pulls are not). If water is escaping we can't stop it on this
@@ -6795,6 +6854,10 @@ static void check_battery_on_boot(void)
         boot_diag_append_and_save(&diag);
         sleep_forever_quiet("low battery");
     }
+    if (s_lowbatt_hold)
+        ESP_LOGI(TAG, "Battery %.2fV >= %.1fV -- recovered from low-battery sleep",
+                 batt_v, BATT_RESUME_VOLTAGE_V);
+    s_lowbatt_hold = false;
 
     // Battery is at least marginal. If we have enough headroom for a motor
     // move without dipping near the brownout point, verify the valve is in
@@ -6859,10 +6922,68 @@ static void cal_watchdog_check(void)
     s_cal_state_since = 0;
 }
 
+// b533: turn the motor rail off once nothing has used it for a while. Manual
+// moves (/nozzle/goto, /aim/*, /valve/goto) power it on and leave it on by
+// design; on a unit held awake (auto-sleep off) the 9 V boost + released
+// brake then ran until sleep -- a day of that flattened a bench unit. Any
+// motor user calls motor_rail_on() again and gets it back in 100 ms.
+static volatile bool s_zone_trace_busy;   // defined with the trace code below
+static volatile bool s_water_arc_busy;    // defined with water_arc below
+static void motor_rail_idle_check(void)
+{
+    if (!s_motor_rail) return;
+    if (s_web_water_mode != 0 || s_zone_trace_busy || s_water_arc_busy ||
+        s_frame_sweep_active || s_exp_running || s_ota_in_progress) return;
+    if (s_wcal.state == WCAL_PRESSURE_SCANNING        ||
+        s_wcal.state == WCAL_PRESSURE_AWAIT_THROW     ||
+        s_wcal.state == WCAL_PRESSURE_AWAIT_THROW_LOW ||
+        s_wcal.state == WCAL_NOZZLE_RUNNING           ||
+        s_wcal.state == WCAL_JOG_RUNNING) return;
+    if ((TickType_t)(xTaskGetTickCount() - s_motor_rail_last_use) <
+        pdMS_TO_TICKS(MOTOR_RAIL_IDLE_OFF_MS)) return;
+    ESP_LOGI(TAG, "Motor rail idle %u min -- switching off",
+             (unsigned)(MOTOR_RAIL_IDLE_OFF_MS / 60000u));
+    motor_rail_off();
+}
+
+// b534: stay awake a while after ANY calibration ends (done, error or
+// cancelled) -- including the frame sweep. The inactivity clock measures from
+// the last user touch, which is usually the cal START, so at 1-min inactivity
+// a unit slept the instant a pressure cal finished, before the operator could
+// read the result or start the next cal. Overrides auto-sleep AND the winter
+// re-sleep; when the hold expires the normal rules apply again.
+#define POST_CAL_AWAKE_MS (3u * 60u * 1000u)
+static bool       s_cal_was_active     = false;
+static TickType_t s_post_cal_hold_until = 0;
+static bool post_cal_hold_active(void)
+{
+    bool active = s_frame_sweep_active                              ||
+                  s_wcal.state == WCAL_PRESSURE_SCANNING            ||
+                  s_wcal.state == WCAL_PRESSURE_AWAIT_THROW         ||
+                  s_wcal.state == WCAL_PRESSURE_AWAIT_THROW_LOW     ||
+                  s_wcal.state == WCAL_NOZZLE_RUNNING               ||
+                  s_wcal.state == WCAL_JOG_RUNNING;
+    TickType_t now = xTaskGetTickCount();
+    if (s_cal_was_active && !active) {
+        s_post_cal_hold_until = now + pdMS_TO_TICKS(POST_CAL_AWAKE_MS);
+        if (s_post_cal_hold_until == 0) s_post_cal_hold_until = 1;
+        INFO("Calibration ended -- holding awake %u min",
+             (unsigned)(POST_CAL_AWAKE_MS / 60000u));
+    }
+    s_cal_was_active = active;
+    if (s_post_cal_hold_until == 0) return false;
+    if ((int32_t)(now - s_post_cal_hold_until) < 0) return true;
+    s_post_cal_hold_until = 0;
+    INFO("Post-calibration awake hold over -- normal sleep rules apply");
+    return false;
+}
+
 static void check_inactivity(void)
 {
+    motor_rail_idle_check();
     if (s_last_activity == 0) return;  // not yet initialised
     if (s_ota_in_progress) return;  // never sleep during OTA
+    if (post_cal_hold_active()) return;   // b534
     // b525: winter mode owns the sleep decision -- the unit holds awake for
     // the whole WINTER_WAKE_WINDOW_S (so HA and the web UI get a reliable
     // window to cancel, no matter what the inactivity knob says) and then
@@ -15800,10 +15921,10 @@ static esp_err_t api_all_handler(httpd_req_t *req)
     // b529: which LED expander boot detection picked (SX1502 vs
     // TCA6408A-compatible) + the raw register reads it decided on. Own chunk.
     n = snprintf(buf, sizeof(buf),
-        ",\"led_exp\":\"%s\",\"led_exp_adv\":%d,\"led_exp_cfg\":%d",
+        ",\"led_exp\":\"%s\",\"led_exp_adv\":%d,\"led_exp_cfg\":%d,\"led_exp_dir0\":%d",
         s_led_expander == LED_EXP_SX1502   ? "sx1502" :
         s_led_expander == LED_EXP_TCA6408A ? "tca6408a" : "unknown",
-        (int)s_led_exp_adv, (int)s_led_exp_cfg);
+        (int)s_led_exp_adv, (int)s_led_exp_cfg, (int)s_led_exp_dir0);
     httpd_resp_send_chunk(req, buf, n);
 
     // b525: winter fields ride in THIS chunk, not the head one -- b522 widened
@@ -15811,14 +15932,18 @@ static esp_err_t api_all_handler(httpd_req_t *req)
     n = snprintf(buf, sizeof(buf),
         ",\"water_vol_l\":%.1f,\"water_vol_est_l\":%.1f,"   // b503: live run progress
         "\"winter\":%s,\"winter_left_s\":%lu,\"winter_window_s\":%lu,"  // b525
-        "\"heap_free\":%lu,\"heap_min_free\":%lu,\"heap_largest\":%lu,\"zones\":[",
+        "\"heap_free\":%lu,\"heap_min_free\":%lu,\"heap_largest\":%lu,"
+        "\"stack_hwm\":{\"blink\":%d,\"idle\":%d,\"sched\":%d},\"zones\":[",   // b536
         s_water_vol_disp_l, s_water_vol_exp_l,
         s_winter_sleep ? "true" : "false",
         (unsigned long)irrigoto_winter_window_left_s(),
         (unsigned long)WINTER_WAKE_WINDOW_S,
         (unsigned long)esp_get_free_heap_size(),
         (unsigned long)esp_get_minimum_free_heap_size(),
-        (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+        (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+        s_task_blink && s_blink_hwm < 0 ? (int)uxTaskGetStackHighWaterMark(s_task_blink) : s_blink_hwm,
+        s_task_idle  ? (int)uxTaskGetStackHighWaterMark(s_task_idle)  : -1,
+        s_task_sched ? (int)uxTaskGetStackHighWaterMark(s_task_sched) : -1);
     httpd_resp_send_chunk(req, buf, n);
 
     int count=0;
@@ -18914,6 +19039,9 @@ void irrigoto_init(void)
 {
     uart_setup();
     gpio_setup();
+    // b537: identify the board (SX1502 = v4) before anything drives motors,
+    // so v4-specific pin handling (GPIO13) is in place for the boot valve check.
+    led_expander_detect();
     // NOTE: nvs_flash_init() intentionally omitted — ESPHome calls it first.
     // NOTE: wifi_init() / esp_event_loop_create_default() omitted — ESPHome owns those.
 
@@ -18925,7 +19053,9 @@ void irrigoto_init(void)
     log_wake_cause();
     irrigoto_winter_arm_wake_window();   // b525: no-op unless winterized
 
-    xTaskCreate(led_blink_task, "led_blink", 2048, NULL, 5, NULL);
+    // b536: 2048 -> 4096. It logs (via ESPHome's log hook) while blinking
+    // through the WiFi connect -- the prime suspect for the b535 overflow.
+    xTaskCreate(led_blink_task, "led_blink", 4096, NULL, 5, &s_task_blink);
 
     if (storage_init() == ESP_OK) {
         if (storage_water_load(0, &s_last_water_run) != ESP_OK) {
@@ -18971,14 +19101,14 @@ void irrigoto_init(void)
     INFO("irrigoto ready (ESPHome component, build %d, ip %s)", FW_BUILD, s_wifi_ip);
 
     s_last_activity = xTaskGetTickCount();
-    xTaskCreate(esphome_idle_task, "oto_idle", 4096, NULL, 3, NULL);
+    xTaskCreate(esphome_idle_task, "oto_idle", 6144, NULL, 3, &s_task_idle);   // b536: 4096 -> 6144
     // Schedule executor — separate task so a slow watering loop can't
     // delay the next-minute check. Low priority; just polls every 15 s.
     schedule_load_nvs();
     schedule_delay_load_nvs();   // restore rain/wind delay across reboot/wake
     last_water_load_nvs();       // restore "last completed" tag across deep-sleep wake
     sched_fire_load();           // b437: armed run + fired-epoch ring (clock-free firing)
-    xTaskCreate(schedule_task, "oto_sched", 3072, NULL, 2, NULL);
+    xTaskCreate(schedule_task, "oto_sched", 4096, NULL, 2, &s_task_sched);   // b536: 3072 -> 4096
     INFO("Schedule loaded: %d entries", irrigoto_schedule_count());
 }
 
