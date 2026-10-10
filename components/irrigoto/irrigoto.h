@@ -77,6 +77,7 @@ class IrrigotoComponent : public Component, public api::CustomAPIDevice {
   float get_valve_deg();
   float get_nozzle_deg();
   void stop_and_close();
+  void boot_press_check();   // b541: called from on_boot (priority 800, before WiFi)
   void valve_close();
   void valve_open();
   void cal_pressure_start();

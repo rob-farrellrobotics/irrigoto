@@ -92,6 +92,10 @@ esphome:
           setenv("TZ", "${device_posix_tz}", 1);
           tzset();
           ESP_LOGI("irrigoto.tz", "Set libc TZ to ${device_posix_tz}");
+      # b541: count rapid manual wakes (power-on / wake switch) BEFORE WiFi
+      # starts; the 5th within 30 s of each other opens the setup hotspot.
+      - lambda: |-
+          id(irrigoto_hw).boot_press_check();
       # b290: tried "component.update: reset_reason" here in b287 but
       # at priority 800 the template text_sensor isn't fully
       # initialized yet, so the update call was silently dropped.

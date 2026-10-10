@@ -7073,6 +7073,57 @@ static bool post_cal_hold_active(void)
     return false;
 }
 
+// b541: physical escape hatch for a lost fallback-hotspot password.
+// Five power-on / wake-switch resets in a row, each less than PRESS_GAP_MS after
+// the previous boot, make the NEXT fallback hotspot an OPEN one named
+// "<name> Setup" (the station credentials are untouched, so WiFi entered in the
+// captive portal is saved under the normal key and survives reboots). Counted
+// from ESPHome's priority-800 on_boot hook -- before WiFi -- in NVS ("OtO" /
+// "rst_cnt"), because a power-on clears RTC memory. A boot that stays up
+// PRESS_GAP_MS clears the count; deep-sleep timer wakes clear it too. Only
+// someone holding the unit can do this; it is not mentioned in the web UI.
+#define PRESS_COUNT_TRIGGER 5
+#define PRESS_GAP_MS        30000u
+static bool s_press_count_pending = false;
+static bool s_setup_ap_open       = false;
+
+bool irrigoto_boot_press_check(void)
+{
+    esp_reset_reason_t r = esp_reset_reason();
+    nvs_handle_t h;
+    if (nvs_open(CAL_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return false;
+    uint8_t c = 0;
+    nvs_get_u8(h, "rst_cnt", &c);
+    if (r == ESP_RST_POWERON || r == ESP_RST_EXT) c++;
+    else c = 0;
+    bool fire = (c >= PRESS_COUNT_TRIGGER);
+    if (fire) c = 0;
+    nvs_set_u8(h, "rst_cnt", c);
+    nvs_commit(h);
+    nvs_close(h);
+    s_press_count_pending = (c > 0);
+    if (c > 0) ESP_LOGI(TAG, "Manual wake %u/%u (keep pressing within %us for the setup hotspot)",
+                        (unsigned)c, (unsigned)PRESS_COUNT_TRIGGER, (unsigned)(PRESS_GAP_MS / 1000u));
+    if (fire) s_setup_ap_open = true;
+    return fire;
+}
+
+bool irrigoto_setup_ap_open(void) { return s_setup_ap_open; }
+
+// Called from the 1 Hz idle task: once this boot has stayed up PRESS_GAP_MS,
+// the presses were not a rapid sequence -- reset the count.
+static void boot_press_maintenance(void)
+{
+    if (!s_press_count_pending) return;
+    if (xTaskGetTickCount() < pdMS_TO_TICKS(PRESS_GAP_MS)) return;
+    s_press_count_pending = false;
+    nvs_handle_t h;
+    if (nvs_open(CAL_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_u8(h, "rst_cnt", 0);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
 // b540: WiFi setup window. After a wake that is NOT a routine deep-sleep
 // timer wake (power-on, the wake switch/magnet, a reset), stay awake up to
 // SETUP_WINDOW_MS while the station is not associated, so ESPHome's
@@ -16052,11 +16103,12 @@ static esp_err_t api_all_handler(httpd_req_t *req)
     // TCA6408A-compatible) + the raw register reads it decided on. Own chunk.
     n = snprintf(buf, sizeof(buf),
         ",\"led_exp\":\"%s\",\"led_exp_adv\":%d,\"led_exp_cfg\":%d,\"led_exp_dir0\":%d,"
-        "\"bat_filt_mv\":%d,\"batt_block\":%s",
+        "\"bat_filt_mv\":%d,\"batt_block\":%s,\"setup_ap_open\":%s",
         s_led_expander == LED_EXP_SX1502   ? "sx1502" :
         s_led_expander == LED_EXP_TCA6408A ? "tca6408a" : "unknown",
         (int)s_led_exp_adv, (int)s_led_exp_cfg, (int)s_led_exp_dir0,
-        (int)(s_batt_filt_v * 1000.0f + 0.5f), s_batt_start_blocked ? "true" : "false");
+        (int)(s_batt_filt_v * 1000.0f + 0.5f), s_batt_start_blocked ? "true" : "false",
+        s_setup_ap_open ? "true" : "false");
     httpd_resp_send_chunk(req, buf, n);
 
     // b525: winter fields ride in THIS chunk, not the head one -- b522 widened
@@ -19186,6 +19238,7 @@ static void esphome_idle_task(void *arg)
 {
     (void)arg;
     while (true) {
+        boot_press_maintenance();   // b541
         batt_filter_tick();     // b539: 1 Hz, stock-matched low-pass
         batt_guard_check();     // b539: mid-run abort / critical sleep
         check_inactivity();

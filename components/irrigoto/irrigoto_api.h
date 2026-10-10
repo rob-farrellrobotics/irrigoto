@@ -274,6 +274,8 @@ void irrigoto_zone_trace_stop(void);
  * position. Safe to call at any time.
  */
 void irrigoto_stop_and_close(void);
+bool irrigoto_boot_press_check(void);   // b541: true on the 5th rapid manual wake
+bool irrigoto_setup_ap_open(void);      // b541
 
 /** Drive the valve to VALVE_CLOSED_DEG (231 deg). */
 void irrigoto_valve_close(void);

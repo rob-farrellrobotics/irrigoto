@@ -454,6 +454,23 @@ float IrrigotoComponent::get_nozzle_deg() {
     return irrigoto_get_nozzle_deg();
 }
 
+// b541: 5 rapid manual wakes -> the fallback hotspot comes up OPEN as
+// "<name> Setup". Only the AP config is swapped (before WiFi starts); the STA
+// list is left alone so the captive portal saves new credentials under the
+// normal preference key and they survive reboots. Fallback timing (ap_timeout)
+// and the b540 setup window are unchanged.
+void IrrigotoComponent::boot_press_check() {
+    if (!irrigoto_boot_press_check()) return;
+    auto *w = esphome::wifi::global_wifi_component;
+    if (w == nullptr) return;
+    esphome::wifi::WiFiAP ap = w->get_ap();
+    std::string ssid = std::string(App.get_name().c_str()) + " Setup";
+    ap.set_ssid(ssid);
+    ap.set_password("");
+    w->set_ap(ap);
+    ESP_LOGW(TAG, "5 rapid manual wakes: fallback hotspot will be OPEN as \"%s\" this boot", ssid.c_str());
+}
+
 void IrrigotoComponent::stop_and_close() {
     ESP_LOGI(TAG, "HA stop_and_close");
     irrigoto_stop_and_close();
